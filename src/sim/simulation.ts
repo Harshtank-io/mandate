@@ -144,6 +144,14 @@ export class Simulation {
   takeOffice(): void {
     const sim = this.sim, s = sim.s;
     seedMilestones(sim);
+    if (s.meta.condition === 'empty') {
+      pushNews(sim, {
+        tag: 'government', headline: `Work begins on a new town: ${s.meta.name}`,
+        body: `The development authority holds ${fmtMoney(sim, s.gov.cash)} to lay out roads, build public facilities and house the first settlers. Nobody lives here yet.`,
+        why: ['The regional highway already crosses the site', 'Settlers, farmers and businesses come when there is zoned land, homes and work for them'], eventId: -1,
+      });
+      return;
+    }
     // make sure a few private homes are going up when the player arrives
     const building = s.projects.some((p) => !p.gov && (p.kind === 'house' || p.kind === 'apartment') && p.phase === 'construction');
     const dev = s.businesses.find((b) => b.kind === 'realestate');

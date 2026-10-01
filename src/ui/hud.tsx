@@ -9,7 +9,9 @@ import { inspect, inspectCitizen, type Card, type Ref } from '../sim/inspect';
 import { GOV_BUILDINGS, previewBuilding, previewRoad, proposeBuilding, proposeRoad, rezone, ZONE_LABELS, type Preview, type RoadTool } from '../sim/commands';
 import { BUILDINGS, GOOD_SPECS, ROADWORKS } from '../sim/tables';
 import { getPreset, SPEEDS } from '../sim/presets';
-import { alerts } from '../sim/summary';
+import { alerts, foundingSteps } from '../sim/summary';
+import { activeSync } from '../net/sync';
+import { CloudBadge } from './account';
 import { formatDate } from '../sim/calendar';
 import { Terrain, Zone, type BuildingKind } from '../sim/types';
 import { Budget, Milestones, News, Overview, PoliciesPanel, Projects, Saves, Taxes, type Ctx, type Tab } from './panels';
@@ -220,11 +222,17 @@ export function Hud(p: HudProps) {
         <div class="kpis">
           <button class="kpi" onClick={() => setTab('overview')}><span>Population</span><b>{num(s.citizens.length)}</b></button>
           <button class="kpi" onClick={() => setTab('budget')}><span>Treasury</span><b class={s.gov.cash < 0 ? 'bad' : ''}>{money(sim, s.gov.cash)}</b></button>
-          <button class="kpi" onClick={() => setTab('overview')}><span>Approval</span><b class={s.gov.approval < 0.45 ? 'bad' : ''}>{pct(s.gov.approval)}</b></button>
-          {st && <button class="kpi" onClick={() => setTab('overview')}><span>Unemployment</span><b class={st.unemployment > 0.1 ? 'bad' : ''}>{pct(st.unemployment, 1)}</b></button>}
+          <button class="kpi" onClick={() => setTab('overview')}><span>Approval</span><b class={s.citizens.length && s.gov.approval < 0.45 ? 'bad' : ''}>{s.citizens.length ? pct(s.gov.approval) : '–'}</b></button>
+          {st && <button class="kpi" onClick={() => setTab('overview')}><span>Unemployment</span><b class={st.unemployment > 0.1 ? 'bad' : ''}>{st.laborForce ? pct(st.unemployment, 1) : '–'}</b></button>}
         </div>
         <div class="actions">
-          <button class="ghost" onClick={() => { void game.save('Autosave').then((m) => toast(m ? 'Saved.' : 'Save skipped (already saving).')); }}>Save</button>
+          <CloudBadge />
+          <button class="ghost" onClick={() => {
+            void game.save('Autosave').then((m) => {
+              toast(m ? 'Saved.' : game.locked ? 'This town is open on another device.' : 'Save skipped (already saving).');
+              if (m) void activeSync()?.upload();
+            });
+          }}>Save</button>
           <button class="ghost" onClick={p.onMenu}>Menu</button>
         </div>
       </header>
@@ -343,7 +351,7 @@ function ProposalPanel({ sim, proposal, floors, setFloors, onApprove, onCancel }
       <section class="proposal panel" aria-label="Rezoning proposal">
         <h3>Rezone {(proposal.tiles.length * 0.16).toFixed(1)} ha as {ZONE_LABELS[proposal.zone].toLowerCase()}</h3>
         <ul class="lines">
-          <li>{proposal.tiles.length} tiles; roads, water, buildings and project sites are left as they are</li>
+          <li>{proposal.tiles.length} tiles; roads, water, buildings and project sites are left ads they are</li>
           {proposal.zone !== Zone.Agricultural && <li>Developers and businesses can build here once there is road access and demand</li>}
           {farmed > 0 && <li>{farmed} tiles are farmed today: farmers keep working them until a developer buys the land</li>}
           {forest > 0 && <li class="bad">{forest} tiles are woodland that would be cleared for building</li>}
@@ -407,8 +415,33 @@ function WelcomeBack({ sim, report, onClose, openRef }: { sim: Sim; report: Away
   );
 }
 
+function FoundingBriefing({ sim, onClose }: { sim: Sim; onClose(): void }) {
+  const s = sim.s;
+  const p = getPreset(s.meta.preset);
+  return (
+    <Modal title={`Welcome to ${s.meta.name}`} wide>
+      <p>{p.blurb}</p>
+      <p>There is no town here yet: open land by the river, the regional highway and a development grant of {money(sim, s.gov.cash)}. Nobody lives here.</p>
+      <h3>How to found a town</h3>
+      <ol class="lines steps-list">
+        {foundingSteps(sim).map((x) => <li key={x.text}><b>{x.text}.</b> <span class="muted small">{x.hint}</span></li>)}
+      </ol>
+      <h3>Good to know</h3>
+      <ul class="lines">
+        <li>Zone land straight along the highway to get going at once; a new street takes months to build.</li>
+        <li>Public housing (Build menu) lets you house the first settlers yourself.</li>
+        <li>Settlers stay only if they find work: public facilities, building sites, shops and farms all hire.</li>
+        <li>Until local firms exist, building materials and food come in by truck at import prices.</li>
+      </ul>
+      <p class="lead">The land is yours to shape.</p>
+      <div class="buttons"><button class="primary" onClick={onClose} autoFocus>Take office</button></div>
+    </Modal>
+  );
+}
+
 function Briefing({ sim, onClose }: { sim: Sim; onClose(): void }) {
   const s = sim.s;
+  if (s.meta.condition === 'empty') return <FoundingBriefing sim={sim} onClose={onClose} />;
   const st = s.stats.months[s.stats.months.length - 1];
   const p = getPreset(s.meta.preset);
   const count = (k: string) => s.businesses.filter((b) => b.kind === k && b.status === 'operating').length;

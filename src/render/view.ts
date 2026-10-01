@@ -207,6 +207,16 @@ export class WorldView {
     this.rig = new CameraRig(this.canvas, w / h);
     const th = sim.s.buildings.find((b) => b.kind === 'townhall');
     if (th) { const [x, y] = sim.center(th); this.rig.target.set(x, 0, y); }
+    else {
+      // no town yet: look at the road closest to the middle of the region
+      let best = -1, bd = Infinity;
+      for (let t = 0; t < N * N; t++) {
+        if (!sim.s.map.road[t]) continue;
+        const d = Math.hypot((t % N) - N / 2, ((t / N) | 0) - N / 2);
+        if (d < bd) { bd = d; best = t; }
+      }
+      if (best >= 0) this.rig.target.set((best % N) + 0.5, 0, ((best / N) | 0) + 0.5);
+    }
     this.rig.preset('city');
     this.rig.snap();
     this.scene.fog = this.fog;

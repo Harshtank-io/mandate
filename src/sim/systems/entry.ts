@@ -5,7 +5,8 @@ import { idx, W, type Sim } from '../core';
 import { businessName } from '../names';
 import { BUILDINGS, BUSINESSES } from '../tables';
 import { Terrain, Zone, type Building, type Business, type BusinessKind, type Citizen } from '../types';
-import { createProject, estimate } from './construction';
+import { dateOf } from '../calendar';
+import { createProject, estimate, OUTSIDE_CONTRACTOR } from './construction';
 import { rebuildStores } from './households';
 import { findLot } from './housing';
 import { freightPerUnit } from './logistics';
@@ -80,6 +81,11 @@ function open(sim: Sim, kind: BusinessKind, near: [number, number] | null, owner
   return b;
 }
 
+const STORE_NOUNS: Record<'grocery' | 'shop' | 'restaurant' | 'services', [string, string]> = {
+  grocery: ['grocery store', 'grocery stores'], shop: ['shop', 'shops'], restaurant: ['restaurant', 'restaurants'],
+  services: ['repair shop, salon or tailor', 'service businesses (repairs, salons, transport, tailoring)'],
+};
+
 function retailEntry(sim: Sim, kind: 'grocery' | 'shop' | 'restaurant' | 'services'): void {
   const s = sim.s, r = sim.rng;
   const nominal = nominalOf(sim);
@@ -105,22 +111,25 @@ function retailEntry(sim: Sim, kind: 'grocery' | 'shop' | 'restaurant' | 'servic
   const recent = (b: Business) => { const h = b.profitHist.slice(-3); return h.length ? h.reduce((a, x) => a + x, 0) / h.length : 0; };
   const avgProfit = ops.length ? ops.reduce((a, b) => a + recent(b), 0) / ops.length : 0;
   const rich = ops.length > 0 && avgProfit > 2.5 * sim.roleWage('supervisor');
-  if (signal < minRev * 0.35 && far < 60 && !rich) return;
+  // in a young town a shopkeeper will set up for far fewer customers: there is no competition at all
+  const farMin = Math.round(60 * (1 - 0.75 * sim.frontier()));
+  if (signal < minRev * 0.35 && far < farMin && !rich) return;
   const ease = [1, 0.8, 0.55][s.gov.policies.businessRegulation];
   if (!r.chance(0.5 * ease)) return;
   const topBl = top ? sim.bld(top.building) : undefined;
-  let near = far >= 60 && farAt ? farAt : topBl ? sim.center(topBl) : null;
-  if (rich && signal < minRev * 0.35 && far < 60) {
+  let near = far >= farMin && farAt ? farAt : topBl ? sim.center(topBl) : null;
+  if (rich && signal < minRev * 0.35 && far < farMin) {
     const homes = s.buildings.filter((b) => b.occupants.length > 0);
     if (homes.length) near = sim.center(r.pick(homes));
   }
   const capital = BUSINESSES[kind].startup * nominal + BUILDINGS[kind].cost * nominal;
   const owner = entrepreneur(sim, capital);
   if (!owner) return;
-  const label = BUSINESSES[kind].label.toLowerCase();
-  const why = far >= 60 ? `About ${far} households live more than 600 m from the nearest ${label}`
-    : signal >= minRev * 0.35 ? `Existing ${label}s turned away customers worth ${Math.round(signal / nominal / 1000)}K a month`
-      : `Existing ${label}s are earning strong profits`;
+  const [one, many] = STORE_NOUNS[kind];
+  const why = far >= farMin && !ops.length ? `${far} households have no ${one} anywhere nearby`
+    : far >= farMin ? `About ${far} households live more than 600 m from the nearest ${one}`
+    : signal >= minRev * 0.35 ? `Existing ${many} turned away customers worth ${Math.round(signal / nominal / 1000)}K a month`
+      : `Existing ${many} are earning strong profits`;
   const b = open(sim, kind, near, owner, why, [Zone.Commercial, Zone.Residential]);
   if (b) sim.emit('business.planned', `${sim.fullName(owner)} is opening ${b.name}. ${why}.`, 1, b.building >= 0 ? { k: 'building', id: b.building } : undefined, undefined, [why]);
 }
@@ -201,9 +210,14 @@ function proForma(sim: Sim, kind: BusinessKind): ProForma | null {
     }
     case 'construction': {
       const starved = s.projects.filter((p) => p.phase === 'construction' && (p.issue.startsWith('No construction') || p.issue.startsWith('Contractor has no'))).length;
-      if (starved < 1) return null;
-      monthly = wages * 0.3;
-      reasons.push(`${starved} building sites are waiting for a contractor`);
+      // work done by outside contractors at a premium is business a local firm could win
+      const outside = s.projects.filter((p) => p.phase === 'construction' && p.contractor === OUTSIDE_CONTRACTOR).length;
+      if (starved + outside < 1) return null;
+      // a hamlet cannot keep a 20-strong building firm busy; outside contractors serve it until it grows
+      if (!starved && s.citizens.length < 400) return null;
+      monthly = wages * (0.3 + 0.25 * Math.min(3, outside));
+      if (starved) reasons.push(`${starved} building sites are waiting for a contractor`);
+      if (outside) reasons.push(`${outside} building site${outside > 1 ? 's are' : ' is'} run by outside contractors charging a premium`);
       break;
     }
     default: return null;
@@ -300,7 +314,9 @@ function hotelEntry(sim: Sim): void {
   if (s.businesses.some((b) => b.kind === 'hotel' && b.status !== 'operating')) return;
   let rooms = 0, nights = 0;
   for (const b of s.businesses) if (b.kind === 'hotel' && b.status === 'operating' && b.hotel) { rooms += b.hotel.rooms; nights += b.hotel.nights; }
-  const occ = rooms > 0 ? nights / (rooms * sim.date.daysInMonth) : 1;
+  // runs on the 1st: the nights belong to the month that just ended. Without any hotel, only visitors who were
+  // actually turned away count as demand
+  const occ = rooms > 0 ? nights / (rooms * dateOf(s.meta.startYear, sim.day - 1).daysInMonth) : T.m.turned > 30 ? 1 : 0;
   const extra = ((T.m.turned / 30) * 2.2) / 2; // rooms a night that would have been let
   if (occ < 0.72 && extra < 10) return;
   const ease = [1, 0.8, 0.55][s.gov.policies.businessRegulation] * (s.gov.policies.investmentIncentive >= 1 ? 1.3 : 1);
@@ -331,6 +347,93 @@ function cinemaEntry(sim: Sim): void {
   if (b) sim.emit('business.planned', `${b.name} will open a cinema. ${why}.`, 1, b.building >= 0 ? { k: 'building', id: b.building } : undefined, undefined, [why]);
 }
 
+/** Unused agricultural land next to a road, laid out as a farm: a farmhouse tile and up to 30 field tiles. */
+function farmParcel(sim: Sim): { house: number; fields: number[] } | null {
+  const m = sim.s.map, r = sim.rng;
+  const open = (t: number) => m.zone[t] === Zone.Agricultural && (m.terrain[t] === Terrain.Grass || m.terrain[t] === Terrain.Farmland)
+    && m.farm[t] < 0 && m.owner[t] < 0 && m.project[t] < 0 && m.road[t] === 0;
+  const N4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  const seeds: { t: number; score: number }[] = [];
+  for (let t = 0; t < W * W; t++) {
+    if (!open(t)) continue;
+    const x = t % W, y = (t / W) | 0;
+    if (N4.some(([dx, dy]) => x + dx >= 0 && y + dy >= 0 && x + dx < W && y + dy < W && m.road[idx(x + dx, y + dy)] > 0)) seeds.push({ t, score: m.fertility[t] + r.next() * 0.3 });
+  }
+  seeds.sort((a, b) => b.score - a.score);
+  for (const { t: house } of seeds.slice(0, 12)) {
+    const fields: number[] = [];
+    const seen = new Set<number>([house]);
+    const q = [house];
+    while (q.length && fields.length < 30) {
+      const i = q.shift()!;
+      const x = i % W, y = (i / W) | 0;
+      for (const [dx, dy] of N4) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= W || ny >= W) continue;
+        const j = idx(nx, ny);
+        if (seen.has(j)) continue;
+        seen.add(j);
+        if (!open(j)) continue;
+        fields.push(j);
+        q.push(j);
+        if (fields.length >= 30) break;
+      }
+    }
+    if (fields.length >= 8) return { house, fields };
+  }
+  return null;
+}
+
+/**
+ * Farming families from the surrounding region settle unused agricultural land in a town founded on empty land.
+ * The land is allotted to them; they pay for their farmhouse and first season with what they bring.
+ */
+function pioneerFarms(sim: Sim): void {
+  const s = sim.s, r = sim.rng, m = s.map;
+  if (s.meta.condition !== 'empty') return;
+  if (s.businesses.filter((b) => b.kind === 'farm' && b.status === 'planned').length >= 3) return;
+  // once farms are established, newcomers follow how they are doing
+  const est = s.businesses.filter((b) => b.farm && b.profitHist.length >= 6);
+  if (est.length >= 3 && est.reduce((a, b) => a + b.profitHist.reduce((x, y) => x + y, 0), 0) <= 0) return;
+  const n = nominalOf(sim);
+  for (let k = 0; k < 2; k++) {
+    if (!r.chance(0.5)) continue;
+    const pc = farmParcel(sim);
+    if (!pc) return;
+    const b = sim.newBusiness('farm', businessName(sim, 'farm'), -1, -1, false, 0, 'planned');
+    const ha = pc.fields.length * 0.16;
+    let canal = false, lowland = false;
+    for (const t of pc.fields) {
+      m.farm[t] = b.id;
+      m.terrain[t] = Terrain.Farmland;
+      const x = t % W, y = (t / W) | 0;
+      for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= W || ny >= W) continue;
+        const tt = m.terrain[idx(nx, ny)];
+        if (tt === Terrain.Canal) canal = true;
+        if ((tt === Terrain.Water || tt === Terrain.Canal) && Math.abs(dx) <= 3 && Math.abs(dy) <= 3) lowland = true;
+      }
+    }
+    const well = !canal && r.chance(sim.preset.wells);
+    b.farm = {
+      fields: pc.fields, ha, crop: null, phase: 'fallow', phaseDays: 0, growth: 0, health: 1, moisture: 0.5, fertilizer: 0.8,
+      irrigation: canal ? 0.9 : well ? 0.6 : 0, well, seasonCost: 0, seasonRevenue: 0, expected: 0, harvested: 0, waterToday: 0,
+      stressDays: 0, disease: 0, insured: false, premium: 0, lastHarvest: null, plan: 'Farmhouse being built', work: 0, lowland, losses: {},
+    };
+    b.capacity = 3;
+    b.reason = 'Zoned farmland was lying unused';
+    const fh = estimate(sim, 'farmhouse', [pc.house], 1, false);
+    sim.pay(s.ext, b, fh.cost * 1.15 + 120_000 * n * (0.5 + ha / 4));
+    sim.addBusiness(b);
+    sim.ix.ver.farms++;
+    sim.ix.ver.terrain++;
+    createProject(sim, { kind: 'farmhouse', x: pc.house % W, y: (pc.house / W) | 0, w: 1, h: 1, gov: false, sponsor: b.id, bizKind: 'farm', bizId: b.id, name: `Farmhouse for ${b.name}`, reason: b.reason });
+    sim.emit('business.planned', `A farming family is setting up ${b.name} on ${ha.toFixed(1)} ha of unused farmland; their farmhouse is being built.`, 1, { k: 'tile', id: pc.house }, undefined,
+      ['Agricultural land next to a road was available', canal ? 'A canal nearby will irrigate the fields' : well ? 'They will sink a tube well' : 'The fields will be rain-fed']);
+  }
+}
+
 export function entryMonthly(sim: Sim): void {
   retailEntry(sim, 'grocery');
   retailEntry(sim, 'shop');
@@ -340,4 +443,5 @@ export function entryMonthly(sim: Sim): void {
   cinemaEntry(sim);
   for (const k of ['factory', 'foodplant', 'materials', 'office', 'logistics', 'construction'] as BusinessKind[]) invest(sim, k);
   farmEntry(sim);
+  pioneerFarms(sim);
 }

@@ -3,3 +3,5 @@ dist
 *.log
 screenshots
 .vite
+.env.local
+.env.*.local

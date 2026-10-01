@@ -2,7 +2,7 @@
 // businesses, households and citizens. The result is a coherent economy close to a steady state so the
 // simulation can take over immediately.
 
-import { dateOf, dayIndex } from './calendar';
+import { dateOf, dayIndex, MIN_PER_DAY } from './calendar';
 import { emptyAcc, emptyGovLedger, emptyHhLedger, idx, inMap, Sim, W } from './core';
 import { businessName, firstName, lastName } from './names';
 import { emptyVenue, initAir, initFood, initLeisure, initTourism, initTrade } from './init';
@@ -54,12 +54,16 @@ export function skeleton(o: NewWorldOptions): WorldState {
   const preset = getPreset(o.preset);
   const cond = getCondition(o.condition);
   const epoch = o.startYear - 1;
+  const officeDay = dayIndex(epoch, o.startYear, 0, 1);
   const scale = moneyScale(o.preset, epoch);
+  // empty land has no history to simulate: the clock starts the day the player takes office, at that year's prices
+  const empty = cond.id === 'empty';
+  const trend = empty ? 1 + preset.inflation : 1;
   const prices = {} as Record<Good, number>;
   const dev = {} as Record<Good, number>;
   const market = {} as Record<Good, MarketGood>;
   for (const g of GOODS) {
-    prices[g] = GOOD_SPECS[g].world * scale;
+    prices[g] = GOOD_SPECS[g].world * scale * trend;
     dev[g] = 0;
     market[g] = { price: prices[g], supply: 0, demand: 0, local: 0, imported: 0, exported: 0, lastLocal: 0, lastImported: 0, lastExported: 0, importValue: 0, exportValue: 0, hist: [], lastWhy: '' };
   }
@@ -72,9 +76,9 @@ export function skeleton(o: NewWorldOptions): WorldState {
     v: STATE_VERSION,
     meta: {
       id: `w${o.now.toString(36)}${Math.floor(o.seed % 1e6).toString(36)}`, name: o.name, preset: o.preset, startYear: epoch,
-      officeYear: o.startYear, officeDay: dayIndex(epoch, o.startYear, 0, 1), condition: o.condition, seed: o.seed, pace: o.pace, offlineCapDays: o.offlineCapDays, createdAt: o.now, lastReal: o.now, playedMs: 0,
+      officeYear: o.startYear, officeDay, condition: o.condition, seed: o.seed, pace: o.pace, offlineCapDays: o.offlineCapDays, createdAt: o.now, lastReal: o.now, playedMs: 0,
     },
-    minute: 8 * 60,
+    minute: (empty ? officeDay * MIN_PER_DAY : 0) + 8 * 60,
     rng: seedState(o.seed),
     nextId: 1,
     map: {
@@ -84,7 +88,7 @@ export function skeleton(o: NewWorldOptions): WorldState {
     },
     buildings: [], businesses: [], citizens: [], households: [], projects: [], shipments: [],
     market,
-    ext: { cash: 0, demand: 1, phase: 'normal', phaseLeft: 0, fuel: 60 * scale, fuelDev: 0, prices, dev, trend: 1 },
+    ext: { cash: 0, demand: 1, phase: 'normal', phaseLeft: 0, fuel: 60 * scale * trend, fuelDev: 0, prices, dev, trend },
     weather: { temp: preset.climate.temp[0], tempDev: 0, rain: 0, rainLog: [], normalLog: [], anomaly: 1, anomalyQuarter: -1, drought: false, flood: 999, heatDays: 0, pandemic: 0 },
     gov: {
       cash: cond.treasury * scale, debt: cond.debt * scale, rate: 0.07, rating: 'A',
@@ -148,6 +152,11 @@ class Generator {
 
   run(): void {
     this.terrain();
+    if (this.c.id === 'empty') {
+      this.emptyLand();
+      this.finance();
+      return;
+    }
     this.roads();
     this.zones();
     this.placeCivic();
@@ -244,6 +253,22 @@ class Generator {
     }
     for (let i = 0; i < N; i++) if (m.road[i] > 0 && !seen[i]) m.road[i] = 0;
     for (let i = 0; i < N; i++) m.roadCond[i] = m.road[i] ? 0.7 + 0.3 * this.r.next() : 0;
+  }
+
+  /** Empty land: only the regional highway crosses the region. Nothing is zoned, built or farmed. */
+  emptyLand(): void {
+    const m = this.s.map;
+    for (let x = 0; x < W; x++) {
+      const i = idx(x, this.yH);
+      m.road[i] = RoadClass.Highway;
+      if (m.terrain[i] === Terrain.Forest) m.terrain[i] = Terrain.Grass;
+    }
+    for (let i = 0; i < N; i++) m.roadCond[i] = m.road[i] ? 0.8 + 0.2 * this.r.next() : 0;
+    // land value: the riverbank and the highway are the most sought-after places to settle
+    for (let y = 0; y < W; y++) for (let x = 0; x < W; x++) {
+      const dr = Math.abs(x - this.riverX[y]), dh = Math.abs(y - this.yH);
+      m.landValue[idx(x, y)] = clamp(0.2 + 0.3 * Math.exp(-dr / 10) + 0.25 * Math.exp(-dh / 8), 0, 1);
+    }
   }
 
   roadNeighbor(i: number): number {
@@ -483,8 +508,8 @@ class Generator {
       const [x, y] = this.randomUrbanPoint(0.35);
       this.place('cinema', 'cinema', x, y, okCom, 20) ?? this.place('cinema', 'cinema', x, y, okComRes, 25);
     }
-    // hotels sized to the visitors the attractions already draw
-    computeAppeal(this.sim);
+    // hotels sized to the visitors the attractions already draw (residents are placed later, so use the target)
+    computeAppeal(this.sim, c.population);
     const T = this.s.tourism, rep = 0.5 + T.reputation;
     const dom = VISITOR_BASE.domestic * T.appeal * T.awareness * rep * 0.85;
     const forn = VISITOR_BASE.foreign * T.appeal * T.awarenessIntl * rep * 0.36;

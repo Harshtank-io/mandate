@@ -124,14 +124,17 @@ function shop(sim: Sim, h: Household): void {
   const frac = h.cash >= foodCost ? 1 : Math.max(0, h.cash / Math.max(1, foodCost));
   let gotF = buy(sim, h, st.grocery, 'food', foodT * frac, pf, 'foodTax', t.foodSales, 'food');
   let gotV = buy(sim, h, st.grocery, 'vegetables', vegT * frac, pv, 'foodTax', t.foodSales, 'food');
-  // informal street vendors fill part of any gap at a premium (money leaves the formal economy)
+  // informal street vendors fill part of any gap at a premium (money leaves the formal economy). Where the town has
+  // no grocery at all, families buy everything at weekly markets and in neighbouring towns, at a higher premium
   const gapF = foodT * frac - gotF, gapV = vegT * frac - gotV;
   if (gapF + gapV > 1e-6) {
-    const inf = Math.min(h.cash, ((gapF * pf + gapV * pv) * 0.6) * 1.15);
+    const none = st.grocery.length === 0;
+    const premium = none ? 1.25 : 1.15;
+    const inf = Math.min(h.cash, ((gapF * pf + gapV * pv) * (none ? 1 : 0.6)) * premium);
     if (inf > 0) {
       sim.pay(h, s.ext, inf);
       h.m.food += inf;
-      const share = inf / (((gapF * pf + gapV * pv) * 1.15) || 1);
+      const share = inf / (((gapF * pf + gapV * pv) * premium) || 1);
       gotF += gapF * share; gotV += gapV * share;
     }
   }

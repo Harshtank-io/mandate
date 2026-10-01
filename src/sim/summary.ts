@@ -7,7 +7,7 @@ import { CROPS, ROAD_CAPACITY } from './tables';
 import { fmtMoney } from './systems/construction';
 import { DEPT_LABELS } from './systems/government';
 import { districtName, projectProgress } from './inspect';
-import { DEPTS, type SimEvent } from './types';
+import { DEPTS, Zone, type SimEvent } from './types';
 
 export interface Snapshot {
   minute: number;
@@ -135,9 +135,33 @@ export function summarize(sim: Sim, before: Snapshot): AwaySummary {
 
 export interface Alert { sev: 1 | 2 | 3; text: string; hint: string; ref?: SimEvent['ref']; tab?: string }
 
+export interface FoundingStep { done: boolean; text: string; hint: string }
+
+/** What a town founded on empty land still lacks, read from the current state. */
+export function foundingSteps(sim: Sim): FoundingStep[] {
+  const s = sim.s, zone = s.map.zone;
+  let res = 0, com = 0, ind = 0, agr = 0;
+  for (let i = 0; i < zone.length; i++) {
+    const z = zone[i];
+    if (z === Zone.Residential) res++; else if (z === Zone.Commercial) com++; else if (z === Zone.Industrial) ind++; else if (z === Zone.Agricultural) agr++;
+  }
+  const has = (k: string) => s.businesses.some((b) => b.kind === k) || s.projects.some((p) => p.kind === k && p.phase !== 'cancelled');
+  return [
+    { done: res > 0, text: 'Zone land for homes', hint: 'Developers build houses on residential land next to a road (the highway counts); settlers move in once homes are ready.' },
+    { done: com > 0, text: 'Zone land for shops and services', hint: 'Traders among the settlers open groceries, shops and workshops once enough families live nearby.' },
+    { done: has('townhall'), text: 'Commission a town hall', hint: 'The first public employer. It speeds up approvals and tax collection.' },
+    { done: has('school') && has('clinic'), text: 'Build a school and a clinic', hint: 'Families look for schools and healthcare nearby, and the staff posts are jobs.' },
+    { done: ind > 0, text: 'Zone industrial land', hint: 'A local construction company needs a yard. Until one sets up, outside contractors build at about 30% higher labour cost.' },
+    { done: agr > 0, text: 'Zone farmland', hint: 'Farming families settle unused agricultural land next to a road.' },
+  ];
+}
+
 export function alerts(sim: Sim): Alert[] {
   const s = sim.s, g = s.gov;
   const out: Alert[] = [];
+  if (s.meta.condition === 'empty' && s.citizens.length < 1500) {
+    for (const st of foundingSteps(sim).filter((x) => !x.done).slice(0, 3)) out.push({ sev: 1, text: `Founding: ${st.text.toLowerCase()}`, hint: st.hint });
+  }
   const st = s.stats.months[s.stats.months.length - 1];
   const spend = Math.max(1, sumExp(g.last));
   if (g.arrears > 0) out.push({ sev: 3, text: 'The treasury cannot pay its bills', hint: 'Raise revenue or cut spending; lenders will not lend more at this debt level.', tab: 'budget' });

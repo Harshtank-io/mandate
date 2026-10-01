@@ -56,7 +56,7 @@ button.on, .segmented button.on { background: rgba(92, 200, 176, 0.22); border-c
 button.link { background: none; border: none; padding: 0; color: #9fd8ff; text-align: left; text-decoration: underline; text-decoration-color: rgba(159, 216, 255, 0.35); }
 button.link:hover { background: none; color: #c6e8ff; }
 :focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
-input[type='text'], input[type='number'] {
+input[type='text'], input[type='number'], input[type='email'] {
   font: inherit; color: var(--text); background: rgba(0, 0, 0, 0.3); border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; width: 100%;
 }
 input[type='number'] { width: 80px; }
@@ -100,6 +100,21 @@ input[type='range'] { width: 100%; accent-color: var(--accent); }
 .saves li .buttons { margin: 0; flex-shrink: 0; }
 .notice { position: fixed; top: 80px; left: 50%; transform: translateX(-50%); padding: 12px 16px; max-width: 520px; display: flex; gap: 12px; align-items: center; z-index: 50; }
 .notice p { margin: 0; }
+
+/* ------------------------------------------------------------------ account and cloud saves */
+.account { border-top: 1px solid var(--line); padding-top: 16px; }
+.account p { margin-bottom: 0.4em; }
+.account-form input { flex: 1; min-width: 0; }
+.cloud-badge { align-self: center; font-size: 0.74rem; padding: 2px 8px; border-radius: 99px; background: rgba(255, 255, 255, 0.07); color: var(--muted); white-space: nowrap; }
+.cloud-badge.synced { color: var(--good); }
+.cloud-badge.uploading, .cloud-badge.pending { color: var(--accent-2); }
+.cloud-badge.offline, .cloud-badge.error { color: var(--muted); }
+.cloud-badge.conflict, .cloud-badge.lost { background: rgba(242, 131, 107, 0.18); color: var(--bad); }
+.conflict-choices { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 12px 0; }
+.conflict-choices > div { padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255, 255, 255, 0.03); }
+.conflict-choices h3 { margin-top: 0; }
+.conflict-choices button { margin: 4px 0 6px; }
+@media (max-width: 640px) { .conflict-choices { grid-template-columns: 1fr; } }
 
 /* ------------------------------------------------------------------ HUD layout */
 .hud { position: fixed; inset: 0; pointer-events: none; }
@@ -157,6 +172,9 @@ input[type='range'] { width: 100%; accent-color: var(--accent); }
 .rows dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
 .lines li { padding: 3px 0 3px 14px; position: relative; }
 .lines li::before { content: ''; position: absolute; left: 3px; top: 0.75em; width: 4px; height: 4px; border-radius: 50%; background: var(--muted); }
+.lines.steps-list { padding-left: 1.4em; }
+.lines.steps-list li { padding-left: 2px; }
+.lines.steps-list li::before { content: none; }
 .lines.good li::before { background: var(--good); }
 .lines.bad li::before, .lines li.bad::before { background: var(--bad); }
 .links li { padding: 2px 0; }

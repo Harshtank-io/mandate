@@ -301,8 +301,21 @@ export const CONDITIONS: StartCondition[] = [
   { id: 'agricultural', label: 'Agricultural region', blurb: 'A market town serving a wide belt of farms. Weather decides good years and bad.', population: 4200, farms: 170, treasury: 30e6, debt: 0, schools: 2, clinics: 1, hospital: false, college: false, police: 1, factories: 0, offices: 0, foodplants: 2, materials: 1, logistics: 2, construction: 1, apartmentShare: 0.1, unemployment: 0.08, wealth: 0.8, vacancy: 0.05, heritage: 1, stadium: false, museum: false },
 ];
 
+/**
+ * Empty land: no town yet. Open country by the river, the regional highway and a development grant. Roads, zoning
+ * and the first public facilities are up to the player; settlers, farmers and businesses respond to what is built.
+ */
+export const EMPTY_LAND: StartCondition = {
+  id: 'empty', label: 'Empty land', blurb: 'No town yet: open land, the regional highway and a development grant. You lay out roads, zone land and commission the first facilities; settlers, farmers and businesses follow.',
+  population: 0, farms: 0, treasury: 450e6, debt: 0, schools: 0, clinics: 0, hospital: false, college: false, police: 0, factories: 0, offices: 0, foodplants: 0, materials: 0, logistics: 0, construction: 0,
+  apartmentShare: 0, unemployment: 0, wealth: 1, vacancy: 0, heritage: 0, stadium: false, museum: false,
+};
+
+/** Every way a world can start: an existing town of some kind, or empty land. */
+export const START_OPTIONS: StartCondition[] = [...CONDITIONS, EMPTY_LAND];
+
 export function getCondition(id: string): StartCondition {
-  return CONDITIONS.find((c) => c.id === id) ?? CONDITIONS[0];
+  return START_OPTIONS.find((c) => c.id === id) ?? CONDITIONS[0];
 }
 
 export const START_YEARS = [1995, 2005, 2015, 2026];

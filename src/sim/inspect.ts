@@ -5,7 +5,7 @@ import { formatDay, spanText } from './calendar';
 import { hhIncome } from './econ';
 import { idx, sumExp, sumRev, W, type Sim } from './core';
 import { BUILDINGS, BUSINESSES, CROPS, EDU_LABEL, FIELD_LABEL, GOOD_SPECS, ROAD_CAPACITY, ROAD_SPEED, ROLES, cropTempFactor } from './tables';
-import { fmtMoney, isRoadwork } from './systems/construction';
+import { fmtMoney, isRoadwork, OUTSIDE_CONTRACTOR } from './systems/construction';
 import { DEPT_LABELS } from './systems/government';
 import { envAt } from './systems/environment';
 import { cellOf, SAT_WEIGHTS, satisfactionParts, type SatParts } from './systems/services';
@@ -349,6 +349,7 @@ export function inspectProject(sim: Sim, p: Project): Card {
   if (p.phase !== 'done' && p.phase !== 'cancelled') rows.push(['Expected completion', formatDay(s.meta.startYear, Math.max(sim.day + 1, planned))]);
   const contractor = p.contractor >= 0 ? sim.biz(p.contractor) : undefined;
   if (contractor) rows.push(['Contractor', contractor.name]);
+  else if (p.contractor === OUTSIDE_CONTRACTOR) rows.push(['Contractor', 'Outside contractor (no local firm had a crew)']);
   const sections: Section[] = [];
   if (p.issue) sections.push({ title: 'Current problem', lines: [p.issue] });
   const delays = Object.entries(p.issues).sort((a, b) => b[1] - a[1]);

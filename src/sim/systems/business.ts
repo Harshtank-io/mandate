@@ -133,7 +133,8 @@ function adjustJobs(sim: Sim, b: Business, after: number): void {
     case 'construction': {
       // crews follow the order book: project crews plus maintenance contracts
       let demand = 0;
-      for (const p of sim.s.projects) if (p.phase === 'construction' && (p.contractor === b.id || p.contractor < 0)) demand += BUILDINGS[p.kind as keyof typeof BUILDINGS]?.crew ?? 15;
+      // sites already contracted to an outside firm (contractor -2) are not work this firm will get
+      for (const p of sim.s.projects) if (p.phase === 'construction' && (p.contractor === b.id || p.contractor === -1)) demand += BUILDINGS[p.kind as keyof typeof BUILDINGS]?.crew ?? 15;
       const crew = b.jobs.filter((j) => j.role === 'laborer').length;
       if ((demand > crew * 1.1 || margin > 0.12) && after > 0 && vacant <= 2 && b.jobs.length < b.capacity * 2) sim.addJobs(b, 'laborer', Math.min(8, Math.max(1, Math.ceil((demand - crew) / 3))));
       else if (b.lossMonths >= 2 && crew > 6) cutJobs(sim, b, Math.max(1, Math.round(crew * 0.15)), 'Not enough construction contracts.');

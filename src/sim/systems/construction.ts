@@ -3,9 +3,11 @@
 // money and weather, and every lost day is recorded with its reason.
 
 import { idx, W, type Account, type Sim } from '../core';
+import { casualWage } from '../econ';
 import { BASE_RENT, BUILDINGS, BUSINESSES, HA_PER_TILE, HOUSING_YIELD, ROADWORKS, unitsFor } from '../tables';
 import { RoadClass, Terrain, type Building, type BuildingKind, type Business, type BusinessKind, type Project, type ProjectKind, type ProjectPhase } from '../types';
 import { businessName } from '../names';
+import { settleFarmFamily } from './population';
 import { refreshTileTimes } from './transport';
 import { badWeather } from './weather';
 
@@ -250,10 +252,50 @@ function pickContractor(sim: Sim, committed: Map<number, number>): Business | un
   for (const b of sim.s.businesses) {
     if (b.kind !== 'construction' || b.status !== 'operating') continue;
     const crew = b.jobs.filter((j) => j.role === 'laborer' && j.worker >= 0).length;
+    if (crew <= 0) continue; // a yard without labourers cannot take on work
     const free = crew - (committed.get(b.id) ?? 0);
     if (!best || free > spare) { best = b; spare = free; }
   }
   return best;
+}
+
+/** Contractor id used for projects built by a firm from outside the city. */
+export const OUTSIDE_CONTRACTOR = -2;
+/** Outside firms charge more for labour: travel, lodging and their overheads. */
+export const OUTSIDE_PREMIUM = 1.3;
+
+/**
+ * Local labourers the town needs before its own construction firms take on new projects. A new town relies on
+ * outside contractors until its first local firm has a real crew; elsewhere they step in only when there is none.
+ */
+export function minLocalCrew(sim: Sim): number { return sim.s.meta.condition === 'empty' ? 8 : 1; }
+
+/** Healthy labourers on the books of local construction firms. */
+export function localLabourers(sim: Sim): number {
+  let n = 0;
+  for (const b of sim.s.businesses) {
+    if (b.kind !== 'construction' || b.status !== 'operating') continue;
+    for (const j of b.jobs) if (j.role === 'laborer' && j.worker >= 0) { const c = sim.cit(j.worker); if (c && c.injured <= 0) n++; }
+  }
+  return n;
+}
+
+/** Local people taken on as day labourers by an outside contractor. Pays each one and returns how many came. */
+function dayLabour(sim: Sim, wanted: number, pay: (to: Account, amt: number) => void): number {
+  const ix = sim.ix;
+  const cap = Math.floor(ix.casualPool.length * 0.6);
+  const wage = casualWage(sim);
+  let got = 0;
+  while (got < wanted && ix.casualUsed < cap) {
+    const c = sim.cit(ix.casualPool[ix.casualUsed++]);
+    if (!c) continue;
+    const h = sim.hh(c.hh);
+    if (!h) continue;
+    pay(h, wage);
+    h.m.wages += wage;
+    got++;
+  }
+  return got;
 }
 
 function delay(p: Project, reason: string): void {
@@ -277,6 +319,9 @@ export function constructionDaily(sim: Sim): void {
     crews.set(b.id, n);
   }
   for (const p of s.projects) if (p.phase === 'construction' && p.contractor >= 0) committed.set(p.contractor, (committed.get(p.contractor) ?? 0) + (BUILDINGS[p.kind as BuildingKind]?.crew ?? 20));
+  let localCrew = 0;
+  for (const n of crews.values()) localCrew += n;
+  const minLocal = minLocalCrew(sim);
   const done: Project[] = [];
   const ordered = [...s.projects].sort((a, b) => Number(b.gov) - Number(a.gov) || a.created - b.created);
   for (const p of ordered) {
@@ -297,31 +342,39 @@ export function constructionDaily(sim: Sim): void {
       case 'construction': {
         if (weatherStop) { delay(p, 'Heavy rain / flooding halted work'); break; }
         if (!work) break;
-        let c = p.contractor >= 0 ? sim.biz(p.contractor) : undefined;
-        if (!c || c.status !== 'operating') {
-          c = pickContractor(sim, committed);
-          if (!c) { delay(p, 'No construction company available'); break; }
-          p.contractor = c.id;
-          committed.set(c.id, (committed.get(c.id) ?? 0) + (BUILDINGS[p.kind as BuildingKind]?.crew ?? 20));
-        }
         const maxCrew = isRoadwork(p.kind) ? Math.min(60, ROADWORKS[p.kind as keyof typeof ROADWORKS].crew + p.tiles.length) : BUILDINGS[p.kind as BuildingKind].crew;
-        const avail = crews.get(c.id) ?? 0;
-        // very large public works bring in a national contractor's crews alongside local firms
-        const outside = BIG_WORKS.has(p.kind) ? Math.max(0, Math.round(maxCrew * 0.7) - avail) : 0;
-        const localWorkers = Math.min(maxCrew, avail);
-        const workers = Math.min(maxCrew, localWorkers + outside);
-        if (workers <= 0) { delay(p, 'Contractor has no free workers'); break; }
+        let c = p.contractor >= 0 ? sim.biz(p.contractor) : undefined;
+        if (p.contractor !== OUTSIDE_CONTRACTOR && (!c || c.status !== 'operating')) {
+          c = localCrew >= minLocal ? pickContractor(sim, committed) : undefined;
+          // in a new town, work goes to outside firms rather than queueing behind a local firm whose crews are taken
+          if (c && sim.frontier() > 0 && (crews.get(c.id) ?? 0) - (committed.get(c.id) ?? 0) < Math.min(8, maxCrew) * 0.75) c = undefined;
+          if (c) {
+            p.contractor = c.id;
+            committed.set(c.id, (committed.get(c.id) ?? 0) + (BUILDINGS[p.kind as BuildingKind]?.crew ?? 20));
+          } else {
+            // no local firm has a crew: a contractor from outside the city takes the job
+            p.contractor = OUTSIDE_CONTRACTOR;
+            sim.emit('project.outside', `No local construction company can take on ${p.name}; an outside contractor is building it.`, 1, { k: 'project', id: p.id }, undefined,
+              [`Outside firms charge about ${Math.round((OUTSIDE_PREMIUM - 1) * 100)}% more for labour, and most of the money leaves the city`, 'They take on local people as day labourers when they can']);
+          }
+        }
+        const outsideFirm = p.contractor === OUTSIDE_CONTRACTOR;
+        const avail = c ? crews.get(c.id) ?? 0 : 0;
+        const local = c ? Math.min(maxCrew, avail) : 0;
+        // outside crews: the whole crew for an outside contractor; on very large public works a national contractor
+        // also works alongside the local firm
+        const extra = outsideFirm ? maxCrew : BIG_WORKS.has(p.kind) ? Math.min(maxCrew - local, Math.max(0, Math.round(maxCrew * 0.7) - avail)) : 0;
+        if (local + extra <= 0) { delay(p, 'Contractor has no free workers'); break; }
         const matAllowed = p.materials > 0 ? (p.matDelivered / p.materials) * p.labor + p.labor * 0.05 : p.labor;
         if (p.laborDone >= matAllowed) { delay(p, 'Waiting for building materials'); break; }
         const rate = laborRate(sim);
-        const cost = workers * rate;
+        const outRate = rate * OUTSIDE_PREMIUM;
+        const cost = local * rate + extra * outRate;
+        let sp: Business | undefined;
         if (p.gov) {
           if (s.gov.arrears > 0 && s.gov.cash < cost) { delay(p, 'Government cannot pay the contractor'); break; }
-          const outsideCost = (workers - localWorkers) * rate * 1.2;
-          sim.spend('capital', c, localWorkers * rate);
-          if (outsideCost > 0) { sim.spend('capital', s.ext, outsideCost); p.spent += outsideCost - (workers - localWorkers) * rate; }
         } else {
-          const sp = sim.biz(p.sponsor);
+          sp = sim.biz(p.sponsor);
           if (!sp) { delay(p, 'Developer has gone out of business'); break; }
           if (sp.cash < cost) {
             // lenders cover overruns until spending reaches 130% of the original budget
@@ -329,15 +382,26 @@ export function constructionDaily(sim: Sim): void {
             if (room > cost) { const borrow = Math.min(room, cost * 10); sim.pay(s.ext, sp, borrow); sp.loan += borrow; }
             else { delay(p, 'Developer is short of cash'); break; }
           }
-          sim.pay(sp, c, cost); // capital outlay, not an operating cost
         }
-        c.m.revenue += p.gov ? localWorkers * rate : cost;
-        crews.set(c.id, Math.max(0, avail - localWorkers));
+        // capital outlay (not an operating cost of the sponsor)
+        const payer = sp;
+        const pay = (to: Account, amt: number) => { if (!(amt > 0)) return; if (payer) sim.pay(payer, to, amt); else sim.spend('capital', to, amt); };
+        if (c && local > 0) {
+          pay(c, local * rate);
+          c.m.revenue += local * rate;
+          crews.set(c.id, Math.max(0, avail - local));
+        }
+        if (extra > 0) {
+          // an outside firm takes on local people as day labourers and brings the rest of its crew from elsewhere
+          const day = outsideFirm ? dayLabour(sim, Math.floor(maxCrew * 0.6), pay) : 0;
+          pay(s.ext, extra * outRate - day * casualWage(sim));
+        }
+        const workers = local + extra;
         p.spent += cost;
         p.laborDone += workers * 0.9;
         p.workersToday = workers;
         p.issue = '';
-        const remaining = (Math.max(0, p.labor - p.laborDone) / 0.9) * rate + Math.max(0, p.materials - p.matDelivered - p.matOrdered) * s.market.materials.price * 1.05;
+        const remaining = (Math.max(0, p.labor - p.laborDone) / 0.9) * (outsideFirm ? outRate : rate) + Math.max(0, p.materials - p.matDelivered - p.matOrdered) * s.market.materials.price * 1.05;
         const equipment = isRoadwork(p.kind) ? 0 : BUILDINGS[p.kind as BuildingKind].equipment * sim.scale * s.ext.trend;
         p.cost = p.spent + remaining + equipment + (p.phase === 'construction' ? 0 : p.landCost);
         if (p.laborDone >= p.labor && p.matDelivered >= p.materials * 0.98) done.push(p);
@@ -454,9 +518,11 @@ function complete(sim: Sim, p: Project): void {
       biz.status = 'registering';
       biz.statusDay = sim.day;
       sim.ix.storesDirty = true;
+      // a settler family's farmhouse is ready: the family moves in and starts working its fields
+      if (biz.kind === 'farm') settleFarmFamily(sim, biz, b);
     }
   }
-  if (!p.gov && b.units > 0) sellHomes(sim, p, b);
+  if (!p.gov && b.units > 0 && kind !== 'farmhouse') sellHomes(sim, p, b);
   p.phase = 'done';
   if (p.gov) sim.emit('project.completed', `${b.name || spec.label} completed${p.delayDays > 20 ? `, ${p.delayDays} days late` : ''}.`, 1, { k: 'building', id: b.id }, undefined, lateReasons(p));
 }
@@ -468,7 +534,8 @@ function complete(sim: Sim, p: Project): void {
 function sellHomes(sim: Sim, p: Project, b: Building): void {
   const s = sim.s;
   const dev = sim.biz(p.sponsor);
-  const price = (b.rent * b.units * 12 * 0.92) / HOUSING_YIELD;
+  // in a new town investors pay a premium, betting that rents and values will rise as it grows
+  const price = ((b.rent * b.units * 12 * 0.92) / HOUSING_YIELD) * (1 + 0.3 * sim.frontier());
   b.value = price;
   const buyer = s.households.filter((h) => h.home >= 0 && h.cash > price * 1.5).sort((x, y) => y.cash - x.cash)[0];
   if (buyer) {

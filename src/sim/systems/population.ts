@@ -5,7 +5,7 @@ import { emptyHhLedger, type Sim } from '../core';
 import { hhIncome } from '../econ';
 import { firstName, lastName } from '../names';
 import { ROLES } from '../tables';
-import type { Business, Citizen, Household } from '../types';
+import type { Building, Business, Citizen, Household } from '../types';
 
 const SQRT_PI = Math.sqrt(Math.PI);
 
@@ -28,6 +28,44 @@ function newHousehold(sim: Sim, cash: number): Household {
     m: emptyHhLedger(), last: emptyHhLedger(), foodSec: 1, arrived: sim.day, rentArrears: 0, unhappy: 0, incAvg: 0, ration: 0, leisure: 0.5,
   };
   sim.addHousehold(h);
+  return h;
+}
+
+/**
+ * A farming family arrives and moves into the farmhouse it has had built on land allotted to it. The working-age
+ * members run the farm together, as on the farms that were already there.
+ */
+export function settleFarmFamily(sim: Sim, farm: Business, home: Building): Household {
+  const s = sim.s, r = sim.rng;
+  const n = sim.scale * s.ext.trend;
+  const h = newHousehold(sim, 0);
+  sim.pay(s.ext, h, (40_000 + 60_000 * r.next()) * n); // savings from the land they left behind
+  const last = lastName(sim);
+  const head = newCitizen(sim, h, 26 + r.int(22), r.chance(0.12), last, { edu: r.int(3), schoolYears: 2 + r.int(8) });
+  if (r.chance(0.85)) {
+    const partner = newCitizen(sim, h, Math.max(20, sim.age(head) - 3 + r.int(6)), !head.female, last, { edu: r.int(3), schoolYears: 2 + r.int(8) });
+    head.partner = partner.id; partner.partner = head.id;
+  }
+  for (let q = 0, kids = 1 + r.int(3); q < kids; q++) newCitizen(sim, h, r.int(16), r.chance(0.5), last);
+  if (r.chance(sim.preset.elderWithFamily)) newCitizen(sim, h, 62 + r.int(12), r.chance(0.55), last, { status: 'retired' });
+  h.bike = r.chance(sim.preset.bike2026);
+  sim.moveIn(h, home, true);
+  home.ownerT = 2; home.ownerId = farm.id;
+  farm.owner = head.id;
+  for (const id of h.members) {
+    const c = sim.cit(id)!;
+    const a = sim.age(c);
+    if (c === head || (a >= 18 && a <= 65 && c.status !== 'retired')) { c.status = 'owner'; c.employer = farm.id; c.job = -1; }
+  }
+  h.incAvg = 9_000 * n * (1 + (farm.farm?.ha ?? 2) / 2);
+  farm.status = 'operating';
+  farm.statusDay = sim.day;
+  if (farm.farm) farm.farm.plan = 'Newly settled: waiting for the next sowing window';
+  s.stats.acc.opened++;
+  s.stats.acc.immigrants += h.members.length;
+  sim.ix.ver.farms++;
+  sim.emit('business.opened', `The ${last} family has moved onto ${farm.name} (${(farm.farm?.ha ?? 0).toFixed(1)} ha).`, 1, { k: 'building', id: home.id }, undefined,
+    ['Unused farmland in the new town was allotted to settler families']);
   return h;
 }
 
@@ -221,8 +259,11 @@ function immigration(sim: Sim): void {
   const pop = s.citizens.length;
   const attract = Math.max(0.1, Math.min(1.5, 0.4 + s.gov.approval));
   const unemp = s.labor.unemployed.reduce((a, x) => a + x, 0);
+  const fr = sim.frontier();
   // job-driven migration plus a small rural-urban drift when homes are available
   let lambda = Math.max(0, vac.length - unemp * 0.5) * 0.12 * attract + (freeUnits > 0 ? pop * 0.0006 * attract * (1 + 4 * Math.max(0, sim.s.housing.vacancy - 0.05)) : 0);
+  // a new town draws settlers from the surrounding region as soon as there are homes to move into
+  if (fr > 0 && freeUnits > 0) lambda += fr * attract * Math.min(freeUnits * 0.6, 5);
   if (freeUnits <= 0) lambda *= 0.15;
   else lambda = Math.min(lambda, freeUnits * 0.5 + 1);
   const n = r.poisson(lambda);
@@ -233,6 +274,8 @@ function immigration(sim: Sim): void {
     const wage = role ? sim.roleWage(role.id) : sim.roleWage('helper');
     const h = newHousehold(sim, 0);
     sim.pay(s.ext, h, wage * (1.5 + 3 * r.next())); // newcomers bring savings from outside
+    // some settlers in a new town are traders and craftspeople who bring the capital to open a business
+    if (fr > 0 && !target && r.chance(0.25)) sim.pay(s.ext, h, (1_200_000 + 2_500_000 * r.next()) * sim.scale * s.ext.trend);
     const last = lastName(sim);
     const female = r.chance(0.3);
     const head = newCitizen(sim, h, 23 + r.int(22), female, last, {

@@ -8,10 +8,12 @@ import { alerts } from '../sim/summary';
 import { explain, projectProgress, REV_LABELS, type MetricKey, type Ref } from '../sim/inspect';
 import { announcePolicy, announceTax, cancel, describeValue, policyEffects, policyRange, setFunding, taxEffects, taxRange } from '../sim/commands';
 import { DEPT_LABELS, POLICY_DELAY, POLICY_LABELS, TAX_LABELS } from '../sim/systems/government';
-import { MILESTONES } from '../sim/systems/milestones';
+import { milestonesFor } from '../sim/systems/milestones';
 import { OFFLINE_CAPS, PACES, getPreset } from '../sim/presets';
 import { DEPTS, type MonthStats, type Policies, type RevCat, type TaxSettings } from '../sim/types';
 import { deleteSave, listSaves, type SaveMeta } from '../game/persist';
+import { activeSync } from '../net/sync';
+import { CloudSection } from './account';
 import { Chart, dayLabel, money, num, pct, realSpan, SectionView, Spark } from './util';
 
 export type Tab = 'overview' | 'budget' | 'taxes' | 'policies' | 'projects' | 'news' | 'milestones' | 'saves';
@@ -436,12 +438,13 @@ export function News({ ctx }: { ctx: Ctx }) {
 export function Milestones({ ctx }: { ctx: Ctx }) {
   const { sim } = ctx;
   const got = sim.s.milestones;
-  const done = MILESTONES.filter((m) => got[m.id] !== undefined);
+  const list = milestonesFor(sim);
+  const done = list.filter((m) => got[m.id] !== undefined);
   return (
     <div class="panel-body">
-      <p class="muted">Milestones are recognised when the simulation reaches them. {done.length} of {MILESTONES.length} reached.</p>
+      <p class="muted">Milestones are recognised when the simulation reaches them. {done.length} of {list.length} reached.</p>
       <ul class="milestones">
-        {MILESTONES.map((m) => {
+        {list.map((m) => {
           const d = got[m.id];
           return (
             <li key={m.id} class={d !== undefined ? 'done' : ''}>
@@ -493,6 +496,7 @@ export function Saves({ ctx }: { ctx: Ctx }) {
           <button class="ghost" onClick={() => ctx.menu()}>Main menu</button>
         </div>
       </section>
+      <CloudSection onSaveNow={() => void game.save('Autosave').then((m) => { if (m) void activeSync()?.upload(); })} />
       <section>
         <h3>Save a copy</h3>
         <div class="inline">

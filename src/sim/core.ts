@@ -184,6 +184,14 @@ export class Sim {
 
   isWorkDay(): boolean { return this.date.dow !== 0; }
 
+  /**
+   * How much a town founded on empty land is still a frontier settlement: 1 at the start, falling to 0 as it passes
+   * 3,000 residents. Towns that existed when the world was created are never frontiers.
+   */
+  frontier(): number {
+    return this.s.meta.condition === 'empty' ? Math.max(0, 1 - this.s.citizens.length / 3000) : 0;
+  }
+
   // ---------------------------------------------------------------- lookups
   cit(id: number) { return this.ix.cit.get(id); }
   hh(id: number) { return this.ix.hh.get(id); }

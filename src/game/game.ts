@@ -39,6 +39,10 @@ export class Game {
   /** Multiplier on the world's pace; 0 = paused. */
   speed = 1;
   busy = false;
+  /** Set when another device has taken this town over: time stops here and nothing more is saved. */
+  locked = false;
+  /** Called after every successful save to this device (used by cloud sync). */
+  onSaved?: () => void;
   version = 0;
   lastSaved = 0;
   saveError = '';
@@ -113,9 +117,11 @@ export class Game {
     return report;
   }
 
+  get isSaving(): boolean { return this.saving; }
+
   /** Called once per animation frame with the real milliseconds since the last frame. */
   frame(realMs: number): void {
-    if (this.busy) return;
+    if (this.busy || this.locked) return;
     // slow frames still advance the world by the real time that passed (up to a second; longer gaps are
     // absences, handled by catch-up when the tab becomes visible again)
     const dt = Math.min(Math.max(0, realMs), 1000);
@@ -134,7 +140,7 @@ export class Game {
   }
 
   async save(label = 'Autosave'): Promise<SaveMeta | null> {
-    if (this.saving) return null;
+    if (this.saving || this.locked) return null;
     this.saving = true;
     this.lastAutosave = Date.now();
     this.state.meta.lastReal = Date.now();
@@ -142,6 +148,7 @@ export class Game {
       const meta = await putSave(this.state, 'auto', label);
       this.lastSaved = Date.now();
       this.saveError = '';
+      this.onSaved?.();
       return meta;
     } catch (e) {
       this.saveError = e instanceof Error ? e.message : String(e);
@@ -152,6 +159,7 @@ export class Game {
   }
 
   async saveAs(label: string): Promise<SaveMeta> {
+    if (this.locked) throw new Error('This town is open on another device.');
     this.state.meta.lastReal = Date.now();
     return putSave(this.state, 'manual', label || 'Manual save');
   }
@@ -175,7 +183,7 @@ export class Game {
       } else if (this.hiddenAt) {
         const away = Date.now() - this.hiddenAt;
         this.hiddenAt = 0;
-        if (away > 60_000) {
+        if (away > 60_000 && !this.locked) {
           this.state.meta.lastReal = Date.now() - away;
           void this.catchUp(onProgress).then((r) => { if (r) onAway(r); });
         }

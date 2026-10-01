@@ -96,7 +96,7 @@ export function housingMonthly(sim: Sim): void {
   }
   if (evicted >= 5) sim.emit('housing.evictions', `${evicted} households were evicted for unpaid rent last month.`, 2, undefined, undefined,
     [`Rents have risen to ${Math.round(hs.rentIndex * 100)}% of their starting level`, 'Unemployment and low wages leave some families unable to pay']);
-  developers(sim, vacancy, homeless);
+  developers(sim, vacancy, homeless, units - occupied);
 }
 
 function realestate(sim: Sim): Business {
@@ -137,7 +137,7 @@ export function findLot(sim: Sim, zones: number[], w = 1, h = 1): { x: number; y
   return best;
 }
 
-function developers(sim: Sim, vacancy: number, homeless: number): void {
+function developers(sim: Sim, vacancy: number, homeless: number, vacantUnits: number): void {
   const s = sim.s;
   const nominal = sim.scale * s.ext.trend;
   const control = s.gov.policies.rentControl;
@@ -145,17 +145,27 @@ function developers(sim: Sim, vacancy: number, homeless: number): void {
   const active = s.projects.filter((p) => !p.gov && (p.kind === 'house' || p.kind === 'apartment') && p.phase !== 'done' && p.phase !== 'cancelled');
   const pipeline = active.reduce((a, p) => a + (p.kind === 'apartment' ? p.floors * 4 : 1), 0);
   const lastImm = s.stats.months.length ? s.stats.months[s.stats.months.length - 1].immigrants / 3.5 : 0;
-  const need = homeless + s.households.length * (0.05 - vacancy) + lastImm - pipeline;
+  let need = homeless + s.households.length * (0.05 - vacancy) + lastImm - pipeline;
+  // in a new town developers build ahead of demand: they keep homes ready for the settlers they expect, more as the
+  // town grows and when jobs are waiting for workers
+  const fr = sim.frontier();
+  if (fr > 0) {
+    let jobsWaiting = 0;
+    for (let t = 0; t < 5; t++) jobsWaiting += s.labor.vacancies[t] - s.labor.unemployed[t];
+    need = Math.max(need, fr * (8 + 0.6 * Math.max(0, jobsWaiting)) + 0.15 * s.households.length - vacantUnits - pipeline);
+  }
   if (need <= 0) return;
-  // developers build to sell: investors pay a price that capitalises the rent at the market yield
+  // developers build to sell: investors pay a price that capitalises the rent at the market yield (with a premium
+  // in a new town, where they expect values to rise)
+  const premium = 1 + 0.3 * fr;
   const aptEst = estimate(sim, 'apartment', [0], 6, false);
   const houseEst = estimate(sim, 'house', [0], 1, false);
   const aptRent = (BASE_RENT.apartment ?? 0) * nominal * s.housing.rentIndex * 1.05;
   const houseRent = (BASE_RENT.house ?? 0) * nominal * s.housing.rentIndex * 1.05;
-  const mApt = (aptRent * 24 * 12 * 0.92) / HOUSING_YIELD / aptEst.cost - 1;
-  const mHouse = (houseRent * 12 * 0.95) / HOUSING_YIELD / houseEst.cost - 1;
+  const mApt = ((aptRent * 24 * 12 * 0.92) / HOUSING_YIELD) * premium / aptEst.cost - 1;
+  const mHouse = ((houseRent * 12 * 0.95) / HOUSING_YIELD) * premium / houseEst.cost - 1;
   let left = need;
-  const maxStarts = 1 + Math.floor(s.citizens.length / 2500);
+  const maxStarts = 1 + Math.floor(s.citizens.length / 2500) + Math.round(3 * fr);
   for (let k = 0; k < maxStarts && left > 0; k++) {
     const apt = mApt >= hurdle && left >= 10;
     if (!apt && mHouse < hurdle) {
@@ -173,7 +183,7 @@ function developers(sim: Sim, vacancy: number, homeless: number): void {
     }
     const dev = realestate(sim);
     const kind = apt ? 'apartment' : 'house';
-    const floors = apt ? 110 : 1;
+    const floors = apt ? 6 : 1; // matches the 6-floor block costed above (24 homes)
     createProject(sim, {
       kind, x: lot.x, y: lot.y, w: 1, h: 1, floors, gov: false, sponsor: dev.id,
       name: `${BUILDINGS[kind].label} by ${dev.name}`, reason: `Vacancy ${Math.round(vacancy * 100)}%, ${homeless} families without a home`,

@@ -1,5 +1,6 @@
 // Monthly statistics. Every number here is computed from the simulated entities, never generated.
 
+import { dateOf } from '../calendar';
 import { emptyAcc, sumExp, sumRev, type Sim } from '../core';
 import { foodRetail, goodsRetail, hhIncome, mealPrice, vegRetail } from '../econ';
 import { GOODS, Terrain, type MonthStats } from '../types';
@@ -116,7 +117,7 @@ export function statsMonthly(sim: Sim): void {
     basket, roadKm: rs.km, poorRoads: rs.poor,
     leisure: s.leisure.avg,
     tourists: T.domestic + T.foreign, foreignTourists: T.foreign, touristNights: T.nights, tourismSpend: T.spend, turnedAway: T.turned,
-    hotelRooms: rooms, occupancy: rooms > 0 ? roomNights / (rooms * sim.date.daysInMonth) : 0, appeal: s.tourism.appeal,
+    hotelRooms: rooms, occupancy: rooms > 0 ? roomNights / (rooms * dateOf(s.meta.startYear, sim.day - 1).daysInMonth) : 0, appeal: s.tourism.appeal,
     passengers: s.air.m.pax, flights: s.air.m.flights,
     tradeBalance: exportsV - importsV, fx: s.trade.fx,
     procured: s.pds.procured, grainStock: s.pds.stock, rationed: s.pds.rationed,

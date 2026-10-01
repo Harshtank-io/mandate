@@ -1,7 +1,7 @@
 // New world: choose a place, a starting year, starting conditions, a name and how fast the world lives.
 
 import { useState } from 'preact/hooks';
-import { CONDITIONS, OFFLINE_CAPS, PACES, PRESETS, START_YEARS, getPreset } from '../sim/presets';
+import { OFFLINE_CAPS, PACES, PRESETS, START_OPTIONS, START_YEARS, getPreset } from '../sim/presets';
 import type { NewWorldOptions } from '../sim/worldgen';
 
 const STEPS = ['Place', 'Year', 'Starting point', 'Your mandate'];
@@ -53,7 +53,7 @@ export function NewGame({ onCreate, onBack }: { onCreate(o: NewWorldOptions): vo
         {step === 1 && (
           <section>
             <h2>When do you take office?</h2>
-            <p class="muted">Prices, wages, car ownership and education levels are set to match the year. The simulation runs the year before you arrive, so the place has a recent history.</p>
+            <p class="muted">Prices, wages, car ownership and education levels are set to match the year. For an existing town the simulation runs the year before you arrive, so the place has a recent history.</p>
             <div class="choices row" role="radiogroup" aria-label="Year">
               {START_YEARS.map((y) => (
                 <button key={y} role="radio" aria-checked={year === y} class={`choice ${year === y ? 'on' : ''}`} onClick={() => setYear(y)}><b>{y}</b></button>
@@ -65,8 +65,9 @@ export function NewGame({ onCreate, onBack }: { onCreate(o: NewWorldOptions): vo
         {step === 2 && (
           <section>
             <h2>What kind of place?</h2>
+            <p class="muted">Take over an existing town, or start from empty land and build one yourself.</p>
             <div class="choices" role="radiogroup" aria-label="Starting conditions">
-              {CONDITIONS.map((c) => (
+              {START_OPTIONS.map((c) => (
                 <button key={c.id} role="radio" aria-checked={cond === c.id} class={`choice ${cond === c.id ? 'on' : ''}`} onClick={() => setCond(c.id)}>
                   <b>{c.label}</b>
                   <span class="small">{c.blurb}</span>
@@ -102,7 +103,7 @@ export function NewGame({ onCreate, onBack }: { onCreate(o: NewWorldOptions): vo
                 ))}
               </div>
             </fieldset>
-            <p class="muted">{p.label}, {p.country} · taking office in {year} · {CONDITIONS.find((c) => c.id === cond)?.label.toLowerCase()}</p>
+            <p class="muted">{p.label}, {p.country} · taking office in {year} · {START_OPTIONS.find((c) => c.id === cond)?.label.toLowerCase()}</p>
           </section>
         )}
 

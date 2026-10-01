@@ -41,7 +41,7 @@ export function roomRate(sim: Sim, foreign: boolean): number {
 }
 
 /** The attractions index and its parts: what there is to see and do, and how pleasant the city is to visit. */
-export function computeAppeal(sim: Sim): void {
+export function computeAppeal(sim: Sim, population?: number): void {
   const s = sim.s, T = s.tourism;
   const parts: Record<string, number> = { heritage: 0, museum: 0, stadium: 0, parks: 0, nature: sim.preset.tourism.nature, river: 0.2, food: 0, cinema: 0 };
   let parks = 0, restaurants = 0, cinemas = 0;
@@ -64,8 +64,10 @@ export function computeAppeal(sim: Sim): void {
   const clean = 1 - Math.min(0.4, (st?.pollution ?? 0) * 0.8);
   const crowd = 1 / (1 + Math.max(0, s.traffic.congestion - 1.15) * 0.6);
   const sum = Object.values(parts).reduce((a, x) => a + x, 0);
-  T.appeal = sum * safety * clean * crowd;
-  T.appealParts = { ...parts, xSafety: safety, xClean: clean, xCrowd: crowd };
+  // a settlement too small to put visitors up, feed them or show them around is not yet a destination
+  const town = Math.min(1, (population ?? s.citizens.length) / 1500);
+  T.appeal = sum * safety * clean * crowd * town;
+  T.appealParts = { ...parts, xSafety: safety, xClean: clean, xCrowd: crowd, xTown: town };
 }
 
 /** What visitors present today spend besides their rooms. Returns the total paid. */
@@ -107,7 +109,7 @@ function spendFrom(sim: Sim, ext: Account, d: number, f: number): number {
 
 export function tourismDaily(sim: Sim): void {
   const s = sim.s, T = s.tourism, r = sim.rng, pol = s.gov.policies;
-  if (!T.appeal) computeAppeal(sim);
+  if (T.appealParts.nature === undefined) computeAppeal(sim);
   const season = T.season[sim.date.month] ?? 1;
   const fest = T.festival > 0 ? 1 + FESTIVAL_BOOST[Math.max(1, pol.festival)] : 1;
   const rep = 0.5 + T.reputation;

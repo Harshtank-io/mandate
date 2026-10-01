@@ -5,7 +5,7 @@
 import { dateOf, dayIndex, formatDay } from './calendar';
 import { idx, inMap, W, type Sim } from './core';
 import { BUILDINGS, BUSINESSES, ROADWORKS, ROLES } from './tables';
-import { cancelProject, createProject, estimate, fmtMoney, isRoadwork, type Estimate } from './systems/construction';
+import { cancelProject, createProject, estimate, fmtMoney, isRoadwork, localLabourers, minLocalCrew, OUTSIDE_PREMIUM, type Estimate } from './systems/construction';
 import { DEPT_LABELS, POLICY_DELAY, POLICY_LABELS, TAX_LABELS } from './systems/government';
 import { projectedPassengers } from './systems/aviation';
 import { AIRPORT_COFUND, AIRPORT_MIN_DEMAND } from './tables';
@@ -239,9 +239,11 @@ function tileProblem(sim: Sim, t: number, road: boolean, bridge: boolean): strin
   return null;
 }
 
+const OUTSIDE_NOTE = `No local construction company has a crew yet: an outside contractor will build this, charging about ${Math.round((OUTSIDE_PREMIUM - 1) * 100)}% more for labour than estimated and taking on local people as day labourers.`;
+
 function contractorLoad(sim: Sim): { workers: number; active: number } {
-  let workers = 0, active = 0;
-  for (const b of sim.s.businesses) if (b.kind === 'construction' && b.status === 'operating') workers += b.jobs.filter((j) => j.role === 'laborer' && j.worker >= 0).length;
+  let active = 0;
+  const workers = localLabourers(sim);
   for (const p of sim.s.projects) if (p.phase === 'construction' || p.phase === 'planning' || p.phase === 'approval' || p.phase === 'land' || p.phase === 'assessment' || p.phase === 'funding') active++;
   return { workers, active };
 }
@@ -293,7 +295,9 @@ export function previewBuilding(sim: Sim, kind: BuildingKind, x: number, y: numb
   requirements.push(`Budget: ${fmtMoney(sim, est.cost)}${est.equipment > 0 ? ` including ${fmtMoney(sim, est.equipment)} of equipment` : ''}`);
   if (est.landCost > 0) requirements.push(`Land: ${fmtMoney(sim, est.landCost)} to acquire${est.farmsAffected ? ` fields from ${est.farmsAffected} farm${est.farmsAffected > 1 ? 's' : ''}` : ''}${est.displaced ? `, relocating ${est.displaced} household${est.displaced > 1 ? 's' : ''}` : ''}`);
   const cl = contractorLoad(sim);
+  const outside = cl.workers < minLocalCrew(sim);
   requirements.push(`Construction: ${Math.round(est.labor)} worker-days and ${Math.round(est.materials)} t of materials (crews of up to ${est.crew}; local contractors employ ${cl.workers} labourers)`);
+  if (outside) warnings.push(OUTSIDE_NOTE);
   for (const s of staff) if (ROLES[s.role].edu >= 3) requirements.push(`Staff: ${s.n} ${ROLES[s.role].label.toLowerCase()}${s.n > 1 ? 's' : ''} (${s.avail} qualified people are looking for work)`);
   // benefits
   const served = BUILDINGS[kind].biz ? BUSINESSES[BUILDINGS[kind].biz as keyof typeof BUSINESSES].serves : undefined;
@@ -321,7 +325,7 @@ export function previewBuilding(sim: Sim, kind: BuildingKind, x: number, y: numb
     }
   }
   if (jobs) benefits.push(`${jobs} public jobs once staffed`);
-  benefits.push(`Construction work for local contractors (${fmtMoney(sim, (est.labor / 0.9) * (sim.roleWage('laborer') / 26) * 1.35)} in wages)`);
+  benefits.push(outside ? 'Day labour on the site for local residents' : `Construction work for local contractors (${fmtMoney(sim, (est.labor / 0.9) * (sim.roleWage('laborer') / 26) * 1.35)} in wages)`);
   // risks
   const wet = wetMonths(sim, est.construction);
   if (wet) risks.push(`${wet} rainy-season month${wet > 1 ? 's' : ''} during construction: heavy rain stops work on site`);
@@ -400,6 +404,7 @@ export function previewRoad(sim: Sim, tool: RoadTool, route: number[]): Preview 
   requirements.push(`Budget: ${fmtMoney(sim, est.cost)}`);
   if (est.landCost > 0) requirements.push(`Land: ${fmtMoney(sim, est.landCost)} to acquire (${est.farmsAffected} farm${est.farmsAffected === 1 ? '' : 's'}${est.displaced ? `, ${est.displaced} households relocated` : ''})`);
   requirements.push(`Construction: ${Math.round(est.labor)} worker-days, ${Math.round(est.materials)} t of materials`);
+  if (localLabourers(sim) < minLocalCrew(sim)) warnings.push(OUTSIDE_NOTE);
   const spans = tiles.filter((t) => m.terrain[t] === Terrain.Water).length;
   if (spans) requirements.push(`${spans} bridge span${spans > 1 ? 's' : ''} over the river`);
   const km = (tiles.length * 40) / 1000;
