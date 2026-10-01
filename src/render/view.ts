@@ -1,0 +1,854 @@
+// The 3D world. Everything drawn is read from the simulation: land use and crops on the ground texture, roads,
+// buildings (lit windows at night where people live), construction sites rising with their real progress, trucks
+// carrying actual shipments along their routes, and a sample of real commuters driving between home and work.
+
+import * as THREE from 'three';
+import type { Sim } from '../sim/core';
+import { hash01 } from '../sim/rng';
+import { BUILDINGS } from '../sim/tables';
+import { Terrain, Zone, type Building, type BuildingKind } from '../sim/types';
+import { findPath } from '../sim/systems/transport';
+import { isRoadwork } from '../sim/systems/construction';
+import { projectProgress, refAtTile, type Ref } from '../sim/inspect';
+import { previewBuilding, previewRoad, rectTiles, routeTiles, zoneable, type RoadTool } from '../sim/commands';
+import { CameraRig, type CameraPreset } from './camera';
+import { buildingLook, CAR_COLORS, GOOD_COLORS, lookFor } from './look';
+import { N, paintOverlay, paintTerrain, roadColor, TEX, ZONE_RGB, type Overlay } from './paint';
+
+export type Tool =
+  | { mode: 'inspect' }
+  | { mode: 'build'; kind: BuildingKind; floors?: number }
+  | { mode: 'road'; kind: RoadTool }
+  | { mode: 'zone'; zone: number };
+
+export type Selection = { ref: Ref } | { vehicle: 'truck' | 'car'; id: number };
+
+export interface ViewEvents {
+  select(sel: Selection | null): void;
+  place(x: number, y: number): void;
+  route(tiles: number[]): void;
+  zone(tiles: number[]): void;
+}
+
+export interface ViewOptions {
+  getSim: () => Sim;
+  onFrame?: (dtMs: number) => void;
+}
+
+const UP = new THREE.Vector3(0, 1, 0);
+const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+const LEFT_HAND = new Set(['in-deccan', 'in-punjab', 'ke-rift']);
+
+/** A resizable instanced mesh with per-instance colour and optional float attributes. */
+class Layer {
+  mesh!: THREE.InstancedMesh;
+  n = 0;
+  private cap = 0;
+  private m = new THREE.Matrix4();
+  private q = new THREE.Quaternion();
+  private p = new THREE.Vector3();
+  private sc = new THREE.Vector3();
+  private col = new THREE.Color();
+
+  constructor(private parent: THREE.Object3D, private geo: THREE.BufferGeometry, private mat: THREE.Material, cap: number,
+    private attrs: string[] = [], private cast = false, private receive = false, private order = 0) {
+    this.alloc(cap);
+  }
+
+  private alloc(cap: number): void {
+    if (this.mesh) { this.parent.remove(this.mesh); this.mesh.geometry.dispose(); this.mesh.dispose(); }
+    const g = this.geo.clone();
+    for (const a of this.attrs) g.setAttribute(a, new THREE.InstancedBufferAttribute(new Float32Array(cap), 1));
+    this.mesh = new THREE.InstancedMesh(g, this.mat, cap);
+    this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.mesh.setColorAt(0, new THREE.Color(1, 1, 1));
+    this.mesh.frustumCulled = false;
+    this.mesh.castShadow = this.cast;
+    this.mesh.receiveShadow = this.receive;
+    this.mesh.renderOrder = this.order;
+    this.mesh.count = 0;
+    this.cap = cap;
+    this.parent.add(this.mesh);
+  }
+
+  begin(expected: number): void {
+    if (expected > this.cap) this.alloc(Math.ceil(expected * 1.4) + 16);
+    this.n = 0;
+  }
+
+  add(x: number, y: number, z: number, sx: number, sy: number, sz: number, rotY: number, color: number, a?: number[]): number {
+    if (this.n >= this.cap) return -1;
+    this.p.set(x, y, z);
+    this.sc.set(sx, sy, sz);
+    this.q.setFromAxisAngle(UP, rotY);
+    this.m.compose(this.p, this.q, this.sc);
+    this.mesh.setMatrixAt(this.n, this.m);
+    this.col.setHex(color);
+    this.mesh.setColorAt(this.n, this.col);
+    if (a) for (let k = 0; k < a.length; k++) ((this.mesh.geometry.getAttribute(this.attrs[k]) as THREE.InstancedBufferAttribute).array as Float32Array)[this.n] = a[k];
+    return this.n++;
+  }
+
+  end(): void {
+    this.mesh.count = this.n;
+    this.mesh.instanceMatrix.needsUpdate = true;
+    if (this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
+    for (const a of this.attrs) (this.mesh.geometry.getAttribute(a) as THREE.InstancedBufferAttribute).needsUpdate = true;
+    this.mesh.boundingSphere = null;
+  }
+
+  dispose(): void { this.parent.remove(this.mesh); this.mesh.geometry.dispose(); this.mesh.dispose(); }
+}
+
+function gableGeometry(): THREE.BufferGeometry {
+  const A = [-0.5, 0, -0.5], B = [0.5, 0, -0.5], C = [0.5, 0, 0.5], D = [-0.5, 0, 0.5], E = [-0.5, 1, 0], F = [0.5, 1, 0];
+  const tris = [D, C, F, D, F, E, B, A, E, B, E, F, A, D, E, C, B, F];
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(tris.flat(), 3));
+  g.computeVertexNormals();
+  return g;
+}
+
+/** Wall material: window rows per storey; windows of lived-in buildings glow at night. */
+function wallMaterial(): { mat: THREE.MeshStandardMaterial; night: { value: number } } {
+  const night = { value: 0 };
+  const mat = new THREE.MeshStandardMaterial({ roughness: 0.9, metalness: 0 });
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uNight = night;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float aLit;\nattribute float aFloors;\nvarying vec3 vLocal;\nvarying vec3 vNrm;\nvarying float vLit;\nvarying float vFloors;\nvarying vec2 vScale;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLocal = position;\nvNrm = normal;\nvLit = aLit;\nvFloors = aFloors;\nvScale = vec2(length(instanceMatrix[0].xyz), length(instanceMatrix[2].xyz));');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform float uNight;\nvarying vec3 vLocal;\nvarying vec3 vNrm;\nvarying float vLit;\nvarying float vFloors;\nvarying vec2 vScale;')
+      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+        float side = 1.0 - step(0.5, abs(vNrm.y));
+        float fy = fract(vLocal.y * vFloors);
+        float across = abs(vNrm.x) > 0.5 ? vLocal.z * vScale.y : vLocal.x * vScale.x;
+        float fx = fract(across * 9.0);
+        float win = side * step(0.35, fy) * step(fy, 0.78) * step(0.22, fx) * step(fx, 0.78);
+        diffuseColor.rgb *= 1.0 - 0.3 * win;
+        float on = step(0.4, fract(sin(dot(floor(vec2(across * 9.0, vLocal.y * vFloors)), vec2(12.9898, 78.233))) * 43758.5453));
+        totalEmissiveRadiance += vec3(1.0, 0.78, 0.45) * win * vLit * uNight * on;`);
+  };
+  return { mat, night };
+}
+
+interface Commuter { id: number; path: number[]; depart: number; ret: number; dur: number; mode: number; color: number }
+
+export class WorldView {
+  readonly renderer: THREE.WebGLRenderer;
+  readonly scene = new THREE.Scene();
+  readonly rig: CameraRig;
+  overlay: Overlay = 'none';
+  tool: Tool = { mode: 'inspect' };
+  selection: Selection | null = null;
+  /** Real commuters represented by each car drawn. */
+  carScale = 1;
+
+  private canvas: HTMLCanvasElement;
+  private sun = new THREE.DirectionalLight(0xffffff, 2.2);
+  private hemi = new THREE.HemisphereLight(0xcfe3ff, 0x5a6b45, 0.7);
+  private fog = new THREE.Fog(0x9fc4e8, 200, 700);
+  private terrainData = new Uint8Array(TEX * TEX * 4);
+  private terrainTex: THREE.DataTexture;
+  private overlayData = new Uint8Array(N * N * 4);
+  private overlayTex: THREE.DataTexture;
+  private overlayMesh: THREE.Mesh;
+  private night: { value: number };
+  private geos: THREE.BufferGeometry[] = [];
+  private mats: THREE.Material[] = [];
+  private roads: Layer; private walls: Layer; private gables: Layer; private flats: Layer; private extras: Layer; private trees: Layer;
+  private siteSolid: Layer; private siteMark: Layer; private cranes: Layer; private trucks: Layer; private cars: Layer; private marks: Layer; private preview: Layer;
+  private ghost: THREE.Mesh;
+  private ghostMat = new THREE.MeshBasicMaterial({ color: 0x55cc77, transparent: true, opacity: 0.45, depthWrite: false });
+  private edges: THREE.LineSegments;
+  private hoverLine: THREE.LineLoop;
+  private buildingIds: number[] = [];
+  private truckIds: number[] = []; private truckXZ: number[] = [];
+  private carIds: number[] = []; private carXZ: number[] = [];
+  private seen: Record<string, number> = {};
+  private paintedDay = -1; private overlayDay = -1; private overlayKind: Overlay = 'none'; private siteMinute = -1e9; private builtDay = -1; private commuterDay = -1;
+  private farmTiles: number[] = [];
+  private commuters: Commuter[] = [];
+  private commuterQueue: number[] = [];
+  private hover = -1;
+  private dragFrom = -1;
+  private dragging = false;
+  private downAt = { x: 0, y: 0 };
+  private pendingTiles: number[] | null = null;
+  private pendingColor = 0x55cc77;
+  private pendingBuild: { x: number; y: number; ok: boolean } | null = null;
+  private hoverKey = '';
+  private hoverOk = false;
+  private hlKey = '';
+  private frameNo = 0;
+  private raf = 0;
+  private last = performance.now();
+  private ro: ResizeObserver;
+  private disposed = false;
+  private leftHand: boolean;
+  private v3 = new THREE.Vector3();
+
+  constructor(private container: HTMLElement, private opts: ViewOptions, private events: ViewEvents) {
+    const sim = opts.getSim();
+    this.leftHand = LEFT_HAND.has(sim.s.meta.preset);
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', preserveDrawingBuffer: false });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.05;
+    this.canvas = this.renderer.domElement;
+    this.canvas.className = 'world-canvas';
+    this.canvas.setAttribute('aria-label', 'Interactive 3D view of the region. Drag to pan, right-drag to rotate, scroll to zoom.');
+    container.appendChild(this.canvas);
+    const w = container.clientWidth || 800, h = container.clientHeight || 600;
+    this.renderer.setSize(w, h, false);
+    this.rig = new CameraRig(this.canvas, w / h);
+    const th = sim.s.buildings.find((b) => b.kind === 'townhall');
+    if (th) { const [x, y] = sim.center(th); this.rig.target.set(x, 0, y); }
+    this.rig.preset('city');
+    this.rig.snap();
+    this.scene.fog = this.fog;
+
+    // lights
+    this.sun.castShadow = true;
+    this.sun.shadow.mapSize.set(2048, 2048);
+    const sc = this.sun.shadow.camera;
+    sc.left = -70; sc.right = 70; sc.top = 70; sc.bottom = -70; sc.near = 1; sc.far = 500;
+    this.sun.shadow.bias = -0.0004;
+    this.sun.shadow.normalBias = 0.03;
+    this.scene.add(this.sun, this.sun.target, this.hemi);
+
+    // ground
+    this.terrainTex = new THREE.DataTexture(this.terrainData, TEX, TEX, THREE.RGBAFormat);
+    this.terrainTex.colorSpace = THREE.SRGBColorSpace;
+    this.terrainTex.magFilter = THREE.NearestFilter;
+    this.terrainTex.minFilter = THREE.LinearMipmapLinearFilter;
+    this.terrainTex.generateMipmaps = true;
+    this.terrainTex.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
+    const groundGeo = this.keepGeo(new THREE.PlaneGeometry(N, N));
+    const ground = new THREE.Mesh(groundGeo, this.keepMat(new THREE.MeshLambertMaterial({ map: this.terrainTex })));
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.set(N / 2, 0, N / 2);
+    ground.receiveShadow = true;
+    this.scene.add(ground);
+    const outer = new THREE.Mesh(this.keepGeo(new THREE.PlaneGeometry(4000, 4000)), this.keepMat(new THREE.MeshLambertMaterial({ color: 0x6d8752 })));
+    outer.rotation.x = -Math.PI / 2;
+    outer.position.set(N / 2, -0.04, N / 2);
+    this.scene.add(outer);
+
+    this.overlayTex = new THREE.DataTexture(this.overlayData, N, N, THREE.RGBAFormat);
+    this.overlayTex.colorSpace = THREE.SRGBColorSpace;
+    this.overlayTex.magFilter = THREE.LinearFilter;
+    this.overlayTex.minFilter = THREE.LinearFilter;
+    this.overlayMesh = new THREE.Mesh(groundGeo, this.keepMat(new THREE.MeshBasicMaterial({ map: this.overlayTex, transparent: true, depthWrite: false })));
+    this.overlayMesh.rotation.x = -Math.PI / 2;
+    this.overlayMesh.position.set(N / 2, 0.02, N / 2);
+    this.overlayMesh.renderOrder = 2;
+    this.overlayMesh.visible = false;
+    this.scene.add(this.overlayMesh);
+
+    // geometry and layers
+    const box = this.keepGeo(new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0));
+    const cyl = this.keepGeo(new THREE.CylinderGeometry(0.5, 0.5, 1, 12).translate(0, 0.5, 0));
+    const cone = this.keepGeo(new THREE.ConeGeometry(0.5, 1, 7).translate(0, 0.5, 0));
+    const gable = this.keepGeo(gableGeometry());
+    const lambert = () => this.keepMat(new THREE.MeshLambertMaterial({ color: 0xffffff }));
+    const wm = wallMaterial();
+    this.night = wm.night;
+    this.keepMat(wm.mat);
+    const glass = (opacity: number) => this.keepMat(new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity, depthWrite: false }));
+    this.roads = new Layer(this.scene, box, lambert(), 8000, [], false, true);
+    this.walls = new Layer(this.scene, box, wm.mat, 2000, ['aLit', 'aFloors'], true, true);
+    this.gables = new Layer(this.scene, gable, lambert(), 1500, [], true, true);
+    this.flats = new Layer(this.scene, box, lambert(), 1500, [], true, true);
+    this.extras = new Layer(this.scene, cyl, lambert(), 400, [], true, true);
+    this.trees = new Layer(this.scene, cone, lambert(), 6000, [], true, false);
+    this.siteSolid = new Layer(this.scene, box, lambert(), 100, [], true, true);
+    this.siteMark = new Layer(this.scene, box, glass(0.5), 600, [], false, false, 3);
+    this.cranes = new Layer(this.scene, box, lambert(), 100, [], true, false);
+    this.trucks = new Layer(this.scene, box, lambert(), 600, [], true, false);
+    this.cars = new Layer(this.scene, box, lambert(), 400, [], false, false);
+    this.marks = new Layer(this.scene, box, glass(0.38), 400, [], false, false, 4);
+    this.preview = new Layer(this.scene, box, glass(0.55), 800, [], false, false, 5);
+    this.ghost = new THREE.Mesh(box, this.ghostMat);
+    this.ghost.visible = false;
+    this.ghost.renderOrder = 6;
+    this.scene.add(this.ghost);
+    const eg = this.keepGeo(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0)));
+    this.edges = new THREE.LineSegments(eg, this.keepMat(new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.95, depthTest: false })));
+    this.edges.visible = false;
+    this.edges.renderOrder = 7;
+    this.scene.add(this.edges);
+    const sq = this.keepGeo(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(1, 0, 0), new THREE.Vector3(1, 0, 1), new THREE.Vector3(0, 0, 1)]));
+    this.hoverLine = new THREE.LineLoop(sq, this.keepMat(new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.7 })));
+    this.hoverLine.visible = false;
+    this.scene.add(this.hoverLine);
+
+    // input
+    this.canvas.addEventListener('pointerdown', this.onDown);
+    this.canvas.addEventListener('pointermove', this.onMove);
+    window.addEventListener('pointerup', this.onUp);
+    this.canvas.addEventListener('pointerleave', this.onLeave);
+    this.ro = new ResizeObserver(() => this.resize());
+    this.ro.observe(container);
+    this.raf = requestAnimationFrame(this.loop);
+  }
+
+  private keepGeo<T extends THREE.BufferGeometry>(g: T): T { this.geos.push(g); return g; }
+  private keepMat<T extends THREE.Material>(m: T): T { this.mats.push(m); return m; }
+
+  // ------------------------------------------------------------------------------------------ public API
+
+  setTool(tool: Tool): void {
+    this.tool = tool;
+    this.rig.toolDrag = tool.mode === 'road' || tool.mode === 'zone';
+    this.clearPending();
+    this.hoverKey = '';
+    this.canvas.style.cursor = tool.mode === 'inspect' ? 'default' : 'crosshair';
+  }
+
+  setOverlay(o: Overlay): void { this.overlay = o; }
+
+  select(sel: Selection | null, focus?: [number, number]): void {
+    this.selection = sel;
+    this.hlKey = '';
+    this.rig.follow = null;
+    if (sel && 'vehicle' in sel) this.follow(sel);
+    else if (focus) this.rig.flyTo(focus[0], focus[1], Math.min(this.rig.dist, 40));
+  }
+
+  follow(sel: Selection): void {
+    if (!('vehicle' in sel)) return;
+    let last: THREE.Vector3 | null = null;
+    this.rig.dist = Math.min(this.rig.dist, 14);
+    this.rig.follow = () => {
+      const ids = sel.vehicle === 'truck' ? this.truckIds : this.carIds, xz = sel.vehicle === 'truck' ? this.truckXZ : this.carXZ;
+      const i = ids.indexOf(sel.id);
+      if (i >= 0) last = new THREE.Vector3(xz[i * 2], 0, xz[i * 2 + 1]);
+      return last;
+    };
+  }
+
+  isFollowing(): boolean { return this.rig.follow !== null; }
+
+  /** Whether a vehicle is currently on the map (trip still under way). */
+  vehicleVisible(sel: Selection): boolean {
+    if (!('vehicle' in sel)) return false;
+    return (sel.vehicle === 'truck' ? this.truckIds : this.carIds).includes(sel.id);
+  }
+
+  focus(x: number, z: number, dist?: number): void { this.rig.flyTo(x, z, dist); }
+
+  preset(p: CameraPreset): void { this.rig.preset(p); }
+
+  clearPending(): void {
+    this.pendingTiles = null;
+    this.pendingBuild = null;
+    this.dragging = false;
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    cancelAnimationFrame(this.raf);
+    this.ro.disconnect();
+    this.canvas.removeEventListener('pointerdown', this.onDown);
+    this.canvas.removeEventListener('pointermove', this.onMove);
+    window.removeEventListener('pointerup', this.onUp);
+    this.canvas.removeEventListener('pointerleave', this.onLeave);
+    this.rig.dispose();
+    for (const l of [this.roads, this.walls, this.gables, this.flats, this.extras, this.trees, this.siteSolid, this.siteMark, this.cranes, this.trucks, this.cars, this.marks, this.preview]) l.dispose();
+    for (const g of this.geos) g.dispose();
+    for (const m of this.mats) m.dispose();
+    this.ghostMat.dispose();
+    this.terrainTex.dispose();
+    this.overlayTex.dispose();
+    this.renderer.dispose();
+    this.canvas.remove();
+  }
+
+  // ------------------------------------------------------------------------------------------ loop
+
+  private resize(): void {
+    const w = this.container.clientWidth, h = this.container.clientHeight;
+    if (!w || !h) return;
+    this.renderer.setSize(w, h, false);
+    this.rig.resize(w / h);
+  }
+
+  private loop = () => {
+    if (this.disposed) return;
+    this.raf = requestAnimationFrame(this.loop);
+    const now = performance.now();
+    const dt = Math.min(1000, now - this.last);
+    this.last = now;
+    this.opts.onFrame?.(dt);
+    const sim = this.opts.getSim();
+    this.frameNo++;
+    this.sync(sim);
+    this.rig.update(dt);
+    this.lighting(sim);
+    this.vehicles(sim);
+    this.tools(sim);
+    this.renderer.render(this.scene, this.rig.camera);
+  };
+
+  private changed(sim: Sim, ...keys: (keyof Sim['ix']['ver'])[]): boolean {
+    return keys.some((k) => sim.ix.ver[k] !== this.seen[k]);
+  }
+
+  private sync(sim: Sim): void {
+    const day = sim.day;
+    if (this.changed(sim, 'terrain', 'farms', 'zones', 'buildings', 'roads', 'projects')) {
+      paintTerrain(sim, this.terrainData);
+      const m = sim.s.map;
+      this.farmTiles = [];
+      for (let t = 0; t < N * N; t++) if (m.farm[t] >= 0) this.farmTiles.push(t);
+      this.terrainTex.needsUpdate = true;
+      this.paintedDay = day;
+    } else if (day !== this.paintedDay) {
+      paintTerrain(sim, this.terrainData, this.farmTiles);
+      this.terrainTex.needsUpdate = true;
+      this.paintedDay = day;
+    }
+    const roadOverlay = this.overlay === 'traffic' || this.overlay === 'roads';
+    if (this.changed(sim, 'roads') || this.overlay !== this.overlayKind || (roadOverlay && day !== this.overlayDay)) this.buildRoads(sim);
+    if (this.changed(sim, 'buildings') || day !== this.builtDay) { this.buildBuildings(sim); this.builtDay = day; }
+    if (this.changed(sim, 'terrain', 'zones', 'buildings')) this.buildTrees(sim);
+    if (this.changed(sim, 'projects') || Math.abs(sim.s.minute - this.siteMinute) >= 60) { this.buildSites(sim); this.siteMinute = sim.s.minute; }
+    if (this.overlay !== this.overlayKind || day !== this.overlayDay) {
+      paintOverlay(sim, this.overlay, this.overlayData);
+      this.overlayTex.magFilter = this.overlay === 'zoning' ? THREE.NearestFilter : THREE.LinearFilter;
+      this.overlayTex.needsUpdate = true;
+      this.overlayMesh.visible = this.overlay !== 'none';
+      this.overlayKind = this.overlay;
+      this.overlayDay = day;
+    }
+    if (day !== this.commuterDay || this.changed(sim, 'roads', 'buildings')) this.sampleCommuters(sim);
+    this.routeCommuters(sim);
+    const key = `${JSON.stringify(this.selection)}|${sim.ix.ver.buildings}|${sim.ix.ver.projects}|${sim.ix.ver.farms}`;
+    if (key !== this.hlKey || this.frameNo % 30 === 0) { this.highlight(sim); this.hlKey = key; }
+    for (const k of Object.keys(sim.ix.ver) as (keyof Sim['ix']['ver'])[]) this.seen[k] = sim.ix.ver[k];
+  }
+
+  // ------------------------------------------------------------------------------------------ static layers
+
+  private buildRoads(sim: Sim): void {
+    const m = sim.s.map;
+    let count = 0;
+    for (let t = 0; t < N * N; t++) if (m.road[t]) count++;
+    this.roads.begin(count * 5);
+    const WIDTH = [0, 0.34, 0.52, 0.66];
+    for (let t = 0; t < N * N; t++) {
+      const cls = m.road[t];
+      if (!cls) continue;
+      const x = (t % N) + 0.5, z = ((t / N) | 0) + 0.5;
+      const bridge = m.terrain[t] === Terrain.Water;
+      const y = bridge ? 0.05 : 0, h = bridge ? 0.06 : 0.035;
+      const w = WIDTH[cls];
+      const c = roadColor(sim, t, this.overlay);
+      this.roads.add(x, y, z, w, h, w, 0, c);
+      const tx = t % N, ty = (t / N) | 0;
+      if (tx < N - 1 && m.road[t + 1]) this.roads.add(x + 0.25, y, z, 0.5, h, w, 0, c);
+      if (tx > 0 && m.road[t - 1]) this.roads.add(x - 0.25, y, z, 0.5, h, w, 0, c);
+      if (ty < N - 1 && m.road[t + N]) this.roads.add(x, y, z + 0.25, w, h, 0.5, 0, c);
+      if (ty > 0 && m.road[t - N]) this.roads.add(x, y, z - 0.25, w, h, 0.5, 0, c);
+    }
+    this.roads.end();
+  }
+
+  private lit(sim: Sim, b: Building): number {
+    if (b.units > 0) return b.occupants.length > 0 ? 1 : 0;
+    const biz = b.biz >= 0 ? sim.biz(b.biz) : undefined;
+    if (!biz || biz.status !== 'operating') return 0;
+    const cat = BUILDINGS[b.kind].category;
+    return cat === 'industrial' ? 0.45 : 0.8;
+  }
+
+  private buildBuildings(sim: Sim): void {
+    const bs = sim.s.buildings;
+    this.walls.begin(bs.length);
+    this.gables.begin(bs.length);
+    this.flats.begin(bs.length);
+    this.extras.begin(bs.length);
+    this.buildingIds.length = 0;
+    for (const b of bs) {
+      if (b.kind === 'park') continue;
+      const L = buildingLook(b);
+      const cx = b.x + b.w / 2, cz = b.y + b.h / 2;
+      const small = b.kind === 'house' || b.kind === 'farmhouse' || b.kind === 'luxury';
+      const rot = small && hash01(b.style, 3) < 0.5 ? Math.PI / 2 : 0;
+      const i = this.walls.add(cx, 0, cz, L.w, L.h, L.d, rot, L.wall, [this.lit(sim, b), L.floors]);
+      if (i >= 0) this.buildingIds[i] = b.id;
+      if (L.roof === 'gable') this.gables.add(cx, L.h, cz, L.w + 0.06, L.roofH, L.d + 0.06, rot, L.roofColor);
+      else this.flats.add(cx, L.h, cz, L.w + 0.02, L.roofH, L.d + 0.02, 0, L.roofColor);
+      if (L.extra === 'chimney') this.extras.add(cx + L.w * 0.32, 0, cz - L.d * 0.28, 0.12, L.h + 0.75, 0.12, 0, 0x8b8b8b);
+      else if (L.extra === 'silos') for (let k = 0; k < 3; k++) this.extras.add(b.x + 0.35 + k * 0.32, 0, b.y + b.h - 0.22, 0.26, 0.8, 0.26, 0, 0xd8d6cf);
+      else if (L.extra === 'tower') this.extras.add(cx, L.h, cz, 0.34, 0.36, 0.34, 0, 0xcdb88f);
+    }
+    this.walls.end(); this.gables.end(); this.flats.end(); this.extras.end();
+  }
+
+  private buildTrees(sim: Sim): void {
+    const m = sim.s.map;
+    this.trees.begin(9000);
+    const FOREST = [0x2f5a2a, 0x3b6b30, 0x2c4f28, 0x47753a];
+    const PARK = [0x4f8a3a, 0x5d9a44, 0x3f7a34];
+    for (let t = 0; t < N * N; t++) {
+      const tx = t % N, ty = (t / N) | 0;
+      const o = m.owner[t];
+      const bld = o >= 0 ? sim.bld(o) : undefined;
+      let n = 0, palette = FOREST, big = 1;
+      if (m.terrain[t] === Terrain.Forest && !m.road[t] && o < 0 && m.project[t] < 0) n = 2 + (hash01(t, 19) < 0.4 ? 1 : 0);
+      else if ((m.zone[t] === Zone.Park || bld?.kind === 'park') && !m.road[t]) { n = 2; palette = PARK; big = 1.15; }
+      else if (bld && (bld.kind === 'house' || bld.kind === 'luxury' || bld.kind === 'farmhouse') && hash01(t, 17) < 0.55) { n = 1; palette = PARK; big = 0.85; }
+      for (let k = 0; k < n; k++) {
+        let x = tx + 0.15 + hash01(t, 20 + k) * 0.7, z = ty + 0.15 + hash01(t, 30 + k) * 0.7;
+        if (bld && bld.kind !== 'park') { x = tx + (hash01(t, 21) < 0.5 ? 0.12 : 0.88); z = ty + (hash01(t, 31) < 0.5 ? 0.12 : 0.88); }
+        const h = (0.42 + 0.35 * hash01(t, 40 + k)) * big, r = (0.24 + 0.12 * hash01(t, 50 + k)) * big;
+        this.trees.add(x, 0, z, r, h, r, 0, palette[Math.floor(hash01(t, 60 + k) * palette.length)]);
+      }
+    }
+    this.trees.end();
+  }
+
+  private buildSites(sim: Sim): void {
+    const ps = sim.s.projects.filter((p) => p.phase !== 'done' && p.phase !== 'cancelled' && p.phase !== 'staffing');
+    let tiles = 0;
+    for (const p of ps) tiles += p.tiles.length + 2;
+    this.siteMark.begin(tiles);
+    this.siteSolid.begin(ps.length);
+    this.cranes.begin(ps.length * 2);
+    for (const p of ps) {
+      const prog = projectProgress(p);
+      const building = p.phase === 'construction';
+      if (isRoadwork(p.kind)) {
+        p.tiles.forEach((t, k) => {
+          const done = building && k / p.tiles.length < prog;
+          const x = (t % N) + 0.5, z = ((t / N) | 0) + 0.5;
+          const color = p.kind === 'canal' ? (done ? 0x4a86a8 : 0x6fb0c8) : done ? 0x777a80 : building ? 0xe8912f : 0xf0b04a;
+          this.siteMark.add(x, 0.005, z, 0.9, 0.05, 0.9, 0, color);
+        });
+        continue;
+      }
+      const L = lookFor(p.kind as BuildingKind, p.w, p.h, p.floors || 1, p.id);
+      const cx = p.x + p.w / 2, cz = p.y + p.h / 2;
+      if (!building) { this.siteMark.add(cx, 0.005, cz, p.w - 0.08, 0.04, p.h - 0.08, 0, 0xf0b04a); continue; }
+      const hh = Math.max(0.04, L.h * prog);
+      this.siteSolid.add(cx, 0, cz, L.w, hh, L.d, 0, 0xb9b4aa);
+      this.siteMark.add(cx, 0, cz, L.w + 0.07, L.h + 0.05, L.d + 0.07, 0, 0xf0a030);
+      if (L.h > 0.45 || p.w >= 2) {
+        const mx = p.x + 0.18, mz = p.y + 0.18, top = L.h + 0.5;
+        const th = hash01(p.id, 7) * Math.PI * 2 + sim.s.minute * 0.0005;
+        this.cranes.add(mx, 0, mz, 0.05, top, 0.05, 0, 0xe6c229);
+        this.cranes.add(mx + 0.32 * Math.cos(th), top, mz - 0.32 * Math.sin(th), 0.95, 0.04, 0.04, th, 0xe6c229);
+      }
+    }
+    this.siteMark.end(); this.siteSolid.end(); this.cranes.end();
+  }
+
+  // ------------------------------------------------------------------------------------------ vehicles
+
+  private along(path: number[], f: number, lane: number): { x: number; z: number; rot: number } {
+    const n = path.length;
+    if (n === 1) return { x: (path[0] % N) + 0.5, z: ((path[0] / N) | 0) + 0.5, rot: 0 };
+    const p = clamp(f, 0, 1) * (n - 1);
+    const i = Math.min(n - 2, Math.floor(p)), t = p - i;
+    const a = path[i], b = path[i + 1];
+    const ax = (a % N) + 0.5, az = ((a / N) | 0) + 0.5, bx = (b % N) + 0.5, bz = ((b / N) | 0) + 0.5;
+    const dx = bx - ax, dz = bz - az;
+    const side = this.leftHand ? -1 : 1;
+    return { x: ax + dx * t - dz * lane * side, z: az + dz * t + dx * lane * side, rot: Math.atan2(-dz, dx) };
+  }
+
+  private vehicles(sim: Sim): void {
+    const s = sim.s, now = s.minute;
+    this.trucks.begin(Math.min(1200, s.shipments.length * 3 + 8));
+    this.truckIds.length = 0;
+    this.truckXZ.length = 0;
+    const addTruck = (path: number[], f: number, color: number, id: number) => {
+      const p = this.along(path, f, 0.1);
+      const bridge = s.map.terrain[path[Math.min(path.length - 1, Math.round(f * (path.length - 1)))]] === Terrain.Water ? 0.11 : 0;
+      if (this.trucks.add(p.x, 0.035 + bridge, p.z, 0.2, 0.1, 0.1, p.rot, color) >= 0) { this.truckIds.push(id); this.truckXZ.push(p.x, p.z); }
+    };
+    for (const sh of s.shipments) {
+      if (now < sh.depart || !sh.path.length || !sh.leg) continue;
+      const el = now - sh.depart;
+      const color = GOOD_COLORS[sh.good] ?? 0xcccccc;
+      if (sh.carrier >= 0) {
+        if (now > sh.arrive) continue;
+        const w = el % (2 * sh.leg);
+        addTruck(sh.path, w < sh.leg ? w / sh.leg : 1 - (w - sh.leg) / sh.leg, color, sh.id);
+      } else {
+        for (let j = 0; j < Math.min(3, sh.trucks); j++) {
+          const f = (el - j * 4) / sh.leg;
+          if (f >= 0 && f <= 1) addTruck(sh.path, f, color, sh.id);
+        }
+      }
+    }
+    this.trucks.end();
+    const tod = now % 1440;
+    const workday = sim.date.dow !== 0;
+    this.cars.begin(this.commuters.length);
+    this.carIds.length = 0;
+    this.carXZ.length = 0;
+    if (workday) {
+      for (const c of this.commuters) {
+        let f = -1;
+        if (tod >= c.depart && tod <= c.depart + c.dur) f = (tod - c.depart) / c.dur;
+        else if (tod >= c.ret && tod <= c.ret + c.dur) f = 1 - (tod - c.ret) / c.dur;
+        if (f < 0) continue;
+        const p = this.along(c.path, f, 0.1);
+        const car = c.mode === 3;
+        if (this.cars.add(p.x, 0.035, p.z, car ? 0.12 : 0.07, car ? 0.06 : 0.05, car ? 0.07 : 0.03, p.rot, c.color) >= 0) { this.carIds.push(c.id); this.carXZ.push(p.x, p.z); }
+      }
+    }
+    this.cars.end();
+  }
+
+  /** Picks a representative sample of real motorised commuters to animate. */
+  private sampleCommuters(sim: Sim): void {
+    this.commuterDay = sim.day;
+    const motor: number[] = [];
+    for (const c of sim.s.citizens) if ((c.status === 'working' || c.status === 'owner') && (c.mode === 2 || c.mode === 3) && c.commute > 0) motor.push(c.id);
+    const share = Math.min(1, 260 / Math.max(1, motor.length));
+    this.carScale = 1 / share;
+    this.commuterQueue = motor.filter((id) => hash01(id, 3) < share);
+    this.commuters = [];
+  }
+
+  private routeCommuters(sim: Sim): void {
+    let budget = 30;
+    while (budget-- > 0 && this.commuterQueue.length) {
+      const id = this.commuterQueue.pop()!;
+      const c = sim.cit(id);
+      if (!c) continue;
+      const home = sim.homeOf(c), work = sim.workplaceOf(c);
+      if (!home || !work || home.id === work.id || home.access < 0 || work.access < 0) continue;
+      const path = findPath(sim, home.access, work.access);
+      if (path.length < 2) continue;
+      this.commuters.push({
+        id, path, mode: c.mode, dur: Math.max(6, c.commute), color: CAR_COLORS[Math.floor(hash01(id, 5) * CAR_COLORS.length)],
+        depart: 420 + hash01(id, 7) * 150, ret: 1020 + hash01(id, 9) * 150,
+      });
+    }
+  }
+
+  // ------------------------------------------------------------------------------------------ lighting
+
+  private lighting(sim: Sim): void {
+    const tod = (sim.s.minute % 1440) / 60;
+    const day = tod >= 6 && tod <= 19;
+    const e = day ? Math.sin((Math.PI * (tod - 6)) / 13) : -0.25;
+    const az = Math.PI * clamp((tod - 6) / 13, 0, 1);
+    const el = Math.max(0.05, e) * 1.2;
+    const t = this.rig.target;
+    const dir = this.v3.set(Math.cos(az) * Math.cos(el), Math.sin(el), 0.35 + Math.sin(az) * 0.2).normalize();
+    this.sun.position.set(t.x + dir.x * 150, dir.y * 150, t.z + dir.z * 150);
+    this.sun.target.position.set(t.x, 0, t.z);
+    const sunUp = Math.max(0, e);
+    // by night a cool moonlight keeps the town readable while lit windows show where people live
+    const moon = sunUp <= 0.02;
+    this.sun.intensity = moon ? 0.45 : Math.pow(sunUp, 0.6) * 2.6;
+    if (moon) this.sun.color.setHex(0x8fa8d8);
+    else this.sun.color.setHex(0xffb070).lerp(new THREE.Color(0xfff4e0), Math.min(1, sunUp * 2.5));
+    this.hemi.intensity = 0.42 + 0.4 * Math.min(1, sunUp * 2);
+    this.hemi.color.setHex(moon ? 0x9fb4e0 : 0xcfe3ff);
+    const rain = Math.min(1, sim.s.weather.rain / 20);
+    const dayCol = new THREE.Color(0x9fc4e8).lerp(new THREE.Color(0x8d949c), rain * 0.7);
+    const dusk = new THREE.Color(0xe8a070);
+    const nightCol = new THREE.Color(0x0b1224);
+    let sky: THREE.Color;
+    if (e <= 0) sky = nightCol.clone().lerp(new THREE.Color(0x1d2c4a), 0.5);
+    else if (e < 0.25) sky = nightCol.clone().lerp(dusk, e / 0.25).lerp(dayCol, Math.max(0, (e - 0.1) / 0.15));
+    else sky = dayCol;
+    this.scene.background = sky;
+    this.fog.color.copy(sky);
+    const d = this.rig.distance;
+    this.fog.near = d * 2.2 + 40;
+    this.fog.far = d * 7 + 260 - rain * 120;
+    this.night.value = clamp((0.15 - e) / 0.3, 0, 1);
+    this.renderer.toneMappingExposure = 1.05 - rain * 0.15;
+  }
+
+  // ------------------------------------------------------------------------------------------ selection & tools
+
+  private highlight(sim: Sim): void {
+    const sel = this.selection;
+    this.marks.begin(400);
+    this.edges.visible = false;
+    const outline = (b: Building | undefined) => {
+      if (!b) return;
+      if (b.kind === 'park') { for (let y = b.y; y < b.y + b.h; y++) for (let x = b.x; x < b.x + b.w; x++) this.marks.add(x + 0.5, 0.01, y + 0.5, 0.96, 0.04, 0.96, 0, 0xffffff); return; }
+      const L = buildingLook(b);
+      this.edges.position.set(b.x + b.w / 2, 0, b.y + b.h / 2);
+      this.edges.scale.set(L.w + 0.1, L.h + L.roofH + 0.06, L.d + 0.1);
+      this.edges.visible = true;
+    };
+    const tileMark = (t: number, color = 0xffffff) => this.marks.add((t % N) + 0.5, 0.01, ((t / N) | 0) + 0.5, 0.96, 0.05, 0.96, 0, color);
+    if (sel && 'ref' in sel) {
+      const r = sel.ref;
+      switch (r.k) {
+        case 'building': outline(sim.bld(r.id)); break;
+        case 'business': {
+          const b = sim.biz(r.id);
+          if (b?.farm) for (const t of b.farm.fields.slice(0, 380)) tileMark(t, 0xfff2a0);
+          outline(b ? sim.bld(b.building) : undefined);
+          break;
+        }
+        case 'project': { const p = sim.ix.proj.get(r.id); if (p) for (const t of p.tiles.slice(0, 380)) tileMark(t, 0xffc060); break; }
+        case 'tile': tileMark(r.id); break;
+        case 'citizen': {
+          const c = sim.cit(r.id);
+          if (c) {
+            outline(sim.homeOf(c));
+            const w = sim.workplaceOf(c);
+            if (w) for (let y = w.y; y < w.y + w.h; y++) for (let x = w.x; x < w.x + w.w; x++) tileMark(y * N + x, 0x9fd0ff);
+          }
+          break;
+        }
+        case 'household': { const h = sim.hh(r.id); if (h && h.home >= 0) outline(sim.bld(h.home)); break; }
+      }
+    }
+    this.marks.end();
+  }
+
+  private tileAt(e: PointerEvent): number {
+    const g = this.rig.groundAt(e.clientX, e.clientY);
+    if (!g) return -1;
+    const x = Math.floor(g.x), y = Math.floor(g.z);
+    return x >= 0 && y >= 0 && x < N && y < N ? y * N + x : -1;
+  }
+
+  private onDown = (e: PointerEvent) => {
+    this.downAt = { x: e.clientX, y: e.clientY };
+    if (e.button !== 0 || e.ctrlKey || e.altKey) return;
+    if (this.tool.mode === 'road' || this.tool.mode === 'zone') {
+      const t = this.tileAt(e);
+      if (t < 0) return;
+      this.pendingTiles = null;
+      this.dragFrom = t;
+      this.dragging = true;
+      this.canvas.setPointerCapture?.(e.pointerId);
+    }
+  };
+
+  private onMove = (e: PointerEvent) => { this.hover = this.tileAt(e); };
+
+  private onLeave = () => { if (!this.dragging) this.hover = -1; };
+
+  private onUp = (e: PointerEvent) => {
+    if (e.button !== 0) return;
+    const sim = this.opts.getSim();
+    if (this.dragging) {
+      this.dragging = false;
+      const tiles = this.dragTiles(sim);
+      if (!tiles.length) return;
+      this.pendingTiles = tiles;
+      if (this.tool.mode === 'road') this.events.route(tiles);
+      else if (this.tool.mode === 'zone') this.events.zone(tiles);
+      return;
+    }
+    if (e.target !== this.canvas) return;
+    const click = Math.hypot(e.clientX - this.downAt.x, e.clientY - this.downAt.y) < 6 && !this.rig.moved;
+    if (!click) return;
+    if (this.tool.mode === 'build') {
+      const t = this.tileAt(e);
+      if (t < 0) return;
+      this.pendingBuild = { x: t % N, y: (t / N) | 0, ok: this.hoverOk };
+      this.events.place(t % N, (t / N) | 0);
+    } else if (this.tool.mode === 'inspect') {
+      const sel = this.pick(e.clientX, e.clientY, sim);
+      this.selection = sel;
+      this.hlKey = '';
+      this.rig.follow = null;
+      if (sel && 'vehicle' in sel) this.follow(sel);
+      this.events.select(sel);
+    }
+  };
+
+  private dragTiles(sim: Sim): number[] {
+    if (this.dragFrom < 0 || this.hover < 0) return [];
+    const ax = this.dragFrom % N, ay = (this.dragFrom / N) | 0, bx = this.hover % N, by = (this.hover / N) | 0;
+    if (this.tool.mode === 'road') return routeTiles(ax, ay, bx, by);
+    if (this.tool.mode === 'zone') return rectTiles(ax, ay, bx, by).filter((t) => zoneable(sim, t));
+    return [];
+  }
+
+  /** Vehicles first (screen distance), then buildings (ray), then the ground tile. */
+  pick(clientX: number, clientY: number, sim: Sim): Selection | null {
+    const r = this.canvas.getBoundingClientRect();
+    let best: Selection | null = null, bd = 13 * 13;
+    const test = (ids: number[], xz: number[], kind: 'truck' | 'car') => {
+      for (let i = 0; i < ids.length; i++) {
+        this.v3.set(xz[i * 2], 0.08, xz[i * 2 + 1]).project(this.rig.camera);
+        if (this.v3.z > 1) continue;
+        const sx = ((this.v3.x + 1) / 2) * r.width + r.left, sy = ((1 - this.v3.y) / 2) * r.height + r.top;
+        const d = (sx - clientX) ** 2 + (sy - clientY) ** 2;
+        if (d < bd) { bd = d; best = { vehicle: kind, id: ids[i] }; }
+      }
+    };
+    test(this.truckIds, this.truckXZ, 'truck');
+    test(this.carIds, this.carXZ, 'car');
+    if (best) return best;
+    const ray = this.rig.rayAt(clientX, clientY);
+    const hits = ray.intersectObject(this.walls.mesh, false);
+    if (hits.length && hits[0].instanceId !== undefined) {
+      const id = this.buildingIds[hits[0].instanceId];
+      if (id !== undefined && sim.bld(id)) {
+        const b = sim.bld(id)!;
+        return b.biz >= 0 && sim.biz(b.biz) ? { ref: { k: 'business', id: b.biz } } : { ref: { k: 'building', id } };
+      }
+    }
+    const g = this.rig.groundAt(clientX, clientY);
+    if (!g) return null;
+    const x = Math.floor(g.x), y = Math.floor(g.z);
+    if (x < 0 || y < 0 || x >= N || y >= N) return null;
+    return { ref: refAtTile(sim, y * N + x) };
+  }
+
+  private tools(sim: Sim): void {
+    const tool = this.tool;
+    // hovered tile outline
+    if (this.hover >= 0 && tool.mode !== 'build') {
+      this.hoverLine.position.set(this.hover % N, 0.04, (this.hover / N) | 0);
+      this.hoverLine.visible = true;
+    } else this.hoverLine.visible = false;
+    // building ghost
+    this.ghost.visible = false;
+    if (tool.mode === 'build') {
+      const spec = BUILDINGS[tool.kind];
+      const at = this.pendingBuild ?? (this.hover >= 0 ? { x: this.hover % N, y: (this.hover / N) | 0, ok: false } : null);
+      if (at) {
+        const key = `${tool.kind}:${at.x}:${at.y}:${sim.ix.ver.buildings}:${sim.ix.ver.projects}`;
+        if (key !== this.hoverKey) { this.hoverKey = key; this.hoverOk = previewBuilding(sim, tool.kind, at.x, at.y, tool.floors).ok; }
+        const L = lookFor(tool.kind, spec.w, spec.h, tool.floors ?? spec.floors[0], 1);
+        this.ghost.position.set(at.x + spec.w / 2, 0, at.y + spec.h / 2);
+        this.ghost.scale.set(spec.w - 0.08, Math.max(0.1, L.h + L.roofH), spec.h - 0.08);
+        this.ghostMat.color.setHex(this.hoverOk ? 0x55cc77 : 0xe05050);
+        this.ghost.visible = true;
+      }
+    }
+    // route / zone preview
+    let tiles: number[] | null = null, ok = true, color = 0x55cc77;
+    if (this.dragging && (tool.mode === 'road' || tool.mode === 'zone')) {
+      tiles = this.dragTiles(sim);
+      if (tool.mode === 'road') {
+        const key = `r:${this.dragFrom}:${this.hover}:${tool.kind}`;
+        if (key !== this.hoverKey) { this.hoverKey = key; this.hoverOk = previewRoad(sim, tool.kind, tiles).ok; }
+        ok = this.hoverOk;
+      }
+    } else if (this.pendingTiles) tiles = this.pendingTiles;
+    if (tool.mode === 'zone') {
+      const c = ZONE_RGB[tool.zone];
+      if (c) color = (Math.round(c[0]) << 16) | (Math.round(c[1]) << 8) | Math.round(c[2]);
+    } else if (!ok) color = 0xe05050;
+    else color = this.pendingTiles && !this.dragging ? this.pendingColor : 0x55cc77;
+    this.preview.begin(tiles ? tiles.length : 0);
+    if (tiles) for (const t of tiles) this.preview.add((t % N) + 0.5, 0.02, ((t / N) | 0) + 0.5, 0.94, 0.06, 0.94, 0, color);
+    this.preview.end();
+  }
+}
+
+export type { Overlay, CameraPreset };
