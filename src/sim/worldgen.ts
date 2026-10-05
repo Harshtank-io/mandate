@@ -502,7 +502,19 @@ class Generator {
       bl.built = -36500;
     }
     if (c.museum) this.place('museum', 'museum', this.cx - 5, this.cy - 5, okUrban, 18);
-    if (c.stadium) this.place('stadium', 'stadium', this.cx + this.R * 0.55, this.cy - this.R * 0.45, okUrban, 25);
+    if (c.stadium) {
+      // a stadium needs a bigger plot than the town's street blocks offer: try the town either way round, then open
+      // land at its edge
+      const tx = this.cx + this.R * 0.55, ty = this.cy - this.R * 0.45;
+      const edge = (i: number) => m.zone[i] !== Zone.Industrial;
+      const tries: [number, number, (i: number) => boolean, number][] = [[4, 3, okUrban, 25], [3, 4, okUrban, 25], [4, 3, edge, 35], [3, 4, edge, 35]];
+      for (const [w, h, ok, maxR] of tries) {
+        const spot = this.findRect(w, h, tx, ty, ok, maxR);
+        if (!spot) continue;
+        this.mkBusiness('stadium', this.mkBuilding('stadium', spot.x, spot.y, w, h, spot.access, 1));
+        break;
+      }
+    }
     const nCin = Math.max(1, Math.round(c.population / 5000));
     for (let k = 0; k < nCin; k++) {
       const [x, y] = this.randomUrbanPoint(0.35);

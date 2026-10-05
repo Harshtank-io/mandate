@@ -120,7 +120,8 @@ export function statsMonthly(sim: Sim): void {
     hotelRooms: rooms, occupancy: rooms > 0 ? roomNights / (rooms * dateOf(s.meta.startYear, sim.day - 1).daysInMonth) : 0, appeal: s.tourism.appeal,
     passengers: s.air.m.pax, flights: s.air.m.flights,
     tradeBalance: exportsV - importsV, fx: s.trade.fx,
-    procured: s.pds.procured, grainStock: s.pds.stock, rationed: s.pds.rationed,
+    // the food programmes close their month before the statistics are taken (see MONTHLY), so read last month's figures
+    procured: s.pds.lastProcured, grainStock: s.pds.stock, rationed: s.pds.lastRationed,
   };
   months.push(st);
   if (months.length > 600) months.splice(1, months.length - 600);

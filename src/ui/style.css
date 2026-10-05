@@ -218,6 +218,14 @@ input[type='range'] { width: 100%; accent-color: var(--accent); }
 
 .project { padding: 8px 0; border-bottom: 1px solid var(--line); }
 .project header { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+.partner { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.partner header { display: flex; justify-content: space-between; gap: 8px; align-items: center; margin-bottom: 4px; }
+.partner .rows dd { max-width: 62%; }
+.partner .buttons span { flex: 1; }
+.goods li { padding: 6px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.05); }
+.goods p { margin: 2px 0 0; }
+.goods-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.panel-body h4 { margin-top: 10px; }
 .news { padding: 10px 0; border-bottom: 1px solid var(--line); }
 .news h4 { color: var(--text); text-transform: none; letter-spacing: 0; font-size: 0.95rem; margin-bottom: 4px; }
 .why { margin-top: 6px; padding: 8px 10px 8px 22px; list-style: disc; background: rgba(0, 0, 0, 0.2); border-radius: 6px; font-size: 0.85rem; }

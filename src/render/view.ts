@@ -3,10 +3,12 @@
 // carrying actual shipments along their routes, and a sample of real commuters driving between home and work.
 
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { Sim } from '../sim/core';
 import { hash01 } from '../sim/rng';
 import { BUILDINGS } from '../sim/tables';
 import { Terrain, Zone, type Building, type BuildingKind } from '../sim/types';
+import { flightsOn } from '../sim/systems/aviation';
 import { findPath } from '../sim/systems/transport';
 import { isRoadwork } from '../sim/systems/construction';
 import { projectProgress, refAtTile, type Ref } from '../sim/inspect';
@@ -17,7 +19,7 @@ import { N, paintOverlay, paintTerrain, roadColor, TEX, ZONE_RGB, type Overlay }
 
 export type Tool =
   | { mode: 'inspect' }
-  | { mode: 'build'; kind: BuildingKind; floors?: number }
+  | { mode: 'build'; kind: BuildingKind; floors?: number; rot?: boolean }
   | { mode: 'road'; kind: RoadTool }
   | { mode: 'zone'; zone: number };
 
@@ -133,6 +135,121 @@ function wallMaterial(): { mat: THREE.MeshStandardMaterial; night: { value: numb
   return { mat, night };
 }
 
+/** A regional turboprop with its nose along +x: fuselage, high wing, engines and T-tail. The fin is a separate layer in the airline's colour. */
+function planeGeometry(): THREE.BufferGeometry {
+  const parts = [
+    new THREE.BoxGeometry(1, 0.11, 0.11).translate(0, 0.1, 0),
+    new THREE.BoxGeometry(0.12, 0.07, 0.08).translate(0.53, 0.09, 0),
+    new THREE.BoxGeometry(0.2, 0.025, 1).translate(0.06, 0.16, 0),
+    new THREE.BoxGeometry(0.2, 0.06, 0.07).translate(0.1, 0.13, 0.24),
+    new THREE.BoxGeometry(0.2, 0.06, 0.07).translate(0.1, 0.13, -0.24),
+    new THREE.BoxGeometry(0.12, 0.02, 0.36).translate(-0.45, 0.29, 0),
+  ];
+  const g = mergeGeometries(parts);
+  for (const p of parts) p.dispose();
+  return g;
+}
+
+/** Soft round falloff used for pools of light on the ground. */
+function glowTexture(): THREE.DataTexture {
+  const n = 64, data = new Uint8Array(n * n * 4);
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+    const d = Math.hypot(x + 0.5 - n / 2, y + 0.5 - n / 2) / (n / 2);
+    const i = (y * n + x) * 4;
+    data[i] = data[i + 1] = data[i + 2] = 255;
+    data[i + 3] = Math.round(Math.max(0, 1 - d) ** 1.8 * 255);
+  }
+  const t = new THREE.DataTexture(data, n, n, THREE.RGBAFormat);
+  t.magFilter = THREE.LinearFilter;
+  t.minFilter = THREE.LinearFilter;
+  t.needsUpdate = true;
+  return t;
+}
+
+interface Frame {
+  long: number; short: number; horiz: boolean;
+  /** Map position of a point given along the building (u) and across it from its road side (v). */
+  at(u: number, v: number): [number, number];
+  /** Map extent of a box measured along and across the building. */
+  size(lu: number, lv: number): [number, number];
+  /** Map direction of a heading given along and across the building. */
+  dir(du: number, dv: number): [number, number];
+}
+
+/** Coordinates for laying out a long building such as the airport: u runs along it, v across it from the side facing its road. */
+function frameOf(b: Building): Frame {
+  const horiz = b.w >= b.h;
+  const long = horiz ? b.w : b.h, short = horiz ? b.h : b.w;
+  let roadLow = true;
+  if (b.access >= 0) {
+    const ax = (b.access % N) + 0.5, az = ((b.access / N) | 0) + 0.5;
+    roadLow = horiz ? az < b.y + b.h / 2 : ax < b.x + b.w / 2;
+  }
+  const sv = roadLow ? 1 : -1;
+  return {
+    long, short, horiz,
+    at: (u, v) => { const vv = roadLow ? v : short - v; return horiz ? [b.x + u, b.y + vv] : [b.x + vv, b.y + u]; },
+    size: (lu, lv) => (horiz ? [lu, lv] : [lv, lu]),
+    dir: (du, dv) => (horiz ? [du, dv * sv] : [dv * sv, du]),
+  };
+}
+
+/** Quarter turn that points a building's front (local +z) at the road it is reached from. */
+function frontRot(b: Building): number {
+  if (b.access < 0) return 0;
+  const dx = (b.access % N) + 0.5 - (b.x + b.w / 2), dz = ((b.access / N) | 0) + 0.5 - (b.y + b.h / 2);
+  if (Math.abs(dx) > Math.abs(dz)) return dx > 0 ? Math.PI / 2 : -Math.PI / 2;
+  return dz > 0 ? 0 : Math.PI;
+}
+
+// airport layout across the site, from the road: terminal, apron (stands), taxiway, runway centreline
+const AP_STAND = 1.42, AP_TWY = 2.05, AP_RWY = 3.0;
+
+interface Pose { x: number; y: number; z: number; rot: number }
+
+/** Where an aircraft is at minute-of-day `t` on a turnaround that lands at `tA` and takes off again at `tD`. */
+function planePose(F: Frame, t: number, tA: number, tD: number, stand: number): Pose | null {
+  const su = 9.5 + stand * 1.6;
+  const pose = (u: number, v: number, alt: number, du: number, dv: number): Pose => {
+    const [x, z] = F.at(u, v), [dx, dz] = F.dir(du, dv);
+    return { x, y: 0.02 + alt, z, rot: Math.atan2(-dz, dx) };
+  };
+  // taxiing at an even speed along a route; `nose` overrides the heading on the first leg (pushback)
+  const taxi = (pts: [number, number][], f: number, nose?: [number, number]): Pose => {
+    const legs: number[] = [];
+    let total = 0;
+    for (let i = 1; i < pts.length; i++) { const d = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]); legs.push(d); total += d; }
+    let rest = Math.max(0, Math.min(1, f)) * total;
+    for (let i = 0; i < legs.length; i++) {
+      if (rest <= legs[i] || i === legs.length - 1) {
+        const k = legs[i] > 0 ? Math.min(1, rest / legs[i]) : 1;
+        const a = pts[i], b = pts[i + 1], du = b[0] - a[0], dv = b[1] - a[1];
+        const n = i === 0 && nose ? nose : [du, dv];
+        return pose(a[0] + du * k, a[1] + dv * k, 0, n[0], n[1]);
+      }
+      rest -= legs[i];
+    }
+    return pose(pts[0][0], pts[0][1], 0, 1, 0);
+  };
+  if (t >= tA - 10 && t < tA) { const f = (t - tA + 10) / 10; return pose(-40 + 42.5 * f, AP_RWY, 7 * (1 - f), 1, 0); }
+  if (t >= tA && t < tA + 2) { const f = (t - tA) / 2; return pose(2.5 + 9.5 * (1 - (1 - f) * (1 - f)), AP_RWY, 0, 1, 0); }
+  if (t >= tA + 2 && t < tA + 5) return taxi([[12, AP_RWY], [12, AP_TWY], [su, AP_TWY], [su, AP_STAND]], (t - tA - 2) / 3);
+  if (t >= tA + 5 && t < tD - 4) return pose(su, AP_STAND, 0, 0, -1);
+  if (t >= tD - 4 && t < tD) return taxi([[su, AP_STAND], [su, AP_TWY], [2.5, AP_TWY], [2.5, AP_RWY]], (t - tD + 4) / 4, [0, -1]);
+  if (t >= tD && t < tD + 1.2) { const f = (t - tD) / 1.2; return pose(2.5 + 10.5 * f * f, AP_RWY, 0, 1, 0); }
+  if (t >= tD + 1.2 && t < tD + 7.2) { const f = (t - tD - 1.2) / 6; return pose(13 + 50 * f, AP_RWY, 7 * f * (0.6 + 0.4 * f), 1, 0); }
+  return null;
+}
+
+const WEATHERED = new THREE.Color(0x77736a);
+const SIGN_COLORS = [0xff4d3d, 0x3dc8ff, 0xffd23d, 0xf2f2f2];
+const TEAM_COLORS = [0x2f6fb0, 0xc0392b, 0x2e8b57, 0xe0a020, 0x6c3fb0];
+const LIVERY = [0xd8432f, 0x2f6fd8, 0x2fae6a, 0xe0a020, 0x7a3fc0, 0x1f9fb0];
+/** Upper bound on extra parts drawn for each decorated building type. */
+const PARTS: Partial<Record<BuildingKind, number>> = { airport: 150, stadium: 40, heritage: 30, museum: 12, hotel: 4, cinema: 6 };
+const URBAN = new Set<number>([Zone.Residential, Zone.Commercial, Zone.Industrial]);
+const hashStr = (t: string) => { let h = 7; for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0; return Math.abs(h); };
+
 interface Commuter { id: number; path: number[]; depart: number; ret: number; dur: number; mode: number; color: number }
 
 export class WorldView {
@@ -159,6 +276,17 @@ export class WorldView {
   private mats: THREE.Material[] = [];
   private roads: Layer; private walls: Layer; private gables: Layer; private flats: Layer; private extras: Layer; private trees: Layer;
   private siteSolid: Layer; private siteMark: Layer; private cranes: Layer; private trucks: Layer; private cars: Layer; private marks: Layer; private preview: Layer;
+  // landmarks, street lighting and aircraft
+  private spires: Layer; private signs: Layer; private bldPools: Layer; private posts: Layer; private lampHeads: Layer; private lampPools: Layer;
+  private planeBody: Layer; private planeTail: Layer;
+  /** Unlit material for lamps, signs and runway lights: dull by day, bright at night. */
+  private glowMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+  private poolTex = glowTexture();
+  /** Pools of light on the ground at night under street lamps, floodlit monuments and the stadium. */
+  private poolMat = new THREE.MeshBasicMaterial({ map: this.poolTex, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false });
+  private tmpColor = new THREE.Color();
+  /** Stadium event counters seen so far, to tell when a match was played today (floodlights on in the evening). */
+  private venueSeen = new Map<number, { month: number; events: number; day: number }>();
   private ghost: THREE.Mesh;
   private ghostMat = new THREE.MeshBasicMaterial({ color: 0x55cc77, transparent: true, opacity: 0.45, depthWrite: false });
   private edges: THREE.LineSegments;
@@ -282,6 +410,16 @@ export class WorldView {
     this.cars = new Layer(this.scene, box, lambert(), 400, [], false, false);
     this.marks = new Layer(this.scene, box, glass(0.38), 400, [], false, false, 4);
     this.preview = new Layer(this.scene, box, glass(0.55), 800, [], false, false, 5);
+    const spire = this.keepGeo(new THREE.ConeGeometry(0.5, 1, 8).translate(0, 0.5, 0));
+    const flat = this.keepGeo(new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2));
+    this.spires = new Layer(this.scene, spire, lambert(), 60, [], true, true);
+    this.signs = new Layer(this.scene, box, this.glowMat, 200);
+    this.bldPools = new Layer(this.scene, flat, this.poolMat, 60, [], false, false, 2);
+    this.posts = new Layer(this.scene, box, lambert(), 1500);
+    this.lampHeads = new Layer(this.scene, box, this.glowMat, 1500);
+    this.lampPools = new Layer(this.scene, flat, this.poolMat, 1500, [], false, false, 2);
+    this.planeBody = new Layer(this.scene, this.keepGeo(planeGeometry()), lambert(), 24, [], true, false);
+    this.planeTail = new Layer(this.scene, this.keepGeo(new THREE.BoxGeometry(0.16, 0.16, 0.02).translate(-0.43, 0.21, 0)), lambert(), 24, [], true, false);
     this.ghost = new THREE.Mesh(box, this.ghostMat);
     this.ghost.visible = false;
     this.ghost.renderOrder = 6;
@@ -317,6 +455,13 @@ export class WorldView {
     this.clearPending();
     this.hoverKey = '';
     this.canvas.style.cursor = tool.mode === 'inspect' ? 'default' : 'crosshair';
+  }
+
+  /** Turns the building being placed by a quarter, keeping a spot that has already been clicked. */
+  turn(rot: boolean): void {
+    if (this.tool.mode !== 'build') return;
+    this.tool = { ...this.tool, rot };
+    this.hoverKey = '';
   }
 
   setOverlay(o: Overlay): void { this.overlay = o; }
@@ -368,10 +513,14 @@ export class WorldView {
     window.removeEventListener('pointerup', this.onUp);
     this.canvas.removeEventListener('pointerleave', this.onLeave);
     this.rig.dispose();
-    for (const l of [this.roads, this.walls, this.gables, this.flats, this.extras, this.trees, this.siteSolid, this.siteMark, this.cranes, this.trucks, this.cars, this.marks, this.preview]) l.dispose();
+    for (const l of [this.roads, this.walls, this.gables, this.flats, this.extras, this.trees, this.siteSolid, this.siteMark, this.cranes, this.trucks, this.cars, this.marks, this.preview,
+      this.spires, this.signs, this.bldPools, this.posts, this.lampHeads, this.lampPools, this.planeBody, this.planeTail]) l.dispose();
     for (const g of this.geos) g.dispose();
     for (const m of this.mats) m.dispose();
     this.ghostMat.dispose();
+    this.glowMat.dispose();
+    this.poolMat.dispose();
+    this.poolTex.dispose();
     this.terrainTex.dispose();
     this.overlayTex.dispose();
     this.renderer.dispose();
@@ -400,6 +549,7 @@ export class WorldView {
     this.rig.update(dt);
     this.lighting(sim);
     this.vehicles(sim);
+    this.planes(sim);
     this.tools(sim);
     this.renderer.render(this.scene, this.rig.camera);
   };
@@ -426,6 +576,7 @@ export class WorldView {
     if (this.changed(sim, 'roads') || this.overlay !== this.overlayKind || (roadOverlay && day !== this.overlayDay)) this.buildRoads(sim);
     if (this.changed(sim, 'buildings') || day !== this.builtDay) { this.buildBuildings(sim); this.builtDay = day; }
     if (this.changed(sim, 'terrain', 'zones', 'buildings')) this.buildTrees(sim);
+    if (this.changed(sim, 'roads', 'zones', 'buildings')) this.buildLamps(sim);
     if (this.changed(sim, 'projects') || Math.abs(sim.s.minute - this.siteMinute) >= 60) { this.buildSites(sim); this.siteMinute = sim.s.minute; }
     if (this.overlay !== this.overlayKind || day !== this.overlayDay) {
       paintOverlay(sim, this.overlay, this.overlayData);
@@ -478,26 +629,291 @@ export class WorldView {
 
   private buildBuildings(sim: Sim): void {
     const bs = sim.s.buildings;
-    this.walls.begin(bs.length);
-    this.gables.begin(bs.length);
-    this.flats.begin(bs.length);
-    this.extras.begin(bs.length);
+    let parts = 4;
+    for (const b of bs) parts += PARTS[b.kind] ?? 0;
+    this.walls.begin(bs.length + parts);
+    this.gables.begin(bs.length + parts);
+    this.flats.begin(bs.length + parts);
+    this.extras.begin(bs.length + parts);
+    this.spires.begin(parts);
+    this.signs.begin(parts);
+    this.bldPools.begin(parts);
     this.buildingIds.length = 0;
+    const heritage = sim.preset.tourism.heritageStyle;
     for (const b of bs) {
       if (b.kind === 'park') continue;
+      if (b.kind === 'airport') { this.airport(sim, b); continue; }
+      if (b.kind === 'stadium') { this.stadium(sim, b); continue; }
+      if (b.kind === 'heritage') { this.heritage(b, heritage); continue; }
       const L = buildingLook(b);
       const cx = b.x + b.w / 2, cz = b.y + b.h / 2;
       const small = b.kind === 'house' || b.kind === 'farmhouse' || b.kind === 'luxury';
-      const rot = small && hash01(b.style, 3) < 0.5 ? Math.PI / 2 : 0;
+      // hotels, cinemas and museums face the road they are reached from; small houses vary their orientation
+      const faced = L.extra === 'sign' || L.extra === 'marquee' || L.extra === 'columns';
+      const rot = faced ? frontRot(b) : small && hash01(b.style, 3) < 0.5 ? Math.PI / 2 : 0;
+      const c = Math.cos(rot), s = Math.sin(rot);
+      const at = (lx: number, lz: number): [number, number] => [cx + lx * c + lz * s, cz - lx * s + lz * c];
       const i = this.walls.add(cx, 0, cz, L.w, L.h, L.d, rot, L.wall, [this.lit(sim, b), L.floors]);
       if (i >= 0) this.buildingIds[i] = b.id;
-      if (L.roof === 'gable') this.gables.add(cx, L.h, cz, L.w + 0.06, L.roofH, L.d + 0.06, rot, L.roofColor);
-      else this.flats.add(cx, L.h, cz, L.w + 0.02, L.roofH, L.d + 0.02, 0, L.roofColor);
-      if (L.extra === 'chimney') this.extras.add(cx + L.w * 0.32, 0, cz - L.d * 0.28, 0.12, L.h + 0.75, 0.12, 0, 0x8b8b8b);
-      else if (L.extra === 'silos') for (let k = 0; k < 3; k++) this.extras.add(b.x + 0.35 + k * 0.32, 0, b.y + b.h - 0.22, 0.26, 0.8, 0.26, 0, 0xd8d6cf);
-      else if (L.extra === 'tower') this.extras.add(cx, L.h, cz, 0.34, 0.36, 0.34, 0, 0xcdb88f);
+      if (L.roof === 'gable') {
+        // a museum shows its pediment to the street: the ridge runs front to back and the roof covers the portico
+        if (L.extra === 'columns') { const [gx, gz] = at(0, 0.1); this.gables.add(gx, L.h, gz, L.d + 0.42, L.roofH, L.w + 0.08, rot + Math.PI / 2, L.roofColor); }
+        else if (L.turned) this.gables.add(cx, L.h, cz, L.d + 0.06, L.roofH, L.w + 0.06, rot + Math.PI / 2, L.roofColor);
+        else this.gables.add(cx, L.h, cz, L.w + 0.06, L.roofH, L.d + 0.06, rot, L.roofColor);
+      } else this.flats.add(cx, L.h, cz, L.w + 0.02, L.roofH, L.d + 0.02, rot, L.roofColor);
+      switch (L.extra) {
+        case 'chimney': this.extras.add(cx + L.w * 0.32, 0, cz - L.d * 0.28, 0.12, L.h + 0.75, 0.12, 0, 0x8b8b8b); break;
+        case 'silos': for (let k = 0; k < 3; k++) this.extras.add(b.x + 0.35 + k * 0.32, 0, b.y + b.h - 0.22, 0.26, 0.8, 0.26, 0, 0xd8d6cf); break;
+        case 'tower': this.extras.add(cx, L.h, cz, 0.34, 0.36, 0.34, 0, 0xcdb88f); break;
+        case 'sign': { // hotel: an illuminated name board on the roof and a canopy over the entrance
+          const [sx, sz] = at(0, L.d / 2 - 0.05);
+          this.signs.add(sx, L.h + L.roofH + 0.01, sz, Math.min(0.5, L.w * 0.7), 0.11, 0.035, rot, SIGN_COLORS[Math.floor(hash01(b.style, 4) * SIGN_COLORS.length)]);
+          const [ex, ez] = at(0, L.d / 2 + 0.06);
+          this.flats.add(ex, 0.12, ez, 0.3, 0.025, 0.12, rot, 0x3a3a40);
+          break;
+        }
+        case 'marquee': { // cinema: a canopy edged with bulbs and a vertical blade sign
+          const [mx, mz] = at(0, L.d / 2 + 0.07);
+          this.flats.add(mx, 0.15, mz, L.w * 0.84, 0.045, 0.15, rot, 0x2a2228);
+          const [lx, lz] = at(0, L.d / 2 + 0.145);
+          this.signs.add(lx, 0.15, lz, L.w * 0.84, 0.045, 0.012, rot, 0xffd060);
+          const [bx, bz] = at(L.w / 2 - 0.1, L.d / 2 + 0.03);
+          this.signs.add(bx, 0.21, bz, 0.035, 0.3, 0.12, rot, 0xff4f6a);
+          this.bldPools.add(mx, 0.05, mz, 0.9, 1, 0.7, 0, 0xffd27a);
+          break;
+        }
+        case 'columns': { // museum: a portico of columns on a flight of steps, under the pediment
+          const front = L.d / 2;
+          const [stx, stz] = at(0, front + 0.15);
+          this.flats.add(stx, 0, stz, L.w * 0.94, 0.04, 0.3, rot, 0xd8d2c4);
+          for (let k = 0; k < 6; k++) {
+            const [px, pz] = at(-L.w * 0.4 + (k * L.w * 0.8) / 5, front + 0.18);
+            this.extras.add(px, 0.04, pz, 0.1, L.h - 0.04, 0.1, 0, 0xf2ede2);
+          }
+          break;
+        }
+      }
     }
-    this.walls.end(); this.gables.end(); this.flats.end(); this.extras.end();
+    this.walls.end(); this.gables.end(); this.flats.end(); this.extras.end(); this.spires.end(); this.signs.end(); this.bldPools.end();
+  }
+
+  /** Runway with markings and edge lights, taxiway, apron, terminal, control tower and hangar. */
+  private airport(sim: Sim, b: Building): void {
+    const F = frameOf(b), L = F.long;
+    const box = (layer: Layer, u: number, v: number, lu: number, lv: number, y: number, h: number, color: number, a?: number[]) => {
+      const [x, z] = F.at(u, v), [sx, sz] = F.size(lu, lv);
+      return layer.add(x, y, z, sx, h, sz, 0, color, a);
+    };
+    const asphalt = 0x3b3e43, taxiway = 0x50545a, paint = 0xe9e9e2;
+    box(this.flats, L / 2, AP_RWY, L - 0.8, 0.9, 0, 0.03, asphalt);
+    for (let u = 2.4; u <= L - 2.4; u += 0.9) box(this.flats, u, AP_RWY, 0.42, 0.045, 0, 0.034, paint);
+    for (const u of [0.95, L - 0.95]) for (const dv of [-0.3, -0.18, 0.18, 0.3]) box(this.flats, u, AP_RWY + dv, 0.5, 0.07, 0, 0.034, paint);
+    box(this.flats, L / 2, AP_TWY, L - 4.4, 0.3, 0, 0.026, taxiway);
+    for (const u of [2.5, L / 2, L - 2.5]) box(this.flats, u, (AP_TWY + AP_RWY) / 2, 0.3, AP_RWY - AP_TWY, 0, 0.026, taxiway);
+    box(this.flats, L / 2, 1.38, 8.4, 1.05, 0, 0.022, 0x9c9e9a);
+    // the terminal is what a click on the airport hits
+    const i = box(this.walls, L / 2, 0.5, 4.2, 0.72, 0, 0.32, 0xdfe6ea, [this.lit(sim, b), 2]);
+    if (i >= 0) this.buildingIds[i] = b.id;
+    box(this.flats, L / 2, 0.5, 4.32, 0.82, 0.32, 0.035, 0x9aa6ae);
+    box(this.flats, L / 2 - 4.2, 0.4, 3, 0.6, 0, 0.012, 0x5d6066); // car park
+    // control tower with a glazed cab
+    box(this.extras, L / 2 + 4.6, 0.55, 0.3, 0.3, 0, 0.95, 0xd8dde0);
+    box(this.signs, L / 2 + 4.6, 0.55, 0.44, 0.44, 0.95, 0.17, 0x6fb6d8);
+    box(this.flats, L / 2 + 4.6, 0.55, 0.5, 0.5, 1.12, 0.03, 0x8a949a);
+    // hangar
+    box(this.flats, 5.4, 1.25, 2, 1.1, 0, 0.28, 0xb9c0c6);
+    const [hx, hz] = F.at(5.4, 1.25);
+    this.gables.add(hx, 0.28, hz, 2.04, 0.14, 1.14, F.horiz ? 0 : Math.PI / 2, 0x9aa3aa);
+    // runway edge lights; green at the landing threshold, red at the far end
+    for (let u = 1.2; u <= L - 1.2; u += 1.8) for (const dv of [-0.43, 0.43]) box(this.signs, u, AP_RWY + dv, 0.05, 0.05, 0, 0.04, 0xfff0c8);
+    for (const dv of [-0.36, -0.18, 0, 0.18, 0.36]) {
+      box(this.signs, 0.45, AP_RWY + dv, 0.06, 0.06, 0, 0.04, 0x5dff8a);
+      box(this.signs, L - 0.45, AP_RWY + dv, 0.06, 0.06, 0, 0.04, 0xff5a4a);
+    }
+    const [px, pz] = F.at(L / 2, 1.38), [psx, psz] = F.size(9, 2.2);
+    this.bldPools.add(px, 0.05, pz, psx, 1, psz, 0, 0xb8ad96);
+  }
+
+  /** Pitch, a covered main stand facing the road, open terraces and floodlight masts. */
+  private stadium(sim: Sim, b: Building): void {
+    const F = frameOf(b), L = F.long, S = F.short;
+    const box = (layer: Layer, u: number, v: number, lu: number, lv: number, y: number, h: number, color: number, a?: number[]) => {
+      const [x, z] = F.at(u, v), [sx, sz] = F.size(lu, lv);
+      return layer.add(x, y, z, sx, h, sz, 0, color, a);
+    };
+    const seat = TEAM_COLORS[Math.floor(hash01(b.style, 5) * TEAM_COLORS.length)];
+    const concrete = 0xc9c4ba, line = 0xeef2ea;
+    const pu = L - 1.5, pv = S - 1.6, cu = L / 2, cv = S / 2;
+    for (let k = 0; k < 6; k++) box(this.flats, cu - pu / 2 + (k + 0.5) * (pu / 6), cv, pu / 6, pv, 0, 0.02, k % 2 ? 0x57a84f : 0x4b9a45);
+    box(this.flats, cu, cv - pv / 2 + 0.04, pu - 0.08, 0.02, 0, 0.023, line);
+    box(this.flats, cu, cv + pv / 2 - 0.04, pu - 0.08, 0.02, 0, 0.023, line);
+    box(this.flats, cu - pu / 2 + 0.04, cv, 0.02, pv - 0.08, 0, 0.023, line);
+    box(this.flats, cu + pu / 2 - 0.04, cv, 0.02, pv - 0.08, 0, 0.023, line);
+    box(this.flats, cu, cv, 0.02, pv - 0.08, 0, 0.023, line);
+    // the main stand is what a click on the stadium hits
+    const i = box(this.walls, cu, 0.42, L - 0.6, 0.62, 0, 0.34, 0xcfc9bd, [this.lit(sim, b), 2]);
+    if (i >= 0) this.buildingIds[i] = b.id;
+    box(this.flats, cu, 0.46, L - 0.5, 0.74, 0.34, 0.03, 0xe6e6e2);
+    box(this.flats, cu, S - 0.42, L - 0.6, 0.62, 0, 0.14, concrete);
+    box(this.flats, cu, S - 0.27, L - 0.6, 0.32, 0.14, 0.14, 0xc2bdb2);
+    box(this.flats, cu, S - 0.58, L - 0.64, 0.28, 0.14, 0.012, seat);
+    box(this.flats, cu, S - 0.27, L - 0.64, 0.3, 0.28, 0.012, seat);
+    for (const u of [0.36, L - 0.36]) {
+      box(this.flats, u, cv, 0.5, S - 1.5, 0, 0.18, concrete);
+      box(this.flats, u, cv, 0.46, S - 1.56, 0.18, 0.012, seat);
+    }
+    const on = this.matchDay(sim, b);
+    for (const [u, v] of [[0.12, 0.1], [L - 0.12, 0.1], [0.12, S - 0.1], [L - 0.12, S - 0.1]]) {
+      box(this.extras, u, v, 0.07, 0.07, 0, 1, 0x9a9da2);
+      box(on ? this.signs : this.flats, u, v, 0.2, 0.2, 1, 0.07, on ? 0xffffff : 0x8a8d92);
+    }
+    if (on) { const [x, z] = F.at(cu, cv), [sx, sz] = F.size(L + 0.6, S + 0.4); this.bldPools.add(x, 0.05, z, sx, 1, sz, 0, 0xfff4dc); }
+  }
+
+  /** Whether the stadium held an event today, read from its event counter, so the floodlights go on that evening. */
+  private matchDay(sim: Sim, b: Building): boolean {
+    const v = b.biz >= 0 ? sim.biz(b.biz)?.venue : undefined;
+    if (!v) return false;
+    const month = sim.date.month, seen = this.venueSeen.get(b.id);
+    let day = seen?.day ?? -1;
+    if (seen && (month !== seen.month ? v.events > 0 : v.events > seen.events)) day = sim.day;
+    this.venueSeen.set(b.id, { month, events: v.events, day });
+    return day === sim.day;
+  }
+
+  /** Heritage sites in the region's own style, weathering as their condition falls, and floodlit at night. */
+  private heritage(b: Building, style: string): void {
+    const rot = frontRot(b);
+    const cx = b.x + b.w / 2, cz = b.y + b.h / 2;
+    const c = Math.cos(rot), s = Math.sin(rot);
+    const age = clamp(1 - b.condition, 0, 1);
+    const tint = (hex: number) => this.tmpColor.setHex(hex).lerp(WEATHERED, age * 0.5).getHex();
+    const put = (layer: Layer, lx: number, lz: number, y: number, sx: number, h: number, sz: number, color: number, a?: number[]) =>
+      layer.add(cx + lx * c + lz * s, y, cz - lx * s + lz * c, sx, h, sz, rot, tint(color), a);
+    const pick = (i: number) => { if (i >= 0) this.buildingIds[i] = b.id; };
+    switch (style) {
+      case 'temple':
+        put(this.flats, 0, 0, 0, 1.6, 0.06, 1.6, 0xc8b28a);
+        put(this.flats, 0, -0.1, 0.06, 1.24, 0.06, 1.24, 0xbfa77c);
+        pick(put(this.walls, 0, -0.2, 0.12, 0.62, 0.34, 0.62, 0xc9a777, [0, 0]));
+        put(this.spires, 0, -0.2, 0.46, 0.68, 0.74, 0.68, 0xc29f6c);
+        put(this.extras, 0, -0.2, 1.18, 0.07, 0.09, 0.07, 0xe0b040);
+        put(this.flats, 0, 0.36, 0.12, 0.56, 0.2, 0.42, 0xcdb084);
+        put(this.flats, 0, 0.36, 0.32, 0.64, 0.035, 0.5, 0xb89c70);
+        for (const lx of [-0.24, 0.24]) put(this.extras, lx, 0.6, 0.12, 0.05, 0.2, 0.05, 0xd8c098);
+        break;
+      case 'pagoda': {
+        put(this.flats, 0, 0, 0, 1.5, 0.06, 1.5, 0xb8ab90);
+        let y = 0.06;
+        // tiers narrow towards the top; eaves overhang little enough that each red storey shows beneath the next
+        for (let k = 0; k < 4; k++) {
+          const body = 0.66 - k * 0.12, eave = body + 0.18, hh = k === 0 ? 0.3 : 0.2;
+          const i = put(k === 0 ? this.walls : this.flats, 0, 0, y, body, hh, body, 0xa8352a, k === 0 ? [0, 0] : undefined);
+          if (k === 0) pick(i);
+          y += hh;
+          put(this.flats, 0, 0, y, eave, 0.035, eave, 0x46564a);
+          y += 0.035;
+        }
+        put(this.spires, 0, 0, y, 0.14, 0.34, 0.14, 0xc9a040);
+        break;
+      }
+      case 'castle': {
+        const stone = 0x9c968a;
+        pick(put(this.walls, 0, -0.12, 0, 0.66, 0.56, 0.6, stone, [0, 1]));
+        put(this.flats, 0, -0.12, 0.56, 0.7, 0.04, 0.64, 0x8a8478);
+        for (const [lx, lz] of [[-0.7, -0.7], [0.7, -0.7], [-0.7, 0.7], [0.7, 0.7]]) {
+          put(this.extras, lx, lz, 0, 0.3, 0.46, 0.3, stone);
+          put(this.spires, lx, lz, 0.46, 0.36, 0.3, 0.36, 0x4a5160);
+        }
+        for (const [lx, lz, sx, sz] of [[0, -0.7, 1.3, 0.09], [0, 0.7, 1.3, 0.09], [-0.7, 0, 0.09, 1.3], [0.7, 0, 0.09, 1.3]]) put(this.flats, lx, lz, 0, sx, 0.26, sz, stone);
+        put(this.flats, 0, 0.7, 0, 0.34, 0.34, 0.18, 0x8f897c);
+        break;
+      }
+      case 'colonial': {
+        const roof = 0x8c3b2e;
+        pick(put(this.walls, 0, -0.1, 0, 1.4, 0.3, 0.72, 0xe8dcc0, [0, 2]));
+        put(this.gables, 0, -0.1, 0.3, 1.46, 0.16, 0.78, roof);
+        put(this.flats, 0, 0.42, 0.19, 1.36, 0.025, 0.26, roof);
+        for (let k = 0; k < 5; k++) put(this.extras, -0.6 + k * 0.3, 0.52, 0, 0.035, 0.19, 0.035, 0xf0e8d8);
+        put(this.flats, 0, 0.05, 0.3, 0.28, 0.36, 0.28, 0xe2d4b4);
+        put(this.spires, 0, 0.05, 0.66, 0.36, 0.24, 0.36, roof);
+        put(this.signs, 0, 0.192, 0.5, 0.13, 0.13, 0.01, 0xfff4d8);
+        break;
+      }
+      default: { // hill fort: curtain walls with corner bastions, a gatehouse and a palace inside
+        const stone = 0xb8a07a;
+        for (const [lx, lz, sx, sz] of [[0, -0.72, 1.44, 0.11], [0, 0.72, 1.44, 0.11], [-0.72, 0, 0.11, 1.44], [0.72, 0, 0.11, 1.44]]) put(this.flats, lx, lz, 0, sx, 0.26, sz, stone);
+        for (const [lx, lz] of [[-0.72, -0.72], [0.72, -0.72], [-0.72, 0.72], [0.72, 0.72]]) put(this.extras, lx, lz, 0, 0.32, 0.36, 0.32, 0xb09872);
+        put(this.flats, 0, 0.72, 0, 0.38, 0.33, 0.2, 0xa89068);
+        pick(put(this.walls, 0.1, -0.18, 0, 0.62, 0.4, 0.54, 0xc2ab86, [0, 1]));
+        put(this.flats, 0.1, -0.18, 0.4, 0.66, 0.04, 0.58, 0xa89068);
+      }
+    }
+    this.bldPools.add(cx, 0.05, cz, 2.4, 1, 2.4, 0, 0xffd9a0);
+  }
+
+  /** Street lamps along roads through built-up or zoned land, every other tile, alternating sides. */
+  private buildLamps(sim: Sim): void {
+    const m = sim.s.map;
+    let roads = 0;
+    for (let t = 0; t < N * N; t++) if (m.road[t]) roads++;
+    this.posts.begin(roads);
+    this.lampHeads.begin(roads);
+    this.lampPools.begin(roads);
+    const HALF = [0, 0.17, 0.26, 0.33];
+    const road = (x: number, y: number) => x >= 0 && y >= 0 && x < N && y < N && m.road[y * N + x] > 0;
+    const urbanAt = (x: number, y: number) => {
+      if (x < 0 || y < 0 || x >= N || y >= N) return false;
+      const t = y * N + x;
+      if (URBAN.has(m.zone[t])) return true;
+      const o = m.owner[t];
+      const b = o >= 0 ? sim.bld(o) : undefined;
+      return !!b && BUILDINGS[b.kind].category !== 'agricultural';
+    };
+    for (let t = 0; t < N * N; t++) {
+      const cls = m.road[t];
+      if (!cls || m.terrain[t] === Terrain.Water) continue;
+      const tx = t % N, ty = (t / N) | 0;
+      if ((tx + ty) % 2) continue;
+      const ew = road(tx - 1, ty) || road(tx + 1, ty), ns = road(tx, ty - 1) || road(tx, ty + 1);
+      if (ew && ns) continue; // junctions stay clear
+      if (!urbanAt(tx, ty) && !urbanAt(tx - 1, ty) && !urbanAt(tx + 1, ty) && !urbanAt(tx, ty - 1) && !urbanAt(tx, ty + 1)) continue;
+      const side = ((tx >> 1) + (ty >> 1)) % 2 ? 1 : -1;
+      const off = (HALF[cls] + 0.07) * side;
+      const x = tx + 0.5 + (ew ? 0 : off), z = ty + 0.5 + (ew ? off : 0);
+      const h = cls === 3 ? 0.42 : 0.34;
+      this.posts.add(x, 0, z, 0.03, h, 0.03, 0, 0x5c6066);
+      this.lampHeads.add(x, h, z, 0.08, 0.025, 0.08, 0, 0xffe2a8);
+      this.lampPools.add(x, 0.045, z, 1, 1, 1, 0, 0xffc47a);
+    }
+    this.posts.end(); this.lampHeads.end(); this.lampPools.end();
+  }
+
+  /** Aircraft on today's flights: approach, landing, taxiing, turnaround at the stands and take-off. */
+  private planes(sim: Sim): void {
+    const s = sim.s;
+    this.planeBody.begin(24);
+    this.planeTail.begin(24);
+    const ap = s.air.routes.length ? s.buildings.find((b) => b.kind === 'airport') : undefined;
+    if (ap) {
+      const F = frameOf(ap);
+      const tod = s.minute % 1440, day = sim.day;
+      let k = 0;
+      s.air.routes.forEach((r, ri) => {
+        const n = flightsOn(r, day);
+        const livery = LIVERY[hashStr(r.airline) % LIVERY.length];
+        const scale = r.intl ? 0.8 : 0.66;
+        for (let j = 0; j < n; j++) {
+          const tA = 360 + ((j + 0.5) / n) * 840 + ri * 23 + (hash01(r.id * 31 + day, j) - 0.5) * 40;
+          const p = planePose(F, tod, tA, tA + 55, k++ % 4);
+          if (!p) continue;
+          this.planeBody.add(p.x, p.y, p.z, scale, scale, scale, p.rot, 0xf2f4f6);
+          this.planeTail.add(p.x, p.y, p.z, scale, scale, scale, p.rot, livery);
+        }
+      });
+    }
+    this.planeBody.end();
+    this.planeTail.end();
   }
 
   private buildTrees(sim: Sim): void {
@@ -680,6 +1096,11 @@ export class WorldView {
     this.fog.far = d * 7 + 260 - rain * 120;
     this.night.value = clamp((0.15 - e) / 0.3, 0, 1);
     this.renderer.toneMappingExposure = 1.05 - rain * 0.15;
+    // lamps, signs and runway lights come on at dusk and throw pools of light on the ground
+    const n = this.night.value;
+    this.glowMat.color.setScalar(0.7 + 1.3 * n);
+    this.poolMat.opacity = 0.45 * n;
+    this.lampPools.mesh.visible = this.bldPools.mesh.visible = n > 0.02;
   }
 
   // ------------------------------------------------------------------------------------------ selection & tools
@@ -691,6 +1112,15 @@ export class WorldView {
     const outline = (b: Building | undefined) => {
       if (!b) return;
       if (b.kind === 'park') { for (let y = b.y; y < b.y + b.h; y++) for (let x = b.x; x < b.x + b.w; x++) this.marks.add(x + 0.5, 0.01, y + 0.5, 0.96, 0.04, 0.96, 0, 0xffffff); return; }
+      // sites laid out across their whole footprint are outlined by it
+      const whole = { airport: 0.45, stadium: 1.08, heritage: 0.9 } as Partial<Record<BuildingKind, number>>;
+      const hh = whole[b.kind];
+      if (hh !== undefined) {
+        this.edges.position.set(b.x + b.w / 2, 0, b.y + b.h / 2);
+        this.edges.scale.set(b.w - 0.08, hh, b.h - 0.08);
+        this.edges.visible = true;
+        return;
+      }
       const L = buildingLook(b);
       this.edges.position.set(b.x + b.w / 2, 0, b.y + b.h / 2);
       this.edges.scale.set(L.w + 0.1, L.h + L.roofH + 0.06, L.d + 0.1);
@@ -829,13 +1259,14 @@ export class WorldView {
     this.ghost.visible = false;
     if (tool.mode === 'build') {
       const spec = BUILDINGS[tool.kind];
+      const w = tool.rot ? spec.h : spec.w, h = tool.rot ? spec.w : spec.h;
       const at = this.pendingBuild ?? (this.hover >= 0 ? { x: this.hover % N, y: (this.hover / N) | 0, ok: false } : null);
       if (at) {
-        const key = `${tool.kind}:${at.x}:${at.y}:${sim.ix.ver.buildings}:${sim.ix.ver.projects}`;
-        if (key !== this.hoverKey) { this.hoverKey = key; this.hoverOk = previewBuilding(sim, tool.kind, at.x, at.y, tool.floors).ok; }
-        const L = lookFor(tool.kind, spec.w, spec.h, tool.floors ?? spec.floors[0], 1);
-        this.ghost.position.set(at.x + spec.w / 2, 0, at.y + spec.h / 2);
-        this.ghost.scale.set(spec.w - 0.08, Math.max(0.1, L.h + L.roofH), spec.h - 0.08);
+        const key = `${tool.kind}:${tool.rot ? 1 : 0}:${at.x}:${at.y}:${sim.ix.ver.buildings}:${sim.ix.ver.projects}`;
+        if (key !== this.hoverKey) { this.hoverKey = key; this.hoverOk = previewBuilding(sim, tool.kind, at.x, at.y, tool.floors, !!tool.rot).ok; }
+        const L = lookFor(tool.kind, w, h, tool.floors ?? spec.floors[0], 1);
+        this.ghost.position.set(at.x + w / 2, 0, at.y + h / 2);
+        this.ghost.scale.set(w - 0.08, Math.max(0.1, L.h + L.roofH), h - 0.08);
         this.ghostMat.color.setHex(this.hoverOk ? 0x55cc77 : 0xe05050);
         this.ghost.visible = true;
       }

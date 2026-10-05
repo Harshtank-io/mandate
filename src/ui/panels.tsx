@@ -6,17 +6,25 @@ import type { Game } from '../game/game';
 import type { Selection } from '../render/view';
 import { alerts } from '../sim/summary';
 import { explain, projectProgress, REV_LABELS, type MetricKey, type Ref } from '../sim/inspect';
-import { announcePolicy, announceTax, cancel, describeValue, policyEffects, policyRange, setFunding, taxEffects, taxRange } from '../sim/commands';
+import {
+  announcePolicy, announceTax, cancel, cofundShare, describeValue, leaveAgreement, openTalks, policyEffects, policyRange, setFunding, taxEffects, taxRange,
+  type CommandResult,
+} from '../sim/commands';
 import { DEPT_LABELS, POLICY_DELAY, POLICY_LABELS, TAX_LABELS } from '../sim/systems/government';
 import { milestonesFor } from '../sim/systems/milestones';
+import { DISPUTE_TARIFF, exportDest, importSource, ourTariff, theirTariff } from '../sim/systems/trade';
+import { airportOf, projectedPassengers } from '../sim/systems/aviation';
+import { roomRate } from '../sim/systems/tourism';
+import { MONTHS_LONG } from '../sim/calendar';
 import { OFFLINE_CAPS, PACES, getPreset } from '../sim/presets';
-import { DEPTS, type MonthStats, type Policies, type RevCat, type TaxSettings } from '../sim/types';
+import { AIRPORT_MIN_DEMAND, GOOD_SPECS, PROMOTION_COST } from '../sim/tables';
+import { DEPTS, GOODS, GRAINS, type BuildingKind, type Good, type MonthStats, type Policies, type RevCat, type TaxSettings, type TradePartner } from '../sim/types';
 import { deleteSave, listSaves, type SaveMeta } from '../game/persist';
 import { activeSync } from '../net/sync';
 import { CloudSection } from './account';
-import { Chart, dayLabel, money, num, pct, realSpan, SectionView, Spark } from './util';
+import { Bars, Chart, dayLabel, money, num, pct, realSpan, SectionView, Spark } from './util';
 
-export type Tab = 'overview' | 'budget' | 'taxes' | 'policies' | 'projects' | 'news' | 'milestones' | 'saves';
+export type Tab = 'overview' | 'budget' | 'taxes' | 'policies' | 'trade' | 'tourism' | 'projects' | 'news' | 'milestones' | 'saves';
 
 export interface Ctx {
   game: Game;
@@ -25,6 +33,8 @@ export interface Ctx {
   openRef(ref: Ref): void;
   toast(text: string, tone?: 'good' | 'bad'): void;
   setTab(t: Tab): void;
+  /** Picks up the build tool for a facility, as if chosen from the Build menu. */
+  build(kind: BuildingKind): void;
   menu(): void;
   loadSave(key: string): void;
   exportWorld(): void;
@@ -347,6 +357,299 @@ export function PoliciesPanel({ ctx }: { ctx: Ctx }) {
           })}
         </section>
       ))}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------------------------------------ trade
+
+const TRADE_STATUS: Record<TradePartner['status'], string> = { none: 'No agreement', talks: 'In talks', agreement: 'Trade agreement', leaving: 'Leaving' };
+const goodsList = (gs: Good[]) => gs.map((g) => GOOD_SPECS[g].label.toLowerCase()).join(', ') || '–';
+const unitOf = (g: Good) => (GOOD_SPECS[g].unit === 't' ? 't' : GOOD_SPECS[g].unit);
+
+function partnerStatus(sim: Sim, p: TradePartner): string {
+  switch (p.status) {
+    case 'talks': return `Talks began ${dayLabel(sim, p.statusDay)}; a result is expected around ${dayLabel(sim, p.due)}.`;
+    case 'agreement': return p.statusDay < sim.s.meta.officeDay ? 'In force since before you took office.' : `In force since ${dayLabel(sim, p.statusDay)}.`;
+    case 'leaving': return `Notice given: tariffs return on ${dayLabel(sim, p.due)}.`;
+    default: return 'Trade runs on standard tariffs both ways.';
+  }
+}
+
+export function TradePanel({ ctx }: { ctx: Ctx }) {
+  const { sim } = ctx;
+  const s = sim.s, tr = s.trade, g = s.gov;
+  const [confirm, setConfirm] = useState<string | null>(null);
+  const all = s.stats.months;
+  const st = all[all.length - 1];
+  if (!st) return <p class="muted panel-body">Trade figures appear after the first month.</p>;
+  const ms = all.slice(-24);
+  const yearAgo = all[Math.max(0, all.length - 13)];
+  const fxYear = yearAgo.fx > 0 ? tr.fx / yearAgo.fx - 1 : 0;
+  const code = sim.preset.currencyCode, fxName = sim.preset.fxName;
+  const coolOff = Math.max(0, 365 - (sim.day - tr.lastTalks));
+  const run = (r: CommandResult) => { ctx.toast(r.ok ? r.message : r.error, r.ok ? 'good' : 'bad'); setConfirm(null); };
+  const recentTrade = s.events.filter((e) => e.type.startsWith('trade.') || e.type === 'world.fx').slice(-6).reverse();
+  const fxLine = Math.abs(fxYear) < 0.005 ? `The ${code} has held steady against the ${fxName} over the past year.`
+    : fxYear > 0 ? `The ${code} has fallen about ${pct(fxYear, 1)} against the ${fxName} in a year: imports and fuel cost more, while exporters, tech firms and foreign visitors gain.`
+      : `The ${code} has risen about ${pct(-fxYear, 1)} against the ${fxName} in a year: imports and fuel are cheaper, while exporters earn less and visitors find the city dearer.`;
+  return (
+    <div class="panel-body">
+      <section>
+        <h3>Trade balance</h3>
+        <dl class="rows">
+          <div><dt>Exports last month</dt><dd>{money(sim, st.exports)}</dd></div>
+          <div><dt>Imports last month</dt><dd>{money(sim, st.imports)}</dd></div>
+          <div><dt>Balance</dt><dd class={st.tradeBalance >= 0 ? 'good' : 'bad'}>{money(sim, st.tradeBalance)}</dd></div>
+          <div><dt>Exchange rate index</dt><dd>{(tr.fx * 100).toFixed(1)} <span class="muted small">(100 when the world began)</span></dd></div>
+        </dl>
+        <p class="muted small">{fxLine}</p>
+        <Chart series={[{ label: 'Exports', values: ms.map((m) => m.exports), color: '#7fd18b' }, { label: 'Imports', values: ms.map((m) => m.imports), color: '#f08a6c' }]}
+          fmt={(v) => money(sim, v)} labels={monthLabels(sim, ms)} />
+        <p class="muted small">Exports include what visitors spend here and services sold to clients elsewhere; imports include fuel.</p>
+      </section>
+      <section>
+        <h3>Trading partners</h3>
+        {tr.partners.map((p) => {
+          const inForce = p.status === 'agreement' || p.status === 'leaving';
+          return (
+            <article class="partner" key={p.id}>
+              <header><b>{p.name}</b><span class={`chip ${inForce ? 'on' : ''}`}>{TRADE_STATUS[p.status]}</span></header>
+              {p.dispute > 0 && <p class="bad small">Trade dispute: {pct(DISPUTE_TARIFF)} punitive tariffs on our manufactured goods for about {Math.max(1, Math.round(p.dispute / 30))} more months</p>}
+              <dl class="rows">
+                <div><dt>They buy</dt><dd>{goodsList(p.buys)}</dd></div>
+                <div><dt>They sell</dt><dd>{goodsList(p.sells)}</dd></div>
+                <div><dt>Their tariffs on our goods</dt><dd>{pct(theirTariff(p, 'goods'))} manufactures · {pct(theirTariff(p, 'wheat'))} farm</dd></div>
+                <div><dt>Our tariffs on theirs</dt><dd>{pct(ourTariff(sim, 'goods', p))} manufactures · {pct(ourTariff(sim, 'wheat', p))} farm</dd></div>
+                <div><dt>Last month</dt><dd>exports {money(sim, p.lastExp)} · imports {money(sim, p.lastImp)}</dd></div>
+              </dl>
+              <p class="muted small">{partnerStatus(sim, p)}</p>
+              {p.status === 'none' && (
+                <div class="buttons wrap">
+                  <button class="small" disabled={coolOff > 0} onClick={() => run(openTalks(sim, p.id))}>Open trade talks</button>
+                  <span class="muted small">{coolOff > 0 ? `Partners will not reopen talks for another ${coolOff} days after the last ones collapsed.` : 'Talks take 9–17 months; about 7 in 10 end in an agreement.'}</span>
+                </div>
+              )}
+              {(p.status === 'talks' || p.status === 'agreement') && (confirm === p.id ? (
+                <div class="change">
+                  <ul class="effects">
+                    {p.status === 'talks'
+                      ? <li>Talks end at once; nothing changes, and they can be reopened later</li>
+                      : <><li>Tariffs return six months after notice is given</li><li>Local producers get protection back; exporters and importers lose tariff-free access</li></>}
+                  </ul>
+                  <div class="buttons">
+                    <button class="danger small" onClick={() => run(leaveAgreement(sim, p.id))}>{p.status === 'talks' ? 'Break off talks' : 'Give notice'}</button>
+                    <button class="ghost small" onClick={() => setConfirm(null)}>Keep</button>
+                  </div>
+                </div>
+              ) : <button class="ghost small" onClick={() => setConfirm(p.id)}>{p.status === 'talks' ? 'Break off talks' : 'Leave the agreement'}</button>)}
+            </article>
+          );
+        })}
+      </section>
+      <section>
+        <h3>Goods</h3>
+        <p class="muted small">Imports come from the cheapest source after tariffs and shipping; exports go to the best-paying market.</p>
+        <ul class="goods">
+          {GOODS.map((gd) => {
+            const mk = s.market[gd];
+            const src = importSource(sim, gd), dest = exportDest(sim, gd);
+            const banned = g.policies.grainExportBan && GRAINS.includes(gd);
+            return (
+              <li key={gd}>
+                <div class="goods-head"><b>{GOOD_SPECS[gd].label}</b><span class="muted small">{money(sim, mk.price)}/{unitOf(gd)} here · {money(sim, s.ext.prices[gd])} abroad</span></div>
+                <p class="small">Last month: imported {num(mk.lastImported)} {unitOf(gd)} · exported {num(mk.lastExported)} {unitOf(gd)}</p>
+                <p class="muted small">Cheapest from {src.p ? src.p.name : 'the world market'} ({pct(src.tariff)} tariff) · {banned ? 'exports banned' : `best market: ${dest.p ? dest.p.name : 'other markets'}`}</p>
+              </li>
+            );
+          })}
+        </ul>
+      </section>
+      <section>
+        <h3>Levers</h3>
+        <dl class="rows">
+          {(['import', 'importFood', 'export'] as const).map((k) => <div key={k}><dt>{TAX_LABELS[k]}</dt><dd>{describeValue(sim, k, g.taxes[k])}</dd></div>)}
+          {(['exportIncentive', 'grainExportBan', 'investmentIncentive'] as const).map((k) => <div key={k}><dt>{POLICY_LABELS[k]}</dt><dd>{describeValue(sim, k, g.policies[k])}</dd></div>)}
+        </dl>
+        <div class="buttons">
+          <button class="small" onClick={() => ctx.setTab('taxes')}>Tariffs and export tax</button>
+          <button class="small" onClick={() => ctx.setTab('policies')}>Trade and investment laws</button>
+        </div>
+      </section>
+      {recentTrade.length > 0 && (
+        <section>
+          <h3>Recent</h3>
+          <ul class="lines">{recentTrade.map((e) => <li key={e.id}><span class="muted small">{dayLabel(sim, e.day)}</span> {e.text}</li>)}</ul>
+        </section>
+      )}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------------------------------------ tourism & leisure
+
+const ATTRACTION_LABELS: Record<string, string> = {
+  heritage: 'Heritage sites', museum: 'Museums', stadium: 'Stadium', parks: 'Parks', nature: 'Countryside', river: 'River', food: 'Restaurants', cinema: 'Cinemas',
+};
+
+export function TourismPanel({ ctx }: { ctx: Ctx }) {
+  const { sim } = ctx;
+  const s = sim.s, T = s.tourism, A = s.air, g = s.gov, pol = g.policies;
+  const all = s.stats.months;
+  const st = all[all.length - 1];
+  if (!st) return <p class="muted panel-body">Visitor figures appear after the first month.</p>;
+  const ms = all.slice(-24);
+  const last = T.last;
+  const overnight = Math.max(0, last.domestic + last.foreign - last.dayTrips);
+  const turnedShare = overnight > 0 ? last.turned / overnight : 0;
+  const nominal = sim.scale * s.ext.trend;
+  const fest = sim.preset.tourism.festival;
+  const parts = T.appealParts;
+  const partSum = Object.keys(ATTRACTION_LABELS).reduce((a, k) => a + (parts[k] ?? 0), 0);
+  const attractions = Object.keys(ATTRACTION_LABELS).filter((k) => (parts[k] ?? 0) > 0.001)
+    .sort((a, b) => (parts[b] ?? 0) - (parts[a] ?? 0))
+    .map((k) => ({ label: ATTRACTION_LABELS[k], value: partSum > 0 ? (parts[k] ?? 0) / partSum : 0 }));
+  const season = T.season[sim.date.month] ?? 1;
+  const seasonText = season >= 1.15 ? 'high season' : season <= 0.85 ? 'low season' : 'ordinary season';
+  const hotels = s.businesses.filter((b) => b.kind === 'hotel' && b.status === 'operating');
+  const sites = s.buildings.filter((b) => b.kind === 'heritage');
+  const venues = s.businesses.filter((b) => (b.kind === 'museum' || b.kind === 'stadium') && b.status !== 'closed');
+  const cinemas = s.businesses.filter((b) => b.kind === 'cinema' && b.status === 'operating');
+  const parks = s.buildings.filter((b) => b.kind === 'park').length;
+  const ap = airportOf(sim);
+  const apProject = s.projects.find((p) => p.kind === 'airport' && p.phase !== 'done' && p.phase !== 'cancelled');
+  const tone = (v: number) => (v < 0.4 ? 'bad' : v > 0.7 ? 'good' : undefined);
+  return (
+    <div class="panel-body">
+      <section>
+        <h3>Visitors last month</h3>
+        <dl class="rows">
+          <div><dt>Visitors</dt><dd>{num(st.tourists)} <span class="muted small">({num(st.foreignTourists)} from abroad)</span></dd></div>
+          <div><dt>Came for the day</dt><dd>{num(last.dayTrips)}</dd></div>
+          <div><dt>Guest-nights in hotels</dt><dd>{num(last.nights)}</dd></div>
+          <div><dt>Found no room</dt><dd class={turnedShare > 0.15 ? 'bad' : ''}>{num(last.turned)}{overnight > 0 ? ` (${pct(turnedShare)})` : ''}</dd></div>
+          <div><dt>Arrived by air</dt><dd>{num(last.byAir)}</dd></div>
+          <div><dt>Spent in the city</dt><dd>{money(sim, last.spend)}</dd></div>
+        </dl>
+        <Chart series={[{ label: 'All visitors', values: ms.map((m) => m.tourists), color: '#8fd3ff' }, { label: 'From abroad', values: ms.map((m) => m.foreignTourists), color: '#f0b04a' }]}
+          fmt={(v) => num(v)} labels={monthLabels(sim, ms)} />
+        {T.festival > 0 && <p class="good small">{fest.name} is on: {T.festival} more day{T.festival > 1 ? 's' : ''}, about {num(T.festivalVisitors)} visitors so far.</p>}
+      </section>
+      <section>
+        <h3>Why visitors come</h3>
+        <p class="muted small">Attractions index {T.appeal.toFixed(2)} · {seasonText} this month (×{season.toFixed(2)})</p>
+        {attractions.length ? <Bars bars={attractions} /> : <p class="muted">Nothing draws visitors yet.</p>}
+        <h4>How well the city is known</h4>
+        <Bars bars={[
+          { label: 'At home', value: T.awareness, tone: tone(T.awareness) },
+          { label: 'Abroad', value: T.awarenessIntl, tone: tone(T.awarenessIntl) },
+          { label: 'Reputation', value: T.reputation, tone: tone(T.reputation) },
+        ]} />
+        <h4>What holds visitors back</h4>
+        <Bars bars={[
+          { label: 'Safety', value: parts.xSafety ?? 1, tone: tone(parts.xSafety ?? 1) },
+          { label: 'Clean air', value: parts.xClean ?? 1, tone: tone(parts.xClean ?? 1) },
+          { label: 'Free-flowing roads', value: parts.xCrowd ?? 1, tone: tone(parts.xCrowd ?? 1) },
+          { label: 'Size of the town', value: parts.xTown ?? 1, tone: tone(parts.xTown ?? 1) },
+        ]} />
+        <p class="muted small">Promotion and flights make the city better known; good experiences, safety and enough hotel rooms build its reputation.</p>
+      </section>
+      <section>
+        <h3>Hotels</h3>
+        {hotels.length === 0 ? <p class="muted">No hotels yet. Investors build them on commercial land once visitors start finding no room.</p> : (
+          <>
+            <dl class="rows">
+              <div><dt>Rooms</dt><dd>{num(st.hotelRooms)} in {hotels.length} hotel{hotels.length > 1 ? 's' : ''}</dd></div>
+              <div><dt>Occupancy last month</dt><dd>{pct(st.occupancy)}</dd></div>
+              <div><dt>Room rate</dt><dd>{money(sim, roomRate(sim, false))} a night · {money(sim, roomRate(sim, true))} for foreign guests</dd></div>
+              <div><dt>{TAX_LABELS.tourism}</dt><dd>{pct(g.taxes.tourism)} · raised {money(sim, g.last.rev.tourismTax)}</dd></div>
+            </dl>
+            <ul class="lines">
+              {hotels.slice(0, 12).map((b) => {
+                const h = b.hotel;
+                return (
+                  <li key={b.id}>
+                    <button class="link" onClick={() => ctx.openRef({ k: 'business', id: b.id })}>{b.name}</button>{' '}
+                    <span class="muted small">{h ? `${h.rooms} rooms · ${pct(h.rooms ? h.occupied / h.rooms : 0)} full last night · ${num(h.lastGuests)} guests last month` : 'opening'}</span>
+                  </li>
+                );
+              })}
+            </ul>
+          </>
+        )}
+      </section>
+      <section>
+        <h3>Attractions</h3>
+        {sites.length + venues.length + cinemas.length + parks === 0 && <p class="muted">Nothing much to see yet. Museums, a stadium and parks are on the Build menu.</p>}
+        <ul class="lines">
+          {sites.map((b) => (
+            <li key={b.id}>
+              <button class="link" onClick={() => ctx.openRef({ k: 'building', id: b.id })}>{b.name || 'Heritage site'}</button>{' '}
+              <span class={`small ${b.condition < 0.5 ? 'bad' : 'muted'}`}>condition {pct(b.condition)}{b.condition < 0.5 ? ': needs conservation (culture budget)' : ''}</span>
+            </li>
+          ))}
+          {venues.map((b) => {
+            const v = b.venue;
+            const detail = b.status !== 'operating' ? 'not open yet'
+              : b.kind === 'museum' ? `${num(v?.lastSold ?? 0)} visitors last month, ${num(v?.lastVisitors ?? 0)} from outside the city`
+                : `${v?.lastEvents ?? 0} events last month · last crowd ${num(v?.lastCrowd ?? 0)}${v && v.nextEvent >= sim.day ? ` · next on ${dayLabel(sim, v.nextEvent)}` : ''}`;
+            return <li key={b.id}><button class="link" onClick={() => ctx.openRef({ k: 'business', id: b.id })}>{b.name}</button> <span class="muted small">{detail}</span></li>;
+          })}
+          {cinemas.length > 0 && <li>{cinemas.length} cinema{cinemas.length > 1 ? 's' : ''} <span class="muted small">{num(cinemas.reduce((a, b) => a + (b.venue?.lastSold ?? 0), 0))} tickets last month</span></li>}
+          {parks > 0 && <li>{parks} park{parks > 1 ? 's' : ''} <span class="muted small">free to visit</span></li>}
+        </ul>
+      </section>
+      <section>
+        <h3>Festival and promotion</h3>
+        <dl class="rows">
+          <div><dt>{fest.name}</dt><dd>{MONTHS_LONG[fest.month]}, {fest.days} days · {['not held', 'local festival', 'grand festival'][pol.festival] ?? '–'}</dd></div>
+          <div><dt>{POLICY_LABELS.tourismPromotion}</dt><dd>{describeValue(sim, 'tourismPromotion', pol.tourismPromotion)} · {money(sim, (PROMOTION_COST[pol.tourismPromotion] ?? 0) * nominal)} a month</dd></div>
+          <div><dt>Spent on promotion and festivals last month</dt><dd>{money(sim, g.last.exp.promotion)}</dd></div>
+        </dl>
+        <div class="buttons"><button class="small" onClick={() => ctx.setTab('policies')}>Change in Laws</button></div>
+      </section>
+      <section>
+        <h3>Airport</h3>
+        {ap ? (
+          <>
+            <dl class="rows">
+              <div><dt>Open since</dt><dd>{A.opened >= 0 ? dayLabel(sim, A.opened) : 'this month'}</dd></div>
+              <div><dt>Passengers last month</dt><dd>{num(A.last.pax)}</dd></div>
+              <div><dt>Of whom</dt><dd>{num(A.last.tourists)} visitors · {num(A.last.residents)} residents · {num(A.last.business)} on business</dd></div>
+              <div><dt>Flights last month</dt><dd>{num(A.last.flights)}</dd></div>
+              <div><dt>Fees raised</dt><dd>{money(sim, A.last.fees)}</dd></div>
+            </dl>
+            <ul class="lines">
+              {A.routes.map((r) => (
+                <li key={r.id}>{r.dest} <span class="muted small">{r.airline}{r.intl ? ' · international' : ''} · {r.weekly} flights a week{r.lastSeats > 0 ? ` · ${pct(r.lastPax / r.lastSeats)} of seats filled last month` : ' · new'}</span></li>
+              ))}
+              {A.pending.map((p) => <li key={`${p.dest}-${p.day}`}>{p.dest} <span class="muted small">{p.airline} starts flying around {dayLabel(sim, p.day)}</span></li>)}
+            </ul>
+            {A.routes.length === 0 && A.pending.length === 0 && <p class="muted">No airline flies here yet.</p>}
+          </>
+        ) : apProject ? (
+          <p><button class="link" onClick={() => ctx.openRef({ k: 'project', id: apProject.id })}>{apProject.name}</button> <span class="muted small">{Math.round(projectProgress(apProject) * 100)}% built</span></p>
+        ) : (
+          <>
+            <p class="muted">No airport: visitors come by road, and many who would fly stay away.</p>
+            <dl class="rows">
+              <div><dt>Expected passengers</dt><dd>about {num(projectedPassengers(sim))} a month</dd></div>
+              <div><dt>National co-funding</dt><dd>{cofundShare(sim, 'airport') > 0 ? `${pct(cofundShare(sim, 'airport'))} of construction` : `only above ${num(AIRPORT_MIN_DEMAND)} expected passengers a month`}</dd></div>
+            </dl>
+            <div class="buttons"><button class="small" onClick={() => ctx.build('airport')}>Plan an airport</button></div>
+          </>
+        )}
+      </section>
+      <section>
+        <h3>Going out</h3>
+        <dl class="rows">
+          <div><dt>Residents' leisure</dt><dd class={tone(st.leisure) ?? ''}>{pct(st.leisure)}</dd></div>
+          <div><dt>Spent on outings last month</dt><dd>{money(sim, s.leisure.lastSpend)}</dd></div>
+          <div><dt>Wanted to go out but found no seat</dt><dd>{money(sim, s.leisure.lastUnmet)}</dd></div>
+          <div><dt>{TAX_LABELS.entertainment}</dt><dd>{pct(g.taxes.entertainment)}</dd></div>
+        </dl>
+        <p class="muted small">Families want a couple of films a month, the odd museum visit and a match now and then. Unmet demand draws cinema investors; venues near home and the festival lift satisfaction.</p>
+      </section>
     </div>
   );
 }

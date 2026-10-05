@@ -7,7 +7,7 @@ import { CROPS, ROAD_CAPACITY } from './tables';
 import { fmtMoney } from './systems/construction';
 import { DEPT_LABELS } from './systems/government';
 import { districtName, projectProgress } from './inspect';
-import { DEPTS, Zone, type SimEvent } from './types';
+import { DEPTS, Zone, type Building, type SimEvent } from './types';
 
 export interface Snapshot {
   minute: number;
@@ -32,6 +32,10 @@ export interface Snapshot {
   rentIndex: number;
   opened: number;
   closed: number;
+  visitors: number; foreignVisitors: number; visitorSpend: number;
+  passengers: number;
+  routes: number[];
+  fx: number;
 }
 
 export interface SummaryLine { text: string; tone: 'good' | 'bad' | 'neutral'; ref?: SimEvent['ref'] }
@@ -81,10 +85,13 @@ export function snapshot(sim: Sim): Snapshot {
     harvest: { ...s.stats.cumHarvest }, projects, units, congestion: s.traffic.congestion, districtLoad: districtLoad(sim),
     pollution: avgPollution(sim), satisfaction: adults ? sat / adults : 0, foodPrice: s.market.food.price, rentIndex: s.housing.rentIndex,
     opened: cum(sim, 'opened'), closed: cum(sim, 'closed'),
+    visitors: s.tourism.total.visitors, foreignVisitors: s.tourism.total.foreign, visitorSpend: s.tourism.total.spend,
+    passengers: s.air.totalPax, routes: s.air.routes.map((r) => r.id), fx: s.trade.fx,
   };
 }
 
 const signed = (v: number) => `${v >= 0 ? '+' : '−'}${Math.abs(Math.round(v)).toLocaleString('en-US')}`;
+const whole = (v: number) => Math.round(v).toLocaleString('en-US');
 const pctChange = (a: number, b: number) => (a > 0 ? (b / a - 1) * 100 : 0);
 
 export function summarize(sim: Sim, before: Snapshot): AwaySummary {
@@ -126,6 +133,31 @@ export function summarize(sim: Sim, before: Snapshot): AwaySummary {
   if (Math.abs(dr) >= 3) lines.push({ text: `Rents ${dr > 0 ? 'up' : 'down'} ${Math.abs(dr).toFixed(0)}%`, tone: dr > 0 ? 'bad' : 'neutral' });
   const ds = now.satisfaction - before.satisfaction;
   if (Math.abs(ds) >= 0.02) lines.push({ text: `Public satisfaction ${ds > 0 ? 'rose' : 'fell'} to ${Math.round(now.satisfaction * 100)}%`, tone: ds > 0 ? 'good' : 'bad' });
+  // visitors, flights, trade and the food programmes, from running totals and the months recorded meanwhile
+  const recorded = sim.s.stats.months.filter((m) => m.day > before.day);
+  const sumOf = (k: 'turnedAway' | 'exports' | 'imports' | 'procured' | 'rationed') => recorded.reduce((a, m) => a + m[k], 0);
+  const dv = now.visitors - before.visitors;
+  if (dv >= 1) {
+    const df = now.foreignVisitors - before.foreignVisitors;
+    lines.push({ text: `${whole(dv)} visitors came${df >= 1 ? ` (${whole(df)} from abroad)` : ''} and spent ${fmtMoney(sim, now.visitorSpend - before.visitorSpend)}`, tone: 'good' });
+  }
+  const turned = sumOf('turnedAway');
+  if (turned >= 20) lines.push({ text: `Hotels turned away about ${whole(turned)} visitors who found no room`, tone: 'bad' });
+  const pax = now.passengers - before.passengers;
+  if (pax >= 1) lines.push({ text: `${whole(pax)} passengers flew in or out of the airport`, tone: 'good' });
+  for (const r of sim.s.air.routes) if (!before.routes.includes(r.id)) lines.push({ text: `New flights: ${r.airline} to ${r.dest}, ${r.weekly} a week`, tone: 'good' });
+  if (recorded.length) {
+    const ex = sumOf('exports'), im = sumOf('imports');
+    lines.push({ text: `Exports ${fmtMoney(sim, ex)}, imports ${fmtMoney(sim, im)} (${ex >= im ? 'surplus' : 'deficit'} ${fmtMoney(sim, Math.abs(ex - im))})`, tone: ex >= im ? 'good' : 'neutral' });
+  }
+  const dfx = before.fx > 0 ? now.fx / before.fx - 1 : 0;
+  if (Math.abs(dfx) >= 0.03) {
+    lines.push({ text: `The ${sim.preset.currencyCode} ${dfx > 0 ? 'fell' : 'rose'} about ${Math.round(Math.abs(dfx) * 100)}% against the ${sim.preset.fxName}`, tone: 'neutral' });
+  }
+  const procured = sumOf('procured');
+  if (procured >= 1) lines.push({ text: `The government bought ${whole(procured)} t of grain from farmers at the support price`, tone: 'neutral' });
+  const rationed = sumOf('rationed');
+  if (rationed >= 1000) lines.push({ text: `Ration shops handed out ${whole(rationed / 1000)} t of subsidised grain to ${whole(sim.s.pds.families)} families`, tone: 'good' });
   const investments = sim.s.events.filter((e) => e.id > before.lastEventId && e.type === 'investment.announced');
   for (const e of investments.slice(-3)) lines.push({ text: e.text, tone: 'good', ref: e.ref });
   const skip = new Set(['business.opened', 'business.closed', 'investment.announced', 'project.phase', 'project.completed']);
@@ -181,5 +213,54 @@ export function alerts(sim: Sim): Alert[] {
   if (w.pandemic > 0) out.push({ sev: 3, text: `Epidemic under way (${w.pandemic} more days expected)`, hint: 'Healthcare coverage determines how many people fall seriously ill.', tab: 'budget' });
   if (g.approval < 0.4) out.push({ sev: 2, text: `Approval has fallen to ${Math.round(g.approval * 100)}%`, hint: 'See what residents are unhappy about on the overview.', tab: 'overview' });
   for (const p of g.pending) if (p.day - sim.day <= 7 && p.day >= sim.day) out.push({ sev: 1, text: `${p.label} in ${Math.max(0, p.day - sim.day)} days`, hint: 'Announced change about to take effect.', tab: p.kind === 'tax' ? 'taxes' : 'policies' });
+  out.push(...tradeAlerts(sim), ...visitorAlerts(sim));
   return out.sort((a, b) => b.sev - a.sev).slice(0, 10);
+}
+
+function tradeAlerts(sim: Sim): Alert[] {
+  const s = sim.s, out: Alert[] = [];
+  for (const p of s.trade.partners) {
+    if (p.dispute > 0) out.push({ sev: 2, text: `${p.name} has punitive tariffs on our manufactured goods`, hint: `About ${Math.max(1, Math.round(p.dispute / 30))} more months. Exporters must sell elsewhere for less; disputes are rarer under an agreement.`, tab: 'trade' });
+    const left = p.due - sim.day;
+    if (p.status === 'talks' && left >= 0 && left <= 14) out.push({ sev: 1, text: `Trade talks with ${p.name} conclude in ${left} days`, hint: 'An agreement removes tariffs on manufactures both ways and halves those on farm goods.', tab: 'trade' });
+    if (p.status === 'leaving' && left >= 0 && left <= 14) out.push({ sev: 1, text: `The trade agreement with ${p.name} ends in ${left} days`, hint: 'Tariffs return in both directions.', tab: 'trade' });
+  }
+  const ms = s.stats.months;
+  if (ms.length >= 4) {
+    const d = s.trade.fx / ms[ms.length - 4].fx - 1;
+    if (Math.abs(d) >= 0.08) {
+      out.push({
+        sev: 1, text: `The ${sim.preset.currencyCode} has ${d > 0 ? 'fallen' : 'risen'} ${Math.round(Math.abs(d) * 100)}% in three months`,
+        hint: d > 0 ? 'Imports and fuel cost more; exporters, tech firms and foreign visitors gain.' : 'Imports and fuel are cheaper; exporters earn less and the city is dearer for visitors.', tab: 'trade',
+      });
+    }
+  }
+  const g = s.gov, spend = sumExp(g.last);
+  if (g.policies.msp > 0 && spend > 0 && g.last.exp.procurement > spend * 0.12) {
+    out.push({ sev: 1, text: `Grain purchases took ${Math.round((g.last.exp.procurement / spend) * 100)}% of spending last month`, hint: 'The support price beats what markets pay, so farmers sell to the state. Surplus stock is sold abroad at a loss.', tab: 'policies' });
+  }
+  return out;
+}
+
+function visitorAlerts(sim: Sim): Alert[] {
+  const s = sim.s, out: Alert[] = [];
+  const st = s.stats.months[s.stats.months.length - 1];
+  if (st) {
+    const overnight = st.tourists - s.tourism.last.dayTrips;
+    if (st.turnedAway > 60 && overnight > 0 && st.turnedAway / overnight > 0.15) {
+      out.push({ sev: 1, text: `Hotels turned away ${Math.round(st.turnedAway).toLocaleString('en-US')} visitors last month`, hint: 'Hotel investors build on commercial land when rooms are full; visitors who find no room tell others.', tab: 'tourism' });
+    }
+    if (st.leisure < 0.3 && s.citizens.length > 500) out.push({ sev: 1, text: 'Residents have few places to go out', hint: 'Cinemas open on commercial land where there is demand; museums, a stadium and parks are built by the city.', tab: 'tourism' });
+  }
+  let empty: { dest: string; load: number } | null = null;
+  for (const r of s.air.routes) {
+    if (r.lastSeats <= 0 || sim.day - r.since < 90) continue;
+    const load = r.lastPax / r.lastSeats;
+    if (load < 0.4 && (!empty || load < empty.load)) empty = { dest: r.dest, load };
+  }
+  if (empty) out.push({ sev: 1, text: `Flights to ${empty.dest} were only ${Math.round(empty.load * 100)}% full last month`, hint: 'Airlines cut flights that stay empty. Promotion, attractions and hotel rooms bring more passengers.', tab: 'tourism' });
+  let worst: Building | null = null;
+  for (const b of s.buildings) if (b.kind === 'heritage' && b.condition < 0.45 && (!worst || b.condition < worst.condition)) worst = b;
+  if (worst) out.push({ sev: 1, text: `${worst.name || 'A heritage site'} is falling into disrepair (${Math.round(worst.condition * 100)}%)`, hint: 'Funding culture at full service or above conserves heritage sites; visitors notice their state.', ref: { k: 'building', id: worst.id }, tab: 'budget' });
+  return out;
 }

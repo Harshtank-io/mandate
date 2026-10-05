@@ -27,6 +27,12 @@ export function businessName(sim: Sim, kind: BusinessKind, ownerLast?: string): 
     case 'hospital': return `${town} District Hospital`;
     case 'police': return `${town} Police Station ${1 + sim.s.businesses.filter((b) => b.kind === 'police').length}`;
     case 'townhall': return `${town} Town Hall`;
+    case 'museum': {
+      const n = sim.s.businesses.filter((b) => b.kind === 'museum').length;
+      return n === 0 ? `${town} Museum` : `${town} ${['Art Gallery', 'Science Centre', 'Museum of the Region'][(n - 1) % 3]}`;
+    }
+    case 'stadium': return sim.s.businesses.some((b) => b.kind === 'stadium') ? `${town} Sports Ground` : `${town} Stadium`;
+    case 'airport': return `${town} Airport`;
     default: break;
   }
   const words = p.words[kind] ?? ['Enterprises'];

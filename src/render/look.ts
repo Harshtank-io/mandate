@@ -14,6 +14,8 @@ export interface Look {
   roofH: number;
   floors: number; // window rows
   extra?: 'chimney' | 'silos' | 'tower' | 'sign' | 'marquee' | 'stands' | 'columns' | 'fort' | 'runway';
+  /** The footprint was turned a quarter (it is deeper than it is wide): the usual look, rotated. */
+  turned?: boolean;
 }
 
 const pick = (arr: number[], r: number) => arr[Math.min(arr.length - 1, Math.floor(r * arr.length))];
@@ -24,6 +26,8 @@ const APT_WALLS = [0xd9d4c7, 0xc8c2b5, 0xe3dccb, 0xbfc6cc, 0xd8c6a8, 0xcfd6d2];
 const OFFICE_WALLS = [0x9fb3c4, 0x8aa0b4, 0xb4c2cc, 0x7f95a8];
 
 export function lookFor(kind: BuildingKind, w: number, h: number, floors: number, style: number): Look {
+  // every building type is designed wider than deep; a footprint placed the other way round is the same building turned
+  if (h > w) { const L = lookFor(kind, h, w, floors, style); return { ...L, w: L.d, d: L.w, turned: true }; }
   const r = hash01(style, 1), r2 = hash01(style, 2);
   const f = Math.max(1, floors);
   switch (kind) {
@@ -51,10 +55,11 @@ export function lookFor(kind: BuildingKind, w: number, h: number, floors: number
     case 'park': return { w: 0, d: 0, h: 0, wall: 0x5e9a48, roof: 'flat', roofColor: 0x5e9a48, roofH: 0, floors: 0 };
     case 'hotel': return { w: 0.7, d: 0.64, h: FLOOR * 1.1 * f, wall: pick([0xf2ece0, 0xe9d8c0, 0xd9e2ea, 0xf0dcc8], r), roof: 'flat', roofColor: 0x7d6a58, roofH: 0.04, floors: f, extra: 'sign' };
     case 'cinema': return { w: 0.86, d: 0.78, h: 0.36, wall: pick([0x7a3b4a, 0x5b4a78, 0x8a4a3a], r), roof: 'flat', roofColor: 0x3d3540, roofH: 0.04, floors: 1, extra: 'marquee' };
-    case 'stadium': return { w: w - 0.2, d: h - 0.2, h: 0.2, wall: 0xc9c4ba, roof: 'flat', roofColor: 0x4f9a48, roofH: 0.015, floors: 1, extra: 'stands' };
-    case 'museum': return { w: w - 0.4, d: h - 0.45, h: FLOOR * 2.3, wall: 0xe8e0cc, roof: 'gable', roofColor: 0xb8ae98, roofH: 0.14, floors: 2, extra: 'columns' };
+    case 'stadium': return { w: w - 0.2, d: h - 0.2, h: 0.34, wall: 0xcfc9bd, roof: 'flat', roofColor: 0xe6e6e2, roofH: 0.03, floors: 2, extra: 'stands' };
+    case 'museum': return { w: w - 0.4, d: h - 0.62, h: FLOOR * 2.3, wall: 0xe8e0cc, roof: 'gable', roofColor: 0x8d8371, roofH: 0.16, floors: 2, extra: 'columns' };
     case 'heritage': return { w: w - 0.5, d: h - 0.5, h: 0.3, wall: pick([0xb8a07a, 0xa89272, 0xc2ab86], r), roof: 'flat', roofColor: 0x9a845f, roofH: 0.03, floors: 1, extra: 'fort' };
-    case 'airport': return { w: Math.max(w, h) > 8 ? 2.4 : w - 0.3, d: 1.1, h: 0.3, wall: 0xdfe6ea, roof: 'flat', roofColor: 0x9aa6ae, roofH: 0.04, floors: 1, extra: 'runway' };
+    // the look is the terminal; the view lays out the runway, taxiway, apron and tower around it
+    case 'airport': return { w: Math.min(4.2, w - 0.3), d: 0.72, h: 0.32, wall: 0xdfe6ea, roof: 'flat', roofColor: 0x9aa6ae, roofH: 0.035, floors: 2, extra: 'runway' };
   }
 }
 

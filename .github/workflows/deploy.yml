@@ -1,0 +1,57 @@
+# Builds the game and publishes it on GitHub Pages at https://<owner>.github.io/<repository>/.
+#
+# One-time setup in the repository on GitHub:
+#   1. Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
+#   2. Settings -> Secrets and variables -> Actions -> Variables: add VITE_SUPABASE_URL and
+#      VITE_SUPABASE_PUBLISHABLE_KEY (both are public values; leave them out for an offline-only build) and,
+#      optionally, VITE_AUTH_PROVIDERS. Never add a secret key (sb_secret_...).
+#   3. In Supabase -> Authentication -> URL Configuration, add the Pages address (with the trailing slash) to the
+#      redirect URLs so sign-in links can return to the game.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npx tsc --noEmit -p tsconfig.json
+      # project pages live under /<repository>/, so assets are built for that path
+      - run: npx vite build --base "/${{ github.event.repository.name }}/"
+        env:
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY }}
+          VITE_AUTH_PROVIDERS: ${{ vars.VITE_AUTH_PROVIDERS }}
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

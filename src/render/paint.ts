@@ -35,6 +35,8 @@ const GARDEN: RGB = [110, 148, 78];
 const PARK: RGB = [84, 148, 70];
 const SIDEWALK: RGB = [166, 164, 156];
 const SITE: RGB = [140, 118, 86];
+const AIRFIELD: RGB = [126, 142, 86];
+const GROUNDS: RGB = [142, 150, 112];
 
 function farmLook(sim: Sim, fid: number): { c: RGB; rows: boolean } {
   const f = sim.biz(fid)?.farm;
@@ -69,6 +71,9 @@ function tileLook(sim: Sim, t: number): { c: RGB; rows: boolean } {
     const b = sim.bld(o);
     if (b) {
       if (b.kind === 'park') return { c: PARK, rows: false };
+      // the runway, taxiway and apron are drawn on top of mown grass; monuments stand in kept grounds
+      if (b.kind === 'airport') return { c: AIRFIELD, rows: false };
+      if (b.kind === 'heritage') return { c: GROUNDS, rows: false };
       switch (BUILDINGS[b.kind].category) {
         case 'residential': return { c: GARDEN, rows: false };
         case 'industrial': return { c: CONCRETE, rows: false };

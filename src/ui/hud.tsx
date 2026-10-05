@@ -14,7 +14,7 @@ import { activeSync } from '../net/sync';
 import { CloudBadge } from './account';
 import { formatDate } from '../sim/calendar';
 import { Terrain, Zone, type BuildingKind } from '../sim/types';
-import { Budget, Milestones, News, Overview, PoliciesPanel, Projects, Saves, Taxes, type Ctx, type Tab } from './panels';
+import { Budget, Milestones, News, Overview, PoliciesPanel, Projects, Saves, Taxes, TourismPanel, TradePanel, type Ctx, type Tab } from './panels';
 import { CardView, dateTime, Modal, money, num, pct, realSpan, Rows, useTick } from './util';
 
 /** Event hub the 3D view calls into; the HUD installs the handlers. */
@@ -26,7 +26,7 @@ export interface Bus {
 }
 
 type Proposal =
-  | { k: 'build'; kind: BuildingKind; x: number; y: number }
+  | { k: 'build'; kind: BuildingKind; x: number; y: number; rot: boolean }
   | { k: 'road'; tool: RoadTool; tiles: number[] }
   | { k: 'zone'; zone: number; tiles: number[] };
 
@@ -47,7 +47,8 @@ interface HudProps {
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'overview', label: 'Overview' }, { id: 'budget', label: 'Budget' }, { id: 'taxes', label: 'Taxes' }, { id: 'policies', label: 'Laws' },
-  { id: 'projects', label: 'Projects' }, { id: 'news', label: 'News' }, { id: 'milestones', label: 'Milestones' }, { id: 'saves', label: 'World' },
+  { id: 'trade', label: 'Trade' }, { id: 'tourism', label: 'Tourism' }, { id: 'projects', label: 'Projects' }, { id: 'news', label: 'News' },
+  { id: 'milestones', label: 'Milestones' }, { id: 'saves', label: 'World' },
 ];
 
 const OVERLAYS: { id: Overlay; label: string; legend?: string }[] = [
@@ -70,6 +71,9 @@ const ROAD_HINT: Record<RoadTool, string> = {
   canal: 'Drag across open land or fields to dig an irrigation canal.',
 };
 const ZONES = [Zone.Residential, Zone.Commercial, Zone.Industrial, Zone.Agricultural];
+/** Facilities that are not square can be placed either way round. */
+const turnable = (k: BuildingKind) => BUILDINGS[k].w !== BUILDINGS[k].h;
+const footprint = (k: BuildingKind, rot?: boolean) => (rot ? `${BUILDINGS[k].h}×${BUILDINGS[k].w}` : `${BUILDINGS[k].w}×${BUILDINGS[k].h}`);
 
 function vehicleCard(sim: Sim, sel: Selection, following: boolean): Card | null {
   if (!('vehicle' in sel)) return null;
@@ -128,6 +132,16 @@ export function Hud(p: HudProps) {
     setMenu(null);
     if (t.mode === 'build') setFloors(BUILDINGS[t.kind].floors[0]);
   };
+  /** A quarter turn for facilities that are not square (the airport above all), before or after picking a spot. */
+  const turn = () => {
+    const t = toolRef.current;
+    if (t.mode !== 'build' || !turnable(t.kind)) return;
+    const next: Tool = { ...t, rot: !t.rot };
+    toolRef.current = next;
+    setToolState(next);
+    view?.turn(!!next.rot);
+    setProposal((pr) => (pr && pr.k === 'build' ? { ...pr, rot: !!next.rot } : pr));
+  };
   const setOverlay = (o: Overlay) => { setOverlayState(o); view?.setOverlay(o); setMenu(null); };
   const openRef = (ref: Ref) => {
     const card = inspect(sim, ref);
@@ -140,7 +154,7 @@ export function Hud(p: HudProps) {
 
   useEffect(() => {
     p.bus.select = (x) => setSel(x);
-    p.bus.place = (x, y) => { const t = toolRef.current; if (t.mode === 'build') setProposal({ k: 'build', kind: t.kind, x, y }); };
+    p.bus.place = (x, y) => { const t = toolRef.current; if (t.mode === 'build') setProposal({ k: 'build', kind: t.kind, x, y, rot: !!t.rot }); };
     p.bus.route = (tiles) => { const t = toolRef.current; if (t.mode === 'road') setProposal({ k: 'road', tool: t.kind, tiles }); };
     p.bus.zone = (tiles) => { const t = toolRef.current; if (t.mode === 'zone') setProposal({ k: 'zone', zone: t.zone, tiles }); };
   }, [p.bus]);
@@ -151,6 +165,7 @@ export function Hud(p: HudProps) {
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
       if (e.key === ' ') { e.preventDefault(); setSpeed(game.speed > 0 ? 0 : lastSpeed.current); }
       else if (/^[1-5]$/.test(e.key)) setSpeed(SPEEDS[Number(e.key)]);
+      else if ((e.key === 't' || e.key === 'T') && toolRef.current.mode === 'build') turn();
       else if (e.key === 'Escape') {
         if (p.report || p.briefing) return;
         if (proposal) { setProposal(null); view?.clearPending(); }
@@ -164,7 +179,8 @@ export function Hud(p: HudProps) {
   });
 
   const ctx: Ctx = {
-    game, sim, select: setSel, openRef, toast, setTab: (t) => setTab(t), menu: p.onMenu, loadSave: p.onLoad, exportWorld: p.onExport, importWorld: p.onImport,
+    game, sim, select: setSel, openRef, toast, setTab: (t) => setTab(t), build: (kind) => setTool({ mode: 'build', kind }),
+    menu: p.onMenu, loadSave: p.onLoad, exportWorld: p.onExport, importWorld: p.onImport,
   };
   const preset = getPreset(s.meta.preset);
   const w = s.weather;
@@ -172,7 +188,7 @@ export function Hud(p: HudProps) {
   const st = s.stats.months[s.stats.months.length - 1];
   const urgent = alerts(sim).filter((a) => a.sev >= 2).length;
   const latest = s.news[s.news.length - 1];
-  const hint = tool.mode === 'build' ? `Click a spot next to a road to place a ${BUILDINGS[tool.kind].label.toLowerCase()} (${BUILDINGS[tool.kind].w}×${BUILDINGS[tool.kind].h} tiles). Esc to stop.`
+  const hint = tool.mode === 'build' ? `Click a spot next to a road to place a ${BUILDINGS[tool.kind].label.toLowerCase()} (${footprint(tool.kind, tool.rot)} tiles).${turnable(tool.kind) ? ' T turns it.' : ''} Esc to stop.`
     : tool.mode === 'road' ? `${ROAD_HINT[tool.kind]} Esc to stop.`
       : tool.mode === 'zone' ? `Drag to rezone land as ${ZONE_LABELS[tool.zone].toLowerCase()}. Esc to stop.` : '';
   const legend = OVERLAYS.find((o) => o.id === overlay)?.legend;
@@ -183,6 +199,8 @@ export function Hud(p: HudProps) {
       case 'budget': return <Budget ctx={ctx} />;
       case 'taxes': return <Taxes ctx={ctx} />;
       case 'policies': return <PoliciesPanel ctx={ctx} />;
+      case 'trade': return <TradePanel ctx={ctx} />;
+      case 'tourism': return <TourismPanel ctx={ctx} />;
       case 'projects': return <Projects ctx={ctx} />;
       case 'news': return <News ctx={ctx} />;
       case 'milestones': return <Milestones ctx={ctx} />;
@@ -245,7 +263,8 @@ export function Hud(p: HudProps) {
             </button>
           ))}
         </nav>
-        {tab && <div class="tab-panel" role="tabpanel" aria-label={TABS.find((t) => t.id === tab)?.label}>{panel()}</div>}
+        {/* keyed by tab so each tab opens scrolled to its top */}
+        {tab && <div class="tab-panel" key={tab} role="tabpanel" aria-label={TABS.find((t) => t.id === tab)?.label}>{panel()}</div>}
       </aside>
 
       {sel && (
@@ -262,10 +281,10 @@ export function Hud(p: HudProps) {
       )}
 
       {proposal && (
-        <ProposalPanel sim={sim} proposal={proposal} floors={floors} setFloors={setFloors}
+        <ProposalPanel sim={sim} proposal={proposal} floors={floors} setFloors={setFloors} onTurn={turn}
           onApprove={() => {
             let r;
-            if (proposal.k === 'build') r = proposeBuilding(sim, proposal.kind, proposal.x, proposal.y, floors);
+            if (proposal.k === 'build') r = proposeBuilding(sim, proposal.kind, proposal.x, proposal.y, floors, proposal.rot);
             else if (proposal.k === 'road') r = proposeRoad(sim, proposal.tool, proposal.tiles);
             else r = rezone(sim, proposal.tiles, proposal.zone);
             toast(r.ok ? r.message : r.error, r.ok ? 'good' : 'bad');
@@ -277,9 +296,11 @@ export function Hud(p: HudProps) {
       )}
 
       <div class="bottom-left">
-        {(hint || legend) && (
+        {/* the proposal panel takes over while it is open; the hint would cover its buttons */}
+        {(hint || legend) && !proposal && (
           <div class="hint panel small" role="status">
             {hint && <p>{hint}</p>}
+            {tool.mode === 'build' && turnable(tool.kind) && <button class="small" onClick={turn}>Turn a quarter (T)</button>}
             {legend && <p>{legend}</p>}
             {overlay === 'none' && tool.mode === 'inspect' && view && view.carScale > 1.5 && <p class="muted">Each moving car stands for about {Math.round(view.carScale)} commuters.</p>}
           </div>
@@ -340,8 +361,8 @@ export function Hud(p: HudProps) {
   );
 }
 
-function ProposalPanel({ sim, proposal, floors, setFloors, onApprove, onCancel }: {
-  sim: Sim; proposal: Proposal; floors?: number; setFloors(f: number): void; onApprove(): void; onCancel(): void;
+function ProposalPanel({ sim, proposal, floors, setFloors, onTurn, onApprove, onCancel }: {
+  sim: Sim; proposal: Proposal; floors?: number; setFloors(f: number): void; onTurn(): void; onApprove(): void; onCancel(): void;
 }) {
   if (proposal.k === 'zone') {
     const m = sim.s.map;
@@ -360,7 +381,7 @@ function ProposalPanel({ sim, proposal, floors, setFloors, onApprove, onCancel }
       </section>
     );
   }
-  const pv: Preview = proposal.k === 'build' ? previewBuilding(sim, proposal.kind, proposal.x, proposal.y, floors) : previewRoad(sim, proposal.tool, proposal.tiles);
+  const pv: Preview = proposal.k === 'build' ? previewBuilding(sim, proposal.kind, proposal.x, proposal.y, floors, proposal.rot) : previewRoad(sim, proposal.tool, proposal.tiles);
   const spec = proposal.k === 'build' ? BUILDINGS[proposal.kind] : null;
   const months = pv.est ? Math.max(1, Math.round(pv.est.days / 30.4)) : 0;
   return (
@@ -382,6 +403,7 @@ function ProposalPanel({ sim, proposal, floors, setFloors, onApprove, onCancel }
       {pv.warnings.length > 0 && <ul class="lines muted">{pv.warnings.map((x) => <li key={x}>{x}</li>)}</ul>}
       <div class="buttons sticky-actions">
         <button class="primary" disabled={!pv.ok} onClick={onApprove}>Approve project</button>
+        {proposal.k === 'build' && turnable(proposal.kind) && <button onClick={onTurn}>Turn ({pv.w}×{pv.h})</button>}
         <button class="ghost" onClick={onCancel}>Cancel</button>
         {!pv.ok && <span class="small bad">{pv.errors[0]}</span>}
       </div>

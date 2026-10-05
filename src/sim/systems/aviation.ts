@@ -56,13 +56,16 @@ export function projectedPassengers(sim: Sim): number {
   return Math.round(residents + business + (dom + forn) * 30 * 2);
 }
 
-/** Seats into the city today not taken by residents and business travellers (used by the visitor model). */
+/**
+ * Seats into the city today not taken by residents and business travellers (used by the visitor model). Every trip
+ * out by a resident is a seat back in later, so on average a day's outbound trips also fill that many inbound seats.
+ */
 export function seatsForVisitors(sim: Sim): number {
   const s = sim.s;
   if (!s.air.routes.length) return 0;
   let seats = 0;
   for (const r of s.air.routes) seats += flightsOn(r, sim.day) * SEATS_PER_FLIGHT;
-  return Math.max(0, seats - (s.air.resTrips + s.air.bizTrips) / 30 / 2);
+  return Math.max(0, seats - (s.air.resTrips + s.air.bizTrips) / 30);
 }
 
 /** Visitors flying in today (and out again later): fees and passenger counts. */
