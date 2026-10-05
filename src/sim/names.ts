@@ -33,6 +33,16 @@ export function businessName(sim: Sim, kind: BusinessKind, ownerLast?: string): 
     }
     case 'stadium': return sim.s.businesses.some((b) => b.kind === 'stadium') ? `${town} Sports Ground` : `${town} Stadium`;
     case 'airport': return `${town} Airport`;
+    case 'firestation': return `${town} Fire Station ${1 + sim.s.businesses.filter((b) => b.kind === 'firestation').length}`;
+    case 'waterworks': {
+      const n = sim.s.businesses.filter((b) => b.kind === 'waterworks').length;
+      return n === 0 ? `${town} Waterworks` : `${town} Waterworks No. ${n + 1}`;
+    }
+    case 'gasplant': case 'solarfarm': case 'windfarm': {
+      const n = sim.s.businesses.filter((b) => b.kind === kind).length;
+      const label = { gasplant: 'Gas Power Station', solarfarm: 'Solar Park', windfarm: 'Wind Farm' }[kind];
+      return `${town} ${label}${n ? ` ${n + 1}` : ''}`;
+    }
     default: break;
   }
   const words = p.words[kind] ?? ['Enterprises'];

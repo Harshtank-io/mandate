@@ -4,12 +4,14 @@
 
 import { dateOf, dayIndex, formatDay } from './calendar';
 import { idx, inMap, W, type Sim } from './core';
-import { BUILDINGS, BUSINESSES, ROADWORKS, ROLES } from './tables';
-import { cancelProject, createProject, estimate, fmtMoney, isRoadwork, localLabourers, minLocalCrew, OUTSIDE_PREMIUM, type Estimate } from './systems/construction';
+import { BUILDINGS, BUSINESSES, PLANTS, POWER_TARIFF, ROADWORKS, ROLES, SUBSTATION_MW, WATER_TARIFF, WATERWORKS_M3 } from './tables';
+import {
+  cancelProject, createProject, estimate, fmtMoney, footprintTiles, isRoadwork, localLabourers, minLocalCrew, OUTSIDE_PREMIUM, strandedBy, type Estimate,
+} from './systems/construction';
 import { DEPT_LABELS, POLICY_DELAY, POLICY_LABELS, TAX_LABELS } from './systems/government';
 import { projectedPassengers } from './systems/aviation';
 import { AIRPORT_COFUND, AIRPORT_MIN_DEMAND } from './tables';
-import { Terrain, Zone, type BuildingKind, type Dept, type Policies, type ProjectKind, type RoleId, type TaxSettings } from './types';
+import { RoadClass, Terrain, Zone, type BuildingKind, type Dept, type Policies, type ProjectKind, type RoleId, type TaxSettings } from './types';
 
 export type CommandResult = { ok: true; message: string; id?: number } | { ok: false; error: string };
 
@@ -34,6 +36,12 @@ export function describeValue(sim: Sim, key: string, v: number | boolean): strin
   if (NAMED[key]) return NAMED[key][v] ?? String(v);
   if (key === 'msp') return v > 0 ? `${Math.round(v * 100)}% of the normal world price` : 'Off';
   if (key === 'property') return `${(v * 100).toFixed(2)}% a year`;
+  if (key === 'power' || key === 'water') {
+    if (v <= 0) return 'Free';
+    const n = sim.scale * sim.s.ext.trend * v, sym = sim.preset.currency;
+    const f = (x: number) => (x < 10 ? x.toFixed(2) : x < 100 ? x.toFixed(1) : Math.round(x).toLocaleString('en-US'));
+    return key === 'power' ? `${sym}${f(POWER_TARIFF.home * n)}/kWh homes · ${sym}${f(POWER_TARIFF.business * n)} business` : `${sym}${f(WATER_TARIFF * n)} per m³`;
+  }
   return `${Math.round(v * 1000) / 10}%`;
 }
 
@@ -51,6 +59,7 @@ export function taxRange(sim: Sim, key: keyof TaxSettings): [number, number, num
     case 'fuel': return [0, 2, 0.05];
     case 'income': case 'corporate': case 'smallBusiness': return [0, 0.5, 0.01];
     case 'incomeTop': return [0, 0.6, 0.01];
+    case 'power': case 'water': return [0, 3, 0.05];
     default: return [0, 0.4, 0.01];
   }
 }
@@ -126,6 +135,12 @@ export function taxEffects(key: keyof TaxSettings, up: boolean): string[] {
       return [`Farm families keep ${up ? 'less' : 'more'} of each season's profit`];
     case 'licenseFee':
       return [`Opening a business costs ${more}`];
+    case 'power':
+      return [`Every household's electricity bill ${up ? 'rises' : 'falls'}: families have ${up ? 'less' : 'more'} left for shopping`,
+        `Factories, offices, shops and restaurants pay twice the household rate, so their costs ${up ? 'rise' : 'fall'} too`,
+        'The city still pays the regional grid and gas suppliers the same for every kWh'];
+    case 'water':
+      return [`Water bills ${up ? 'rise' : 'fall'} for homes, hotels and businesses on the mains`, 'Bills pay for the waterworks; families without mains water buy from wells and tankers instead'];
     default: return [];
   }
 }
@@ -194,7 +209,23 @@ export function setFunding(sim: Sim, dept: Dept, level: number): CommandResult {
 
 // ------------------------------------------------------------------------------------------------ development
 
-export const GOV_BUILDINGS: BuildingKind[] = ['school', 'clinic', 'hospital', 'police', 'college', 'affordable', 'park', 'museum', 'stadium', 'airport', 'townhall'];
+export const GOV_BUILDINGS: BuildingKind[] = [
+  'school', 'clinic', 'hospital', 'police', 'firestation', 'college', 'affordable', 'park', 'museum', 'stadium', 'airport', 'townhall',
+  'waterworks', 'substation', 'gasplant', 'solarfarm', 'windfarm',
+];
+/** Monthly running costs of facilities besides their staff, base (matches the department's operating needs). */
+const UPKEEP: Partial<Record<BuildingKind, number>> = { park: 10_000, firestation: 60_000, waterworks: 90_000, gasplant: 120_000, solarfarm: 30_000, windfarm: 30_000, substation: 50_000 };
+
+/** Whether a site lies within `r` tiles of the river or a canal (waterworks draw from them). */
+export function nearWater(sim: Sim, x: number, y: number, w: number, h: number, r: number): boolean {
+  const m = sim.s.map;
+  for (let yy = y - r; yy < y + h + r; yy++) for (let xx = x - r; xx < x + w + r; xx++) {
+    if (!inMap(xx, yy)) continue;
+    const t = m.terrain[idx(xx, yy)];
+    if (t === Terrain.Water || t === Terrain.Canal) return true;
+  }
+  return false;
+}
 export type RoadTool = 'road' | 'avenue' | 'upgrade' | 'canal';
 
 export interface Preview {
@@ -286,11 +317,12 @@ export function previewBuilding(sim: Sim, kind: BuildingKind, x: number, y: numb
   }
   if (!access) errors.push('Needs road access: place it next to a street.');
   if (kind === 'townhall' && sim.s.businesses.some((b) => b.kind === 'townhall')) errors.push('The city already has a town hall.');
+  if (kind === 'waterworks' && !nearWater(sim, x, y, w, h, 4)) errors.push('A waterworks draws from the river or a canal: place it within 160 m of one.');
   const est = estimate(sim, kind, tiles, f, true);
   base.est = est;
   const n = sim.scale * sim.s.ext.trend;
   const staff = staffNeed(sim, kind);
-  base.monthly = staff.reduce((a, s) => a + sim.roleWage(s.role) * s.n * 1.2, 0) + (kind === 'park' ? 10_000 * n : 0) + est.cost * BUILDINGS[kind].maintenance * 0.2;
+  base.monthly = staff.reduce((a, s) => a + sim.roleWage(s.role) * s.n * 1.2, 0) + (UPKEEP[kind] ?? 0) * n + est.cost * BUILDINGS[kind].maintenance * 0.2;
   // requirements
   requirements.push(`Budget: ${fmtMoney(sim, est.cost)}${est.equipment > 0 ? ` including ${fmtMoney(sim, est.equipment)} of equipment` : ''}`);
   if (est.landCost > 0) requirements.push(`Land: ${fmtMoney(sim, est.landCost)} to acquire${est.farmsAffected ? ` fields from ${est.farmsAffected} farm${est.farmsAffected > 1 ? 's' : ''}` : ''}${est.displaced ? `, relocating ${est.displaced} household${est.displaced > 1 ? 's' : ''}` : ''}`);
@@ -323,6 +355,27 @@ export function previewBuilding(sim: Sim, kind: BuildingKind, x: number, y: numb
       risks.push('Aircraft noise lowers the quality of life of anyone living close to the runway', 'Local streets across the site will be closed');
       break;
     }
+    case 'firestation': benefits.push(`Fire cover for about ${served?.toLocaleString()} residents nearby: crews reach fires before they spread`, 'Fewer homes and businesses are lost to fire; it needs mains water to fight fires well'); break;
+    case 'waterworks':
+      benefits.push(`${WATERWORKS_M3.toLocaleString()} m³ of treated water a day, enough for about ${(Math.round(WATERWORKS_M3 / 0.13 / 1000) * 1000).toLocaleString()} residents, through mains along the roads it connects to`,
+        'Families on the mains stop paying for wells and tankers and fall ill less often; water bills go to the city');
+      risks.push('Pumps need electricity: during blackouts it supplies less water');
+      break;
+    case 'substation': benefits.push(`Raises what the town can draw from the regional grid by ${SUBSTATION_MW} MW`, 'Only areas whose roads connect to the regional highway are on the grid');
+      risks.push('When the regional grid fails, every area without a plant of its own goes dark');
+      break;
+    case 'gasplant': case 'solarfarm': case 'windfarm': {
+      const pl = PLANTS[kind]!;
+      if (kind === 'gasplant') {
+        benefits.push(`${pl.mw} MW that runs whenever it is needed, also when the regional grid fails`, 'Powers every building whose roads connect to it');
+        warnings.push('Gas costs more per kWh than buying from the regional grid: the plant runs when the grid cannot cover demand');
+        risks.push('Air pollution and CO₂ around the plant');
+      } else {
+        benefits.push(`${pl.mw} MW of ${kind === 'solarfarm' ? 'panels' : 'turbines'}: free electricity, about ${Math.round(pl.cf * 100)}% of capacity on average`, 'No fuel, no emissions; cuts what the city buys from the grid');
+        risks.push(`Only ${Math.round(pl.peak * 100)}% of its capacity can be counted on at the evening peak${kind === 'solarfarm' ? ', when the sun has set' : ', when the wind may drop'}`);
+      }
+      break;
+    }
   }
   if (jobs) benefits.push(`${jobs} public jobs once staffed`);
   benefits.push(outside ? 'Day labour on the site for local residents' : `Construction work for local contractors (${fmtMoney(sim, (est.labor / 0.9) * (sim.roleWage('laborer') / 26) * 1.35)} in wages)`);
@@ -343,7 +396,7 @@ export function previewBuilding(sim: Sim, kind: BuildingKind, x: number, y: numb
 
 function deptOf(kind: BuildingKind): string {
   const biz = BUILDINGS[kind].biz;
-  const d = biz ? BUSINESSES[biz as keyof typeof BUSINESSES].dept : kind === 'park' ? 'environment' : undefined;
+  const d = biz ? BUSINESSES[biz as keyof typeof BUSINESSES].dept : kind === 'park' ? 'environment' : kind === 'substation' ? 'utilities' : undefined;
   return d ? DEPT_LABELS[d].toLowerCase() : 'city';
 }
 
@@ -438,6 +491,111 @@ export function proposeRoad(sim: Sim, tool: RoadTool, route: number[]): CommandR
   const name = `${pv.label} (${(pv.tiles.length * 40).toLocaleString()} m)`;
   const p = createProject(sim, { kind: tool, x: pv.x, y: pv.y, w: 1, h: 1, tiles: pv.tiles, gov: true, sponsor: -1, name, reason: 'Commissioned by the government' });
   return ok(`${name} proposed. Expected completion in about ${Math.max(1, Math.round(pv.est!.days / 30.4))} months.`, p.id);
+}
+
+// ------------------------------------------------------------------------------------------------ bulldozer
+
+/** Whether the road network stays in one piece around `cut`: every road next to it still reaches the others. */
+function staysConnected(sim: Sim, cut: Set<number>): boolean {
+  const m = sim.s.map;
+  const ends: number[] = [];
+  for (const t of cut) {
+    const x = t % W, y = (t / W) | 0;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      if (!inMap(x + dx, y + dy)) continue;
+      const j = idx(x + dx, y + dy);
+      if (m.road[j] && !cut.has(j)) ends.push(j);
+    }
+  }
+  if (ends.length <= 1) return true;
+  const want = new Set(ends);
+  const seen = new Set<number>([ends[0]]);
+  const q = [ends[0]];
+  let found = 1;
+  while (q.length && found < want.size) {
+    const t = q.pop()!;
+    const x = t % W, y = (t / W) | 0;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      if (!inMap(x + dx, y + dy)) continue;
+      const j = idx(x + dx, y + dy);
+      if (!m.road[j] || cut.has(j) || seen.has(j)) continue;
+      seen.add(j);
+      if (want.has(j)) found++;
+      q.push(j);
+    }
+  }
+  return found >= want.size;
+}
+
+/**
+ * Demolition: a building (the tile clicked) or a stretch of road (the tiles dragged across). Private property is
+ * bought at its value plus a premium before contractors pull it down; public facilities close when the work ends.
+ */
+export function previewDemolish(sim: Sim, tiles: number[]): Preview {
+  const m = sim.s.map;
+  const errors: string[] = [], warnings: string[] = [], requirements: string[] = [], benefits: string[] = [], risks: string[] = [];
+  const first = tiles.length ? m.owner[tiles[0]] : -1;
+  const target = first >= 0 ? sim.bld(first) : undefined;
+  let site: number[];
+  let highway = 0;
+  if (target) site = footprintTiles(target.x, target.y, target.w, target.h);
+  else {
+    site = [];
+    for (const t of new Set(tiles)) {
+      if (!m.road[t]) continue;
+      if (m.road[t] === RoadClass.Highway) { highway++; continue; }
+      site.push(t);
+    }
+  }
+  const xs = site.map((t) => t % W), ys = site.map((t) => (t / W) | 0);
+  const x = site.length ? Math.min(...xs) : 0, y = site.length ? Math.min(...ys) : 0;
+  const w = site.length ? Math.max(...xs) - x + 1 : 1, h = site.length ? Math.max(...ys) - y + 1 : 1;
+  const label = target ? `Demolition of ${target.name || `a ${BUILDINGS[target.kind].label.toLowerCase()}`}` : `Removal of ${site.length * 40} m of road`;
+  const base: Preview = { ok: false, errors, warnings, kind: 'demolish', label, tiles: site, x, y, w, h, floors: 1, est: null, monthly: 0, requirements, benefits, risks };
+  if (!site.length) {
+    errors.push(highway ? 'The regional highway belongs to the state: the city cannot remove it.' : 'Nothing to demolish here: click a building, or drag along a road.');
+    return base;
+  }
+  if (target?.kind === 'heritage') errors.push('Heritage sites are protected and cannot be demolished.');
+  if (site.some((t) => m.project[t] >= 0)) errors.push('Part of this is already a building site or another project.');
+  const roads = site.filter((t) => m.road[t] > 0);
+  const stranded = strandedBy(sim, roads, new Set(target ? [target.id] : []));
+  if (stranded.length) errors.push(`${stranded.slice(0, 2).map((b) => b.name || `A ${BUILDINGS[b.kind].label.toLowerCase()}`).join(' and ')}${stranded.length > 2 ? ` and ${stranded.length - 2} more` : ''} would lose ${stranded.length > 1 ? 'their' : 'its'} only road access.`);
+  if (errors.length) return base;
+  const est = estimate(sim, 'demolish', site, 1, true);
+  base.est = est;
+  requirements.push(`Budget: ${fmtMoney(sim, est.cost)}`);
+  if (est.landCost > 0) requirements.push(`Property: ${fmtMoney(sim, est.landCost)} to buy it from its owners${est.displaced ? `, relocating ${est.displaced} household${est.displaced > 1 ? 's' : ''}` : ''}`);
+  requirements.push(`Work: ${Math.round(est.labor)} worker-days (crews of up to ${est.crew}); nothing is built, so no materials`);
+  if (localLabourers(sim) < minLocalCrew(sim)) warnings.push(OUTSIDE_NOTE);
+  if (target) {
+    const biz = target.biz >= 0 ? sim.biz(target.biz) : undefined;
+    const jobs = biz ? biz.jobs.filter((j) => j.worker >= 0).length : 0;
+    benefits.push('The plot is cleared: it can be zoned, built on or used for a public facility');
+    if (biz && !biz.pub) risks.push(`${biz.name} closes${jobs ? `: ${jobs} jobs lost` : ''}`);
+    if (biz && biz.pub) risks.push(`${biz.name} closes when the work is done${jobs ? `: ${jobs} public employees lose their posts` : ''}, and its service stops`);
+    if (target.occupants.length) risks.push(`${target.occupants.length} household${target.occupants.length > 1 ? 's' : ''} must find somewhere else to live`);
+    if (target.kind === 'townhall') risks.push('Without a town hall, approvals slow down and tax collection suffers');
+    if (target.kind === 'substation') risks.push('The town can draw less from the regional grid');
+    if (PLANTS[target.kind] || target.kind === 'waterworks') risks.push('Its supply is lost: check that what is left covers demand');
+  } else {
+    benefits.push('The land under the road can be zoned and built on again');
+    if (!staysConnected(sim, new Set(roads))) risks.push('This cuts the road network in two: places beyond lose their road link, and with it power lines and water mains, to the rest of town');
+    if (roads.some((t) => m.terrain[t] === Terrain.Water)) risks.push('Includes a bridge: traffic must cross the river elsewhere');
+    if (highway) warnings.push(`${highway} tile${highway > 1 ? 's' : ''} of the regional highway are left as they are.`);
+  }
+  if (target && target.ownerT !== 0 && est.landCost > 0) risks.push('Owners and tenants resent compulsory purchase');
+  warnings.push('Cannot be undone once the work is done.');
+  if (sim.s.gov.cash < est.cost * 0.1) warnings.push('The treasury is low: the work will wait for funds after approval.');
+  base.ok = true;
+  return base;
+}
+
+export function proposeDemolish(sim: Sim, tiles: number[]): CommandResult {
+  const pv = previewDemolish(sim, tiles);
+  if (!pv.ok) return fail(pv.errors.join(' '));
+  const p = createProject(sim, { kind: 'demolish', x: pv.x, y: pv.y, w: pv.w, h: pv.h, tiles: pv.tiles, gov: true, sponsor: -1, name: pv.label, reason: 'Ordered by the government' });
+  return ok(`${pv.label} ordered. Expected to be finished in about ${Math.max(1, Math.round(pv.est!.days / 30.4))} month${Math.round(pv.est!.days / 30.4) > 1 ? 's' : ''}.`, p.id);
 }
 
 export function cancel(sim: Sim, projectId: number): CommandResult {

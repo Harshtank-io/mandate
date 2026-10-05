@@ -21,7 +21,8 @@ export type Tool =
   | { mode: 'inspect' }
   | { mode: 'build'; kind: BuildingKind; floors?: number; rot?: boolean }
   | { mode: 'road'; kind: RoadTool }
-  | { mode: 'zone'; zone: number };
+  | { mode: 'zone'; zone: number }
+  | { mode: 'bulldoze' };
 
 export type Selection = { ref: Ref } | { vehicle: 'truck' | 'car'; id: number };
 
@@ -30,6 +31,8 @@ export interface ViewEvents {
   place(x: number, y: number): void;
   route(tiles: number[]): void;
   zone(tiles: number[]): void;
+  /** Bulldozer: a building clicked (its first tile) or road tiles dragged across. */
+  demolish(tiles: number[]): void;
 }
 
 export interface ViewOptions {
@@ -79,11 +82,16 @@ class Layer {
   }
 
   add(x: number, y: number, z: number, sx: number, sy: number, sz: number, rotY: number, color: number, a?: number[]): number {
+    this.q.setFromAxisAngle(UP, rotY);
+    return this.addQ(x, y, z, sx, sy, sz, this.q, color, a);
+  }
+
+  /** Like add, with any orientation (turbine blades). */
+  addQ(x: number, y: number, z: number, sx: number, sy: number, sz: number, q: THREE.Quaternion, color: number, a?: number[]): number {
     if (this.n >= this.cap) return -1;
     this.p.set(x, y, z);
     this.sc.set(sx, sy, sz);
-    this.q.setFromAxisAngle(UP, rotY);
-    this.m.compose(this.p, this.q, this.sc);
+    this.m.compose(this.p, q, this.sc);
     this.mesh.setMatrixAt(this.n, this.m);
     this.col.setHex(color);
     this.mesh.setColorAt(this.n, this.col);
@@ -279,6 +287,14 @@ export class WorldView {
   // landmarks, street lighting and aircraft
   private spires: Layer; private signs: Layer; private bldPools: Layer; private posts: Layer; private lampHeads: Layer; private lampPools: Layer;
   private planeBody: Layer; private planeTail: Layer;
+  // wind turbine rotors, fires
+  private blades: Layer; private flames: Layer; private smoke: Layer;
+  private turbines: { x: number; y: number; z: number; yaw: number; phase: number; on: boolean }[] = [];
+  private burning: { x: number; z: number; w: number; h: number; seed: number }[] = [];
+  private spin = 0; private spinMinute = -1;
+  private flameMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false });
+  private smokeMat = new THREE.MeshLambertMaterial({ color: 0xffffff, transparent: true, opacity: 0.42, depthWrite: false });
+  private qa = new THREE.Quaternion(); private qb = new THREE.Quaternion();
   /** Unlit material for lamps, signs and runway lights: dull by day, bright at night. */
   private glowMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
   private poolTex = glowTexture();
@@ -420,6 +436,9 @@ export class WorldView {
     this.lampPools = new Layer(this.scene, flat, this.poolMat, 1500, [], false, false, 2);
     this.planeBody = new Layer(this.scene, this.keepGeo(planeGeometry()), lambert(), 24, [], true, false);
     this.planeTail = new Layer(this.scene, this.keepGeo(new THREE.BoxGeometry(0.16, 0.16, 0.02).translate(-0.43, 0.21, 0)), lambert(), 24, [], true, false);
+    this.blades = new Layer(this.scene, box, lambert(), 60, [], true, false);
+    this.flames = new Layer(this.scene, cone, this.flameMat, 40, [], false, false, 3);
+    this.smoke = new Layer(this.scene, this.keepGeo(new THREE.IcosahedronGeometry(0.5, 1)), this.smokeMat, 60, [], false, false, 3);
     this.ghost = new THREE.Mesh(box, this.ghostMat);
     this.ghost.visible = false;
     this.ghost.renderOrder = 6;
@@ -451,7 +470,7 @@ export class WorldView {
 
   setTool(tool: Tool): void {
     this.tool = tool;
-    this.rig.toolDrag = tool.mode === 'road' || tool.mode === 'zone';
+    this.rig.toolDrag = tool.mode === 'road' || tool.mode === 'zone' || tool.mode === 'bulldoze';
     this.clearPending();
     this.hoverKey = '';
     this.canvas.style.cursor = tool.mode === 'inspect' ? 'default' : 'crosshair';
@@ -514,10 +533,12 @@ export class WorldView {
     this.canvas.removeEventListener('pointerleave', this.onLeave);
     this.rig.dispose();
     for (const l of [this.roads, this.walls, this.gables, this.flats, this.extras, this.trees, this.siteSolid, this.siteMark, this.cranes, this.trucks, this.cars, this.marks, this.preview,
-      this.spires, this.signs, this.bldPools, this.posts, this.lampHeads, this.lampPools, this.planeBody, this.planeTail]) l.dispose();
+      this.spires, this.signs, this.bldPools, this.posts, this.lampHeads, this.lampPools, this.planeBody, this.planeTail, this.blades, this.flames, this.smoke]) l.dispose();
     for (const g of this.geos) g.dispose();
     for (const m of this.mats) m.dispose();
     this.ghostMat.dispose();
+    this.flameMat.dispose();
+    this.smokeMat.dispose();
     this.glowMat.dispose();
     this.poolMat.dispose();
     this.poolTex.dispose();
@@ -550,6 +571,7 @@ export class WorldView {
     this.lighting(sim);
     this.vehicles(sim);
     this.planes(sim);
+    this.animate(sim, dt);
     this.tools(sim);
     this.renderer.render(this.scene, this.rig.camera);
   };
@@ -619,12 +641,14 @@ export class WorldView {
     this.roads.end();
   }
 
+  /** How brightly a building's windows glow at night: lived in or open for business, and with electricity. */
   private lit(sim: Sim, b: Building): number {
-    if (b.units > 0) return b.occupants.length > 0 ? 1 : 0;
+    const on = b.pw ?? 1;
+    if (b.units > 0) return b.occupants.length > 0 ? on : 0;
     const biz = b.biz >= 0 ? sim.biz(b.biz) : undefined;
     if (!biz || biz.status !== 'operating') return 0;
     const cat = BUILDINGS[b.kind].category;
-    return cat === 'industrial' ? 0.45 : 0.8;
+    return (cat === 'industrial' ? 0.45 : 0.8) * on;
   }
 
   private buildBuildings(sim: Sim): void {
@@ -639,12 +663,21 @@ export class WorldView {
     this.signs.begin(parts);
     this.bldPools.begin(parts);
     this.buildingIds.length = 0;
+    this.turbines.length = 0;
+    this.burning.length = 0;
     const heritage = sim.preset.tourism.heritageStyle;
     for (const b of bs) {
+      if (b.fire && b.fire > 0 && b.kind !== 'park') {
+        const L = buildingLook(b);
+        this.burning.push({ x: b.x + b.w / 2, z: b.y + b.h / 2, w: Math.max(0.4, Math.min(L.w, L.d)), h: Math.min(1.2, L.h + L.roofH * 0.5), seed: hash01(b.id, 9) * 10 });
+      }
       if (b.kind === 'park') continue;
       if (b.kind === 'airport') { this.airport(sim, b); continue; }
       if (b.kind === 'stadium') { this.stadium(sim, b); continue; }
       if (b.kind === 'heritage') { this.heritage(b, heritage); continue; }
+      if (b.kind === 'solarfarm') { this.solarFarm(sim, b); continue; }
+      if (b.kind === 'windfarm') { this.windFarm(sim, b); continue; }
+      if (b.kind === 'substation') { this.substation(sim, b); continue; }
       const L = buildingLook(b);
       const cx = b.x + b.w / 2, cz = b.y + b.h / 2;
       const small = b.kind === 'house' || b.kind === 'farmhouse' || b.kind === 'luxury';

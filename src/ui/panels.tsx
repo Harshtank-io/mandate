@@ -29,6 +29,8 @@ export type Tab = 'overview' | 'budget' | 'taxes' | 'policies' | 'trade' | 'tour
 export interface Ctx {
   game: Game;
   sim: Sim;
+  /** Visiting another player's town: settings are shown but cannot be changed. */
+  readOnly: boolean;
   select(sel: Selection | null): void;
   openRef(ref: Ref): void;
   toast(text: string, tone?: 'good' | 'bad'): void;
@@ -41,13 +43,18 @@ export interface Ctx {
   importWorld(): void;
 }
 
+/** Shown on the government panels while visiting. */
+function VisitorNote({ ctx }: { ctx: Ctx }) {
+  return ctx.readOnly ? <p class="pending">You are visiting: these are the mayor's settings, and only they can change them.</p> : null;
+}
+
 function monthLabels(sim: Sim, ms: MonthStats[]): string[] {
   return ms.map((m) => `${['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][m.month]} ${m.year}`);
 }
 
 // ------------------------------------------------------------------------------------------------ overview
 
-interface Item { label: string; value: string; spark?: number[]; tone?: 'good' | 'bad' }
+interface Item { label: string; value: string; note?: string; spark?: number[]; tone?: 'good' | 'bad' }
 interface Group { title: string; key: MetricKey; items: Item[] }
 
 export function Overview({ ctx }: { ctx: Ctx }) {
@@ -65,12 +72,12 @@ export function Overview({ ctx }: { ctx: Ctx }) {
   const groups: Group[] = [
     { title: 'Economy', key: 'unemployment', items: [
       { label: 'Output, last 12 months', value: money(sim, gdp12), spark: hist('gdp') },
-      { label: 'Real growth', value: growth === null ? 'needs 2 years of data' : pct(growth, 1), tone: growth === null ? undefined : growth >= 0 ? 'good' : 'bad' },
+      { label: 'Real growth', value: growth === null ? '–' : pct(growth, 1), note: growth === null ? 'needs 2 years of data' : undefined, tone: growth === null ? undefined : growth >= 0 ? 'good' : 'bad' },
       { label: 'Inflation', value: pct(st.inflation, 1), spark: hist('cpi'), tone: st.inflation > 0.08 ? 'bad' : undefined },
       { label: 'Unemployment', value: pct(st.unemployment, 1), spark: hist('unemployment'), tone: st.unemployment > 0.1 ? 'bad' : st.unemployment < 0.05 ? 'good' : undefined },
       { label: 'Average wage', value: `${money(sim, st.avgWage)}/mo`, spark: hist('avgWage') },
       { label: 'Median household income', value: `${money(sim, st.medianIncome)}/mo` },
-      { label: 'Businesses', value: `${num(st.businesses)} (${st.opened} opened, ${st.closed} closed last month)` },
+      { label: 'Businesses', value: num(st.businesses), note: `${st.opened} opened, ${st.closed} closed last month` },
     ] },
     { title: 'Public finances', key: 'budget', items: [
       { label: 'Revenue last month', value: money(sim, st.revenue), spark: hist('revenue') },
@@ -117,7 +124,7 @@ export function Overview({ ctx }: { ctx: Ctx }) {
     { title: 'Transport', key: 'traffic', items: [
       { label: 'Average commute', value: `${Math.round(st.commute)} min`, spark: hist('commute') },
       { label: 'Congestion (delay factor)', value: st.congestion.toFixed(2), tone: st.congestion > 1.3 ? 'bad' : undefined },
-      { label: 'Roads', value: `${st.roadKm.toFixed(1)} km, ${pct(st.poorRoads)} in poor condition` },
+      { label: 'Roads', value: `${st.roadKm.toFixed(1)} km`, note: `${pct(st.poorRoads)} in poor condition` },
     ] },
     { title: 'Environment', key: 'environment', items: [
       { label: 'Air pollution where people live', value: (st.pollution * 100).toFixed(0), spark: hist('pollution'), tone: st.pollution > 0.2 ? 'bad' : undefined },
@@ -131,7 +138,7 @@ export function Overview({ ctx }: { ctx: Ctx }) {
     <div class="panel-body">
       {al.length > 0 && (
         <section class="attention">
-          <h3>Needs your attention</h3>
+          <h3>{ctx.readOnly ? 'Needs the mayor’s attention' : 'Needs your attention'}</h3>
           <ul>
             {al.map((a, i) => (
               <li key={i} class={`sev${a.sev}`}>
@@ -151,7 +158,7 @@ export function Overview({ ctx }: { ctx: Ctx }) {
           <ul class="metrics">
             {gr.items.map((it) => (
               <li key={it.label}>
-                <span class="metric-label">{it.label}</span>
+                <span class="metric-label">{it.label}{it.note && <small class="metric-note">{it.note}</small>}</span>
                 <span class={`metric-value ${it.tone ?? ''}`}>{it.value}</span>
                 {it.spark && <Spark values={it.spark} />}
               </li>
@@ -191,6 +198,7 @@ export function Budget({ ctx }: { ctx: Ctx }) {
       </section>
       <section>
         <h3>Department funding</h3>
+        <VisitorNote ctx={ctx} />
         <p class="muted">Share of each department's full-service cost it receives every month. Below 90% staff are laid off; above 100% buys extra operations such as faster road repair.</p>
         {DEPTS.map((d) => {
           const v = draft[d] ?? Math.round(g.level[d] * 100);
@@ -200,7 +208,7 @@ export function Budget({ ctx }: { ctx: Ctx }) {
                 <label for={`dept-${d}`}>{DEPT_LABELS[d]}</label>
                 <output class={v < 90 ? 'bad' : ''}>{v}%</output>
               </div>
-              <input id={`dept-${d}`} type="range" min={30} max={150} step={5} value={v}
+              <input id={`dept-${d}`} type="range" min={30} max={150} step={5} value={v} disabled={ctx.readOnly}
                 onInput={(e) => setDraft((x) => ({ ...x, [d]: Number((e.currentTarget as HTMLInputElement).value) }))}
                 onChange={(e) => apply(d, Number((e.currentTarget as HTMLInputElement).value))} />
               <p class="muted small">Full service {money(sim, g.deptNeed[d])}/mo · spent last month {money(sim, g.deptSpend[d])} · effective {pct(g.deptFunding[d])}</p>
@@ -222,11 +230,13 @@ const TAX_GROUPS: [string, (keyof TaxSettings)[]][] = [
   ['Property & farming', ['property', 'agriculture']],
   ['Trade', ['import', 'importFood', 'export']],
   ['Tourism & leisure', ['tourism', 'entertainment', 'passengerFee']],
+  ['Utilities', ['power', 'water']],
 ];
 const TAX_REV: Record<keyof TaxSettings, RevCat> = {
   income: 'incomeTax', incomeTop: 'incomeTax', allowance: 'incomeTax', topThreshold: 'incomeTax', corporate: 'corporateTax', smallBusiness: 'smallBizTax',
   sales: 'salesTax', foodSales: 'foodTax', luxury: 'luxuryTax', fuel: 'fuelTax', property: 'propertyTax', agriculture: 'agriTax', import: 'importTariff',
   importFood: 'importTariff', export: 'exportTax', licenseFee: 'licenseFees', tourism: 'tourismTax', entertainment: 'entertainmentTax', passengerFee: 'airportFees',
+  power: 'utilityBills', water: 'utilityBills',
 };
 
 export function Taxes({ ctx }: { ctx: Ctx }) {
@@ -240,6 +250,7 @@ export function Taxes({ ctx }: { ctx: Ctx }) {
   };
   return (
     <div class="panel-body">
+      <VisitorNote ctx={ctx} />
       <p class="muted">Changes are announced now and take effect on the first day of next month. Every tax works through the economy: see the notes under each change.</p>
       {TAX_GROUPS.map(([title, keys]) => (
         <section key={title}>
@@ -257,7 +268,7 @@ export function Taxes({ ctx }: { ctx: Ctx }) {
                   <label for={`tax-${k}`}>{TAX_LABELS[k]}</label>
                   <output>{describeValue(sim, k, v)}</output>
                 </div>
-                <input id={`tax-${k}`} type="range" min={lo} max={hi} step={step} value={v}
+                <input id={`tax-${k}`} type="range" min={lo} max={hi} step={step} value={v} disabled={ctx.readOnly}
                   onInput={(e) => setDraft((x) => ({ ...x, [k]: Number((e.currentTarget as HTMLInputElement).value) }))} />
                 <p class="muted small">{REV_LABELS[rev]} raised {money(sim, g.last.rev[rev])} last month</p>
                 {pending && <p class="pending">Scheduled: {describeValue(sim, k, pending.value)} from {dayLabel(sim, pending.day)}</p>}
@@ -304,9 +315,10 @@ export function PoliciesPanel({ ctx }: { ctx: Ctx }) {
     ctx.toast(r.ok ? r.message : r.error, r.ok ? undefined : 'bad');
     if (r.ok) setDraft((x) => { const n = { ...x }; delete n[k]; return n; });
   };
-  const set = (k: keyof Policies, v: number | boolean) => setDraft((x) => ({ ...x, [k]: v }));
+  const set = (k: keyof Policies, v: number | boolean) => { if (!ctx.readOnly) setDraft((x) => ({ ...x, [k]: v })); };
   return (
     <div class="panel-body">
+      <VisitorNote ctx={ctx} />
       {POLICY_GROUPS.map(([title, keys]) => (
         <section key={title}>
           <h3>{title}</h3>
@@ -320,19 +332,19 @@ export function PoliciesPanel({ ctx }: { ctx: Ctx }) {
             if (typeof cur === 'boolean') {
               control = (
                 <label class="switch">
-                  <input type="checkbox" checked={v as boolean} onChange={(e) => set(k, (e.currentTarget as HTMLInputElement).checked)} />
+                  <input type="checkbox" checked={v as boolean} disabled={ctx.readOnly} onChange={(e) => set(k, (e.currentTarget as HTMLInputElement).checked)} />
                   <span>{v ? 'On' : 'Off'}</span>
                 </label>
               );
             } else if (levels) {
               control = (
                 <div class="segmented" role="radiogroup" aria-label={POLICY_LABELS[k]}>
-                  {levels.map((name, i) => <button key={name} role="radio" aria-checked={v === i} class={v === i ? 'on' : ''} onClick={() => set(k, i)}>{name}</button>)}
+                  {levels.map((name, i) => <button key={name} role="radio" aria-checked={v === i} class={v === i ? 'on' : ''} disabled={ctx.readOnly} onClick={() => set(k, i)}>{name}</button>)}
                 </div>
               );
             } else {
               const [lo, hi, step] = policyRange(sim, k);
-              control = <input id={`pol-${k}`} type="range" min={lo} max={hi} step={step} value={v as number} onInput={(e) => set(k, Number((e.currentTarget as HTMLInputElement).value))} />;
+              control = <input id={`pol-${k}`} type="range" min={lo} max={hi} step={step} value={v as number} disabled={ctx.readOnly} onInput={(e) => set(k, Number((e.currentTarget as HTMLInputElement).value))} />;
             }
             return (
               <div class="setting" key={k}>
@@ -424,13 +436,13 @@ export function TradePanel({ ctx }: { ctx: Ctx }) {
                 <div><dt>Last month</dt><dd>exports {money(sim, p.lastExp)} · imports {money(sim, p.lastImp)}</dd></div>
               </dl>
               <p class="muted small">{partnerStatus(sim, p)}</p>
-              {p.status === 'none' && (
+              {!ctx.readOnly && p.status === 'none' && (
                 <div class="buttons wrap">
                   <button class="small" disabled={coolOff > 0} onClick={() => run(openTalks(sim, p.id))}>Open trade talks</button>
                   <span class="muted small">{coolOff > 0 ? `Partners will not reopen talks for another ${coolOff} days after the last ones collapsed.` : 'Talks take 9–17 months; about 7 in 10 end in an agreement.'}</span>
                 </div>
               )}
-              {(p.status === 'talks' || p.status === 'agreement') && (confirm === p.id ? (
+              {!ctx.readOnly && (p.status === 'talks' || p.status === 'agreement') && (confirm === p.id ? (
                 <div class="change">
                   <ul class="effects">
                     {p.status === 'talks'
@@ -606,7 +618,7 @@ export function TourismPanel({ ctx }: { ctx: Ctx }) {
           <div><dt>{POLICY_LABELS.tourismPromotion}</dt><dd>{describeValue(sim, 'tourismPromotion', pol.tourismPromotion)} · {money(sim, (PROMOTION_COST[pol.tourismPromotion] ?? 0) * nominal)} a month</dd></div>
           <div><dt>Spent on promotion and festivals last month</dt><dd>{money(sim, g.last.exp.promotion)}</dd></div>
         </dl>
-        <div class="buttons"><button class="small" onClick={() => ctx.setTab('policies')}>Change in Laws</button></div>
+        <div class="buttons"><button class="small" onClick={() => ctx.setTab('policies')}>{ctx.readOnly ? 'See the laws' : 'Change in Laws'}</button></div>
       </section>
       <section>
         <h3>Airport</h3>
@@ -636,7 +648,7 @@ export function TourismPanel({ ctx }: { ctx: Ctx }) {
               <div><dt>Expected passengers</dt><dd>about {num(projectedPassengers(sim))} a month</dd></div>
               <div><dt>National co-funding</dt><dd>{cofundShare(sim, 'airport') > 0 ? `${pct(cofundShare(sim, 'airport'))} of construction` : `only above ${num(AIRPORT_MIN_DEMAND)} expected passengers a month`}</dd></div>
             </dl>
-            <div class="buttons"><button class="small" onClick={() => ctx.build('airport')}>Plan an airport</button></div>
+            {!ctx.readOnly && <div class="buttons"><button class="small" onClick={() => ctx.build('airport')}>Plan an airport</button></div>}
           </>
         )}
       </section>
@@ -670,7 +682,9 @@ export function Projects({ ctx }: { ctx: Ctx }) {
   const [confirm, setConfirm] = useState<number | null>(null);
   return (
     <div class="panel-body">
-      <p class="muted">Propose new facilities with <b>Build</b> and new roads or canals with <b>Roads</b> on the toolbar. Projects move through planning, approvals, land and funding before construction starts.</p>
+      <p class="muted">{ctx.readOnly
+        ? 'What the mayor is building, and what developers are building. Projects move through planning, approvals, land and funding before construction starts.'
+        : <>Propose new facilities with <b>Build</b> and new roads or canals with <b>Roads</b> on the toolbar. Projects move through planning, approvals, land and funding before construction starts.</>}</p>
       <section>
         <h3>Public projects ({active.length})</h3>
         {active.length === 0 && <p class="muted">No public projects under way.</p>}
@@ -682,7 +696,7 @@ export function Projects({ ctx }: { ctx: Ctx }) {
             </div>
             <p class="muted small">{Math.round(projectProgress(p) * 100)}% built · spent {money(sim, p.spent)} of {money(sim, p.cost)}{p.cost > p.budget * 1.05 ? ` (budget was ${money(sim, p.budget)})` : ''}{p.delayDays > 0 ? ` · ${p.delayDays} days of delays` : ''}</p>
             {p.issue && <p class="bad small">{p.issue}</p>}
-            {p.phase !== 'staffing' && (confirm === p.id
+            {!ctx.readOnly && p.phase !== 'staffing' && (confirm === p.id
               ? <div class="buttons"><span class="small">Cancel after spending {money(sim, p.spent)}?</span><button class="danger small" onClick={() => { const r = cancel(sim, p.id); ctx.toast(r.ok ? r.message : r.error, r.ok ? undefined : 'bad'); setConfirm(null); }}>Yes, cancel</button><button class="ghost small" onClick={() => setConfirm(null)}>Keep</button></div>
               : <button class="ghost small" onClick={() => setConfirm(p.id)}>Cancel project</button>)}
           </article>
@@ -799,7 +813,7 @@ export function Saves({ ctx }: { ctx: Ctx }) {
           <button class="ghost" onClick={() => ctx.menu()}>Main menu</button>
         </div>
       </section>
-      <CloudSection onSaveNow={() => void game.save('Autosave').then((m) => { if (m) void activeSync()?.upload(); })} />
+      <CloudSection worldId={meta.id} onSaveNow={() => void game.save('Autosave').then((m) => { if (m) void activeSync()?.upload(); })} />
       <section>
         <h3>Save a copy</h3>
         <div class="inline">

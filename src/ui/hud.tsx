@@ -11,11 +11,12 @@ import { BUILDINGS, GOOD_SPECS, ROADWORKS } from '../sim/tables';
 import { getPreset, SPEEDS } from '../sim/presets';
 import { alerts, foundingSteps } from '../sim/summary';
 import { activeSync } from '../net/sync';
+import { cloudConfigured } from '../net/client';
 import { CloudBadge } from './account';
 import { formatDate } from '../sim/calendar';
 import { Terrain, Zone, type BuildingKind } from '../sim/types';
 import { Budget, Milestones, News, Overview, PoliciesPanel, Projects, Saves, Taxes, TourismPanel, TradePanel, type Ctx, type Tab } from './panels';
-import { CardView, dateTime, Modal, money, num, pct, realSpan, Rows, useTick } from './util';
+import { CardView, dateTime, mayorTitle, Modal, money, num, pct, realSpan, Rows, useTick } from './util';
 
 /** Event hub the 3D view calls into; the HUD installs the handlers. */
 export interface Bus {
@@ -43,7 +44,15 @@ interface HudProps {
   onLoad(key: string): void;
   onExport(): void;
   onImport(): void;
+  /** Set while visiting another player's town: everything is read-only and nothing is saved. */
+  visit?: VisitInfo | null;
+  onLeaveVisit?(): void;
+  /** Leaves the player's own town for the world map (only when the game has a server). */
+  onWorld?(): void;
 }
+
+/** Who runs the town being visited and how fresh the copy is. */
+export interface VisitInfo { mayor: string; savedAt: string | null; playing: boolean }
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'overview', label: 'Overview' }, { id: 'budget', label: 'Budget' }, { id: 'taxes', label: 'Taxes' }, { id: 'policies', label: 'Laws' },
@@ -71,6 +80,12 @@ const ROAD_HINT: Record<RoadTool, string> = {
   canal: 'Drag across open land or fields to dig an irrigation canal.',
 };
 const ZONES = [Zone.Residential, Zone.Commercial, Zone.Industrial, Zone.Agricultural];
+const visitAgo = (iso: string | null) => {
+  if (!iso) return 'at an unknown time';
+  const ms = Date.now() - Date.parse(iso);
+  return ms < 60_000 ? 'just now' : `${realSpan(ms)} ago`;
+};
+
 /** Facilities that are not square can be placed either way round. */
 const turnable = (k: BuildingKind) => BUILDINGS[k].w !== BUILDINGS[k].h;
 const footprint = (k: BuildingKind, rot?: boolean) => (rot ? `${BUILDINGS[k].h}×${BUILDINGS[k].w}` : `${BUILDINGS[k].w}×${BUILDINGS[k].h}`);
@@ -116,6 +131,10 @@ export function Hud(p: HudProps) {
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [floors, setFloors] = useState<number | undefined>(undefined);
   const [toasts, setToasts] = useState<{ id: number; text: string; tone?: string }[]>([]);
+  const ro = !!p.visit;
+  const [visitNote, setVisitNote] = useState(true);
+  const speeds = ro ? SPEEDS.slice(0, 2) : SPEEDS;
+  const tabs = ro ? TABS.filter((t) => t.id !== 'saves') : TABS;
   const toolRef = useRef(tool);
   toolRef.current = tool;
   const lastSpeed = useRef(1);
@@ -164,7 +183,7 @@ export function Hud(p: HudProps) {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
       if (e.key === ' ') { e.preventDefault(); setSpeed(game.speed > 0 ? 0 : lastSpeed.current); }
-      else if (/^[1-5]$/.test(e.key)) setSpeed(SPEEDS[Number(e.key)]);
+      else if (/^[1-5]$/.test(e.key)) { if (!ro || e.key === '1') setSpeed(SPEEDS[Number(e.key)]); }
       else if ((e.key === 't' || e.key === 'T') && toolRef.current.mode === 'build') turn();
       else if (e.key === 'Escape') {
         if (p.report || p.briefing) return;
@@ -179,7 +198,7 @@ export function Hud(p: HudProps) {
   });
 
   const ctx: Ctx = {
-    game, sim, select: setSel, openRef, toast, setTab: (t) => setTab(t), build: (kind) => setTool({ mode: 'build', kind }),
+    game, sim, readOnly: ro, select: setSel, openRef, toast, setTab: (t) => setTab(t), build: (kind) => { if (!ro) setTool({ mode: 'build', kind }); },
     menu: p.onMenu, loadSave: p.onLoad, exportWorld: p.onExport, importWorld: p.onImport,
   };
   const preset = getPreset(s.meta.preset);
@@ -204,7 +223,7 @@ export function Hud(p: HudProps) {
       case 'projects': return <Projects ctx={ctx} />;
       case 'news': return <News ctx={ctx} />;
       case 'milestones': return <Milestones ctx={ctx} />;
-      case 'saves': return <Saves ctx={ctx} />;
+      case 'saves': return ro ? null : <Saves ctx={ctx} />;
       default: return null;
     }
   };
@@ -220,44 +239,53 @@ export function Hud(p: HudProps) {
 
   return (
     <div class="hud">
-      <header class="topbar panel">
-        <div class="city">
-          <strong>{s.meta.name}</strong>
-          <span class="muted small">{preset.label}, {preset.country}</span>
+      <header class="topbar">
+        <div class="tb-group place">
+          <div class="city">
+            <strong>{s.meta.name}{ro && <span class="chip on visiting">Visiting</span>}</strong>
+            <span class="muted small">{p.visit ? `${mayorTitle(p.visit.mayor)} · ` : ''}{preset.label}, {preset.country}</span>
+          </div>
+          <div class="clock" aria-live="off">
+            <time>{dateTime(sim)}</time>
+            <span class="muted small">{weather}</span>
+          </div>
         </div>
-        <div class="clock" aria-live="off">
-          <time>{dateTime(sim)}</time>
-          <span class="muted small">{weather}</span>
-        </div>
-        <div class="speeds" role="group" aria-label="Simulation speed">
-          {SPEEDS.map((v, i) => (
+        <div class="tb-group speeds" role="group" aria-label="Simulation speed">
+          {speeds.map((v, i) => (
             <button key={v} class={game.speed === v ? 'on' : ''} aria-pressed={game.speed === v} title={v === 0 ? 'Pause (Space)' : `${v}× the world's pace (key ${i})`} onClick={() => setSpeed(v)}>
               {v === 0 ? 'Pause' : `${v}×`}
             </button>
           ))}
           {game.busy && <span class="small muted">catching up…</span>}
         </div>
-        <div class="kpis">
+        <div class="tb-group kpis">
           <button class="kpi" onClick={() => setTab('overview')}><span>Population</span><b>{num(s.citizens.length)}</b></button>
           <button class="kpi" onClick={() => setTab('budget')}><span>Treasury</span><b class={s.gov.cash < 0 ? 'bad' : ''}>{money(sim, s.gov.cash)}</b></button>
           <button class="kpi" onClick={() => setTab('overview')}><span>Approval</span><b class={s.citizens.length && s.gov.approval < 0.45 ? 'bad' : ''}>{s.citizens.length ? pct(s.gov.approval) : '–'}</b></button>
           {st && <button class="kpi" onClick={() => setTab('overview')}><span>Unemployment</span><b class={st.unemployment > 0.1 ? 'bad' : ''}>{st.laborForce ? pct(st.unemployment, 1) : '–'}</b></button>}
         </div>
-        <div class="actions">
-          <CloudBadge />
-          <button class="ghost" onClick={() => {
-            void game.save('Autosave').then((m) => {
-              toast(m ? 'Saved.' : game.locked ? 'This town is open on another device.' : 'Save skipped (already saving).');
-              if (m) void activeSync()?.upload();
-            });
-          }}>Save</button>
-          <button class="ghost" onClick={p.onMenu}>Menu</button>
+        <div class="tb-group actions">
+          {ro ? (
+            <button class="primary" onClick={() => p.onLeaveVisit?.()}>Back to the world map</button>
+          ) : (
+            <>
+              <CloudBadge />
+              <button class="ghost" onClick={() => {
+                void game.save('Autosave').then((m) => {
+                  toast(m ? 'Saved.' : game.locked ? 'This town is open on another device.' : 'Save skipped (already saving).');
+                  if (m) void activeSync()?.upload();
+                });
+              }}>Save</button>
+              {cloudConfigured && p.onWorld && <button class="ghost" onClick={p.onWorld}>World map</button>}
+              <button class="ghost" onClick={p.onMenu}>Menu</button>
+            </>
+          )}
         </div>
       </header>
 
       <aside class={`sidebar panel ${tab ? '' : 'collapsed'}`} aria-label="Government">
         <nav class="tabs" role="tablist" aria-label="Government departments">
-          {TABS.map((t) => (
+          {tabs.map((t) => (
             <button key={t.id} role="tab" aria-selected={tab === t.id} class={tab === t.id ? 'on' : ''} onClick={() => setTab(tab === t.id ? null : t.id)}>
               {t.label}{t.id === 'overview' && urgent > 0 && <span class="badge" aria-label={`${urgent} urgent`}>{urgent}</span>}
             </button>
@@ -307,6 +335,7 @@ export function Hud(p: HudProps) {
         )}
         <nav class="toolbar panel" aria-label="Tools">
           <button class={tool.mode === 'inspect' ? 'on' : ''} aria-pressed={tool.mode === 'inspect'} onClick={() => setTool({ mode: 'inspect' })}>Inspect</button>
+          {!ro && <>
           <div class="tool-group">
             <button class={tool.mode === 'build' ? 'on' : ''} aria-expanded={menu === 'build'} onClick={() => setMenu(menu === 'build' ? null : 'build')}>Build</button>
             {menu === 'build' && (
@@ -323,6 +352,7 @@ export function Hud(p: HudProps) {
             <button class={tool.mode === 'zone' ? 'on' : ''} aria-expanded={menu === 'zone'} onClick={() => setMenu(menu === 'zone' ? null : 'zone')}>Zone</button>
             {menu === 'zone' && <div class="flyout panel">{ZONES.map((z) => <button key={z} onClick={() => { setTool({ mode: 'zone', zone: z }); setOverlay('zoning'); }}>{ZONE_LABELS[z]}</button>)}</div>}
           </div>
+          </>}
           <div class="tool-group">
             <button class={overlay !== 'none' ? 'on' : ''} aria-expanded={menu === 'layers'} onClick={() => setMenu(menu === 'layers' ? null : 'layers')}>Layers</button>
             {menu === 'layers' && <div class="flyout panel">{OVERLAYS.map((o) => <button key={o.id} class={overlay === o.id ? 'on' : ''} onClick={() => setOverlay(o.id)}>{o.label}</button>)}</div>}
@@ -353,6 +383,16 @@ export function Hud(p: HudProps) {
         <div class="catchup panel" role="status">
           {p.catching.label}… {Math.round((p.catching.done / Math.max(1, p.catching.total)) * 100)}%
         </div>
+      )}
+
+      {p.visit && visitNote && !p.catching && (
+        <section class="visit-note panel" aria-label="About this visit">
+          <p>
+            You are visiting {s.meta.name}, run by {mayorTitle(p.visit.mayor)}. You see it as its mayor last saved it ({visitAgo(p.visit.savedAt)}){p.visit.playing ? ', and they are playing it right now' : ''}.
+            {' '}Time runs here for you alone, and nothing you do changes their town.
+          </p>
+          <div class="buttons"><button class="small" onClick={() => setVisitNote(false)}>Got it</button></div>
+        </section>
       )}
 
       {p.report && <WelcomeBack sim={sim} report={p.report} onClose={p.clearReport} openRef={(r) => { p.clearReport(); openRef(r); }} />}

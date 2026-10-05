@@ -13,6 +13,7 @@ export const TAX_LABELS: Record<keyof TaxSettings, string> = {
   property: 'Property tax', fuel: 'Fuel tax', import: 'Import tariff (manufactures)', importFood: 'Import tariff (food & farm goods)',
   export: 'Export tax', agriculture: 'Agricultural income tax', luxury: 'Luxury tax', licenseFee: 'Business licence fee',
   tourism: 'Hotel room tax', entertainment: 'Entertainment tax', passengerFee: 'Airport passenger fee',
+  power: 'Electricity tariff', water: 'Water tariff',
 };
 
 export const POLICY_LABELS: Record<keyof Policies, string> = {
@@ -34,8 +35,8 @@ export const POLICY_DELAY: Record<keyof Policies, number> = {
 export const GRANT_PER_CAPITA = 550;
 
 export const DEPT_LABELS: Record<Dept, string> = {
-  admin: 'Administration', health: 'Health', education: 'Education', safety: 'Police & safety', transport: 'Transport & roads',
-  agriculture: 'Agriculture', environment: 'Environment', culture: 'Culture, sport & heritage',
+  admin: 'Administration', health: 'Health', education: 'Education', safety: 'Police, fire & safety', transport: 'Transport & roads',
+  agriculture: 'Agriculture', environment: 'Environment', culture: 'Culture, sport & heritage', utilities: 'Water & power',
 };
 
 export function governmentDaily(sim: Sim): void {
@@ -74,6 +75,18 @@ export function deptExtras(sim: Sim): Record<Dept, number> {
   const venues = s.businesses.filter((b) => (b.kind === 'museum' || b.kind === 'stadium') && b.status !== 'planned').length;
   ex.culture = (15_000 + 60_000 * heritage + 90_000 * venues) * nominal;
   if (s.businesses.some((b) => b.kind === 'airport' && b.status !== 'planned')) ex.transport += 450_000 * nominal;
+  // fire engines, breathing sets and hoses; water treatment chemicals, pumps and mains repairs; plant spares
+  let fire = 0, util = 0;
+  for (const b of s.businesses) {
+    if (b.status === 'planned' || b.status === 'closed') continue;
+    if (b.kind === 'firestation') fire += 60_000;
+    else if (b.kind === 'waterworks') util += 90_000;
+    else if (b.kind === 'gasplant') util += 120_000;
+    else if (b.kind === 'solarfarm' || b.kind === 'windfarm') util += 30_000;
+  }
+  for (const b of s.buildings) if (b.kind === 'substation') util += 50_000;
+  ex.safety += fire * nominal;
+  ex.utilities = util * nominal;
   return ex;
 }
 
@@ -116,7 +129,7 @@ export function governmentMonthly(sim: Sim): void {
     const opsShare = opsNeed > 0 ? ops / opsNeed : 1;
     // road, park and heritage upkeep is done by local contractors; supplies and programmes are bought in
     if (ops > 0) {
-      if (d === 'transport' || d === 'environment' || d === 'culture') maintenanceWork(sim, g, ops, d);
+      if (d === 'transport' || d === 'environment' || d === 'culture' || d === 'utilities') maintenanceWork(sim, g, ops, d);
       else sim.spend(d, s.ext, ops);
     }
     g.deptSpend[d] = salaries[d] + ops;

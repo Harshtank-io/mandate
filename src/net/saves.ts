@@ -1,7 +1,7 @@
 // Cloud copies of towns: one row per town in public.towns plus its compressed save files in the private "saves"
 // bucket, under <user id>/<world id>/. Every upload becomes the next revision; the newest few files are kept.
 
-import { formatDate } from '../sim/calendar';
+import { dateOf, formatDate, MIN_PER_DAY } from '../sim/calendar';
 import { STATE_VERSION } from '../sim/migrate';
 import type { WorldState } from '../sim/types';
 import { decode } from '../game/persist';
@@ -15,18 +15,21 @@ interface TownRow {
   world_id: string; name: string; preset: string; condition: string; population: number; sim_minute: number; sim_date: string;
   revision: number; saved_at: string | null; save_path: string | null; save_size: number; save_enc: 'gzip' | 'json';
   lease_device: string | null; lease_until: string | null;
+  // added by the shared-world migration; absent on a server that does not have it yet
+  on_map?: boolean; region?: string | null; plot?: number | null;
 }
-const COLUMNS = 'world_id,name,preset,condition,population,sim_minute,sim_date,revision,saved_at,save_path,save_size,save_enc,lease_device,lease_until';
 
 const toTown = (r: TownRow): CloudTown => ({
   worldId: r.world_id, name: r.name, preset: r.preset, condition: r.condition, population: r.population, minute: r.sim_minute, date: r.sim_date,
   revision: r.revision, savedAt: r.saved_at, path: r.save_path, size: r.save_size, enc: r.save_enc, leaseDevice: r.lease_device, leaseUntil: r.lease_until,
+  onMap: r.on_map ?? true, region: r.region ?? null, plot: r.plot ?? null,
 });
 
 /** Reloads the list of the account's towns in the cloud. */
 export async function refreshTowns(): Promise<CloudTown[]> {
   const sb = await supabase();
-  const { data, error } = await sb.from('towns').select(COLUMNS).order('saved_at', { ascending: false, nullsFirst: false });
+  // every column, so this works whether or not the server has the shared-world columns yet
+  const { data, error } = await sb.from('towns').select('*').order('saved_at', { ascending: false, nullsFirst: false });
   if (error) throw error;
   const towns = ((data ?? []) as TownRow[]).map(toTown);
   setCloud({ towns });
@@ -66,12 +69,19 @@ export async function releaseLease(worldId: string): Promise<void> {
   if (error) throw error;
 }
 
-/** What the cloud list shows about a save, taken from the state at the moment it is encoded. */
+/** What the cloud list and the world map show about a save, taken from the state at the moment it is encoded. */
 export function describe(state: WorldState): Record<string, string | number> {
-  return {
+  const ms = state.stats.months;
+  const last = ms[ms.length - 1];
+  const d: Record<string, string | number> = {
     name: state.meta.name, preset: state.meta.preset, condition: state.meta.condition, population: state.citizens.length,
     minute: state.minute, date: formatDate(state.meta.startYear, state.minute, false), version: STATE_VERSION,
+    year: dateOf(state.meta.startYear, Math.floor(state.minute / MIN_PER_DAY)).year, officeYear: state.meta.officeYear,
   };
+  // a town with nobody in it yet has no approval rating or labour market to speak of
+  if (state.citizens.length) d.approval = state.gov.approval;
+  if (last?.laborForce) d.unemployment = last.unemployment;
+  return d;
 }
 
 export type Commit = { ok: true; revision: number } | { ok: false; reason: 'conflict' | 'lease' | 'missing'; revision: number };

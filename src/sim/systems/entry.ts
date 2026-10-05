@@ -3,13 +3,14 @@
 
 import { idx, W, type Sim } from '../core';
 import { businessName } from '../names';
-import { BUILDINGS, BUSINESSES } from '../tables';
+import { BUILDINGS, BUSINESSES, OFFICE_OVERHEAD, USE_KWH } from '../tables';
 import { Terrain, Zone, type Building, type Business, type BusinessKind, type Citizen } from '../types';
 import { dateOf } from '../calendar';
 import { createProject, estimate, OUTSIDE_CONTRACTOR } from './construction';
 import { rebuildStores } from './households';
 import { findLot } from './housing';
 import { freightPerUnit } from './logistics';
+import { bizTariff } from './utilities';
 
 const nominalOf = (sim: Sim) => sim.scale * sim.s.ext.trend;
 
@@ -164,7 +165,7 @@ function proForma(sim: Sim, kind: BusinessKind): ProForma | null {
       const out = 40 * 3.5 * 26 * 0.9;
       const world = s.ext.prices.goods;
       const sell = Math.max(s.market.goods.price, world * (1 - t.export) - freightPerUnit(sim, 'goods', 60));
-      const unit = 0.5 * world * (1 + t.import) + 40 * nominal;
+      const unit = 0.5 * world * (1 + t.import) + USE_KWH.crate * bizTariff(sim);
       monthly = out * (sell - unit) - wages - capital * 0.0012;
       const avail = laborAvailability(sim, 1) + homes * 0.6;
       labor = Math.min(1, avail / jobs);
@@ -175,7 +176,7 @@ function proForma(sim: Sim, kind: BusinessKind): ProForma | null {
       const out = 22 * 0.5 * 26 * 0.9;
       const grain = Math.min(s.market.wheat.price, s.market.maize.price, s.market.rice.price);
       const food = s.market.food.price;
-      monthly = out * (food - grain * 1.25 - 900 * nominal) - wages - capital * 0.0012;
+      monthly = out * (food - grain * 1.25 - USE_KWH.foodTonne * bizTariff(sim)) - wages - capital * 0.0012;
       const avail = laborAvailability(sim, 1) + homes * 0.6;
       labor = Math.min(1, avail / jobs);
       const surplus = ['wheat', 'rice', 'maize'].reduce((a, g) => a + s.market[g as 'wheat'].lastExported, 0);
@@ -194,7 +195,7 @@ function proForma(sim: Sim, kind: BusinessKind): ProForma | null {
     }
     case 'office': {
       const rev = (5 * 4200 + 3 * 3300 + 3 * 1500 + 2200) * 22 * nominal * s.ext.demand * 0.95;
-      monthly = rev - wages - 12 * 250 * 22 * nominal - capital * 0.001;
+      monthly = rev - wages - 12 * (OFFICE_OVERHEAD * nominal + USE_KWH.officeStaff * bizTariff(sim)) * 22 - capital * 0.001;
       const grads = laborAvailability(sim, 4, ['eng', 'biz']);
       labor = Math.min(1, (grads + homes * 0.25) / 8);
       reasons.push(`${grads} unemployed engineering and business graduates`, s.ext.phase === 'recession' ? 'Global demand for services is weak' : 'Steady demand for outsourced services');

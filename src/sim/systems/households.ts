@@ -3,9 +3,10 @@
 
 import { emptyHhLedger, type Account, type Sim, type StoreLists } from '../core';
 import { buyFuel, foodRetail, goodsRetail, hhIncome, mealPrice, servicePrice, vegRetail } from '../econ';
-import { FOOD_NEED, LEISURE_SHARE, MEAL_INPUT, MEAL_SUPPLIES, MEALS_PER_STAFF, SERVICE_SUPPLY_SHARE, VEG_NEED } from '../tables';
+import { FOOD_NEED, LEISURE_SHARE, MEAL_INPUT, MEAL_SUPPLIES, MEALS_PER_STAFF, SERVICE_SUPPLY_SHARE, USE_KWH, VEG_NEED } from '../tables';
 import type { Building, Business, Good, Household, RevCat } from '../types';
 import { goOut } from './leisure';
+import { powerBill, powered } from './utilities';
 
 type StoreKind = keyof StoreLists;
 const STORE_KINDS: StoreKind[] = ['grocery', 'shop', 'restaurant', 'services', 'cinema'];
@@ -51,16 +52,17 @@ export function visitorStores(sim: Sim): StoreLists {
   return sim.ix.visitorStores ?? emptyLists();
 }
 
-/** Value of sales a store's staff can handle per day. */
+/** Value of sales a store's staff can handle per day. Blackouts cut it: tills, lights, fridges and stoves go dark. */
 function staffCapacity(sim: Sim, b: Business): number {
   let staff = b.owner >= 0 ? 1 : 0;
   for (const j of b.jobs) if (j.worker >= 0) staff++;
   const nominal = sim.scale * sim.s.ext.trend;
+  const pw = 0.4 + 0.6 * powered(sim.bld(b.building));
   switch (b.kind) {
-    case 'grocery': return staff * 24_000 * nominal;
-    case 'shop': return staff * 28_000 * nominal;
-    case 'restaurant': return staff * MEALS_PER_STAFF * mealPrice(sim);
-    default: return staff * 11 * servicePrice(sim);
+    case 'grocery': return staff * 24_000 * nominal * pw;
+    case 'shop': return staff * 28_000 * nominal * pw;
+    case 'restaurant': return staff * MEALS_PER_STAFF * mealPrice(sim) * pw;
+    default: return staff * 11 * servicePrice(sim) * pw;
   }
 }
 
@@ -148,7 +150,7 @@ function shop(sim: Sim, h: Household): void {
   // steer their savings towards a buffer of about four months' income, drawing it down when they hold more.
   const income = Math.max(0, h.incAvg);
   const weekly = income / 4.33;
-  const fixed = (h.rent + h.last.transport) / 4.33;
+  const fixed = (h.rent + h.last.transport + h.last.utilities) / 4.33;
   const disposable = Math.max(0, weekly - foodCost - fixed);
   const buffer = Math.max(4 * income, 15_000 * sim.scale * s.ext.trend);
   const gap = h.cash - buffer;
@@ -190,10 +192,10 @@ export function serveServices(sim: Sim, payer: Account, ids: number[], n: number
     if (payer.cash < value * (1 + t.sales)) break;
     sim.pay(payer, b, value);
     sim.tax('salesTax', payer, value * t.sales);
-    // parts, cosmetics and fuel are bought in from outside
+    // parts, cosmetics and fuel are bought in from outside; electricity is billed by the city
     const supplies = value * SERVICE_SUPPLY_SHARE;
     sim.pay(b, sim.s.ext, supplies);
-    b.m.cogs += supplies;
+    b.m.cogs += supplies + powerBill(sim, b, q * USE_KWH.service);
     b.m.revenue += value;
     b.m.sales += q;
     sim.ix.served.set(b.id, served + value);
@@ -228,10 +230,10 @@ export function serveMeals(sim: Sim, payer: Account, ids: number[], meals: numbe
     b.inv.vegetables = (b.inv.vegetables ?? 0) - q * MEAL_INPUT.vegetables;
     recordSale(sim, b, 'food', q * MEAL_INPUT.food);
     recordSale(sim, b, 'vegetables', q * MEAL_INPUT.vegetables);
-    // cooking gas, oil, electricity and packaging come from outside
+    // cooking gas, oil and packaging come from outside; electricity is billed by the city
     const supplies = q * MEAL_SUPPLIES * sim.scale * sim.s.ext.trend;
     sim.pay(b, sim.s.ext, supplies);
-    b.m.cogs += supplies;
+    b.m.cogs += supplies + powerBill(sim, b, q * USE_KWH.meal);
     b.m.revenue += value;
     b.m.sales += q;
     sim.ix.served.set(b.id, served + value);

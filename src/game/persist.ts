@@ -69,14 +69,39 @@ export async function encode(state: WorldState): Promise<{ blob: Blob; enc: 'gzi
   return { blob: new Blob([blob], { type: 'application/gzip' }), enc: 'gzip' };
 }
 
-export async function decode(blob: Blob, enc?: 'gzip' | 'json'): Promise<WorldState> {
+const TOO_LARGE = 'The save file is too large to open.';
+
+/** Reads a stream as text, giving up past `max` bytes, so a small file that inflates enormously cannot exhaust memory. */
+async function readLimited(stream: ReadableStream<Uint8Array>, max: number): Promise<string> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) { await reader.cancel().catch(() => { /* already failing */ }); throw new Error(TOO_LARGE); }
+    chunks.push(value);
+  }
+  return new Blob(chunks as BlobPart[]).text();
+}
+
+/**
+ * Turns a stored or downloaded file back into a world. `maxBytes` limits the size of the unpacked file; use it for
+ * files from other players.
+ */
+export async function decode(blob: Blob, enc?: 'gzip' | 'json', maxBytes = Infinity): Promise<WorldState> {
   let text: string;
   const head = new Uint8Array(await blob.slice(0, 2).arrayBuffer());
   const gz = enc === 'gzip' || (head[0] === 0x1f && head[1] === 0x8b);
   if (gz) {
     if (!hasGzip()) throw new Error('This browser cannot read compressed saves.');
-    text = await new Response(blob.stream().pipeThrough(new DecompressionStream('gzip'))).text();
-  } else text = await blob.text();
+    const stream = blob.stream().pipeThrough(new DecompressionStream('gzip'));
+    text = Number.isFinite(maxBytes) ? await readLimited(stream, maxBytes) : await new Response(stream).text();
+  } else {
+    if (blob.size > maxBytes) throw new Error(TOO_LARGE);
+    text = await blob.text();
+  }
   const state = JSON.parse(text) as WorldState;
   validate(state);
   return state;

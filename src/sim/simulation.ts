@@ -31,6 +31,8 @@ import { computeAppeal, tourismCosts, tourismDaily, tourismMonthly } from './sys
 import { aviationDaily, aviationMonthly } from './systems/aviation';
 import { tradeDaily, tradeMonthly } from './systems/trade';
 import { foodMonthly } from './systems/food';
+import { utilitiesDaily, utilitiesMonthly } from './systems/utilities';
+import { fireDaily } from './systems/fire';
 import { migrate } from './migrate';
 import { Zone, GOODS, type WorldState } from './types';
 
@@ -42,6 +44,8 @@ export const DAILY: SystemDef[] = [
   { id: 'trade', daily: tradeDaily },
   { id: 'external', daily: externalDaily },
   { id: 'weather', daily: weatherDaily },
+  // electricity and water first: plants, shops and homes work with what they get today
+  { id: 'utilities', daily: utilitiesDaily },
   { id: 'labor', daily: laborDaily },
   { id: 'agriculture', daily: agricultureDaily },
   { id: 'production', daily: productionDaily },
@@ -53,6 +57,7 @@ export const DAILY: SystemDef[] = [
   { id: 'households', daily: householdsDaily },
   { id: 'business', daily: businessDaily },
   { id: 'construction', daily: constructionDaily },
+  { id: 'fire', daily: fireDaily },
   { id: 'population', daily: populationDaily },
   { id: 'housing', daily: housingDaily },
   { id: 'transport', daily: transportDaily },
@@ -76,6 +81,7 @@ export const MONTHLY: SystemDef[] = [
   { id: 'tourismCosts', monthly: tourismCosts },
   { id: 'stats', monthly: statsMonthly },
   // these close their month-to-date counters, so they run after the statistics have read them
+  { id: 'utilities', monthly: utilitiesMonthly },
   { id: 'tourism', monthly: tourismMonthly },
   { id: 'aviation', monthly: aviationMonthly },
   { id: 'trade', monthly: tradeMonthly },
@@ -132,6 +138,7 @@ export class Simulation {
     for (const g of GOODS) for (let k = 0; k < 30; k++) s.market[g].hist.push(s.market[g].price);
     assignTraffic(sim);
     laborDaily(sim);
+    utilitiesDaily(sim);
     servicesMonthly(sim);
     environmentDaily(sim);
     weatherDaily(sim);

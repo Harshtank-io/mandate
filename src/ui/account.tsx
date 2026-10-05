@@ -3,8 +3,9 @@
 
 import { useState } from 'preact/hooks';
 import { addEmail, linkProvider, playAsGuest, rename, sendSignInLink, signInWith, signOut, startCloud } from '../net/auth';
-import { cloudConfigured, OAUTH_LABELS, oauthProviders } from '../net/client';
+import { cloudConfigured, errText, OAUTH_LABELS, oauthProviders } from '../net/client';
 import { useCloud, type CloudTown, type SyncInfo } from '../net/store';
+import { setOnMap } from '../net/world';
 import { getPreset } from '../sim/presets';
 import { Modal, num, realSpan } from './util';
 
@@ -149,8 +150,36 @@ function syncText(s: SyncInfo | null): string {
   }
 }
 
+/** Whether a town appears on the shared world map, switchable by its owner once it is in the account. */
+function MapSwitch({ worldId }: { worldId: string }) {
+  const c = useCloud();
+  const [busy, setBusy] = useState(false);
+  const [want, setWant] = useState<boolean | null>(null); // the player's choice while the server confirms it
+  const [error, setError] = useState('');
+  const town = c.towns.find((t) => t.worldId === worldId && t.path);
+  const onMap = want ?? town?.onMap ?? true;
+  const toggle = async (v: boolean) => {
+    setBusy(true);
+    setWant(v);
+    setError('');
+    try { await setOnMap(worldId, v); } catch (e) { setError(errText(e)); } finally { setWant(null); setBusy(false); }
+  };
+  return (
+    <div class="setting">
+      <label class="switch">
+        <input type="checkbox" checked={onMap} disabled={!town || busy} onChange={(e) => void toggle((e.currentTarget as HTMLInputElement).checked)} />
+        <span>Show this town on the world map</span>
+      </label>
+      <p class="muted small">{!town ? 'It goes on the world map after its first cloud save.'
+        : onMap ? 'Every player can find it on the world map and visit it. Visitors see the copy last saved to your account and cannot change anything.'
+          : 'Off the map: only you can see it there, and nobody else can visit it.'}</p>
+      {error && <p class="bad small" role="alert">{error}</p>}
+    </div>
+  );
+}
+
 /** Cloud section of the World panel. */
-export function CloudSection({ onSaveNow }: { onSaveNow(): void }) {
+export function CloudSection({ worldId, onSaveNow }: { worldId: string; onSaveNow(): void }) {
   const c = useCloud();
   if (!cloudConfigured) return <section><h3>Cloud</h3><p class="muted small">Cloud saves are not set up in this copy of the game, so this town is saved on this device only.</p></section>;
   const acc = c.account;
@@ -170,6 +199,7 @@ export function CloudSection({ onSaveNow }: { onSaveNow(): void }) {
       )}
       {c.phase === 'online' && <div class="buttons"><button disabled={status === 'uploading' || status === 'lost' || status === 'conflict'} onClick={onSaveNow}>Save to cloud now</button></div>}
       {acc?.guest && <p class="muted small">Guest towns can only be reached from this browser. Add an email on the main menu to keep them safe.</p>}
+      {c.phase === 'online' && acc && <MapSwitch worldId={worldId} />}
     </section>
   );
 }

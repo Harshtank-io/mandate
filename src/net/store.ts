@@ -34,6 +34,11 @@ export interface CloudTown {
   enc: 'gzip' | 'json';
   leaseDevice: string | null;
   leaseUntil: string | null;
+  /** Shown on the world map (true when the server has no world map yet). */
+  onMap: boolean;
+  /** Its place on the world map, once it has one. */
+  region: string | null;
+  plot: number | null;
 }
 
 export type SyncStatus = 'pending' | 'uploading' | 'synced' | 'offline' | 'conflict' | 'lost' | 'error';

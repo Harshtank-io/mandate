@@ -31,6 +31,8 @@ export const ROLES: Record<RoleId, RoleSpec> = {
   security: { id: 'security', label: 'Security guard', edu: 1, wage: 15000 },
   curator: { id: 'curator', label: 'Curator', edu: 4, fields: ['gen', 'biz'], wage: 45000 },
   controller: { id: 'controller', label: 'Air traffic controller', edu: 4, fields: ['eng'], wage: 85000 },
+  firefighter: { id: 'firefighter', label: 'Firefighter', edu: 2, wage: 26000 },
+  plantop: { id: 'plantop', label: 'Plant operator', edu: 2, wage: 23000 },
 };
 
 export const EDU_LABEL = ['No schooling', 'Primary', 'Secondary', 'Vocational diploma', 'University degree'];
@@ -83,6 +85,12 @@ export const BUILDINGS: Record<BuildingKind, BuildingSpec> = {
   museum: { kind: 'museum', label: 'Museum', w: 2, h: 2, floors: [2, 2], unitsPerFloor: 0, cost: 70_000_000, labor: 20000, materials: 3500, perFloor: false, equipment: 10_000_000, crew: 50, zones: [], biz: 'museum', maintenance: 0.001, category: 'civic' },
   heritage: { kind: 'heritage', label: 'Heritage site', w: 2, h: 2, floors: [1, 1], unitsPerFloor: 0, cost: 40_000_000, labor: 0, materials: 0, perFloor: false, equipment: 0, crew: 0, zones: [], biz: '', maintenance: 0, category: 'civic' },
   airport: { kind: 'airport', label: 'Regional airport', w: 24, h: 4, floors: [1, 1], unitsPerFloor: 0, cost: 450_000_000, labor: 200000, materials: 45000, perFloor: false, equipment: 150_000_000, crew: 260, zones: [], biz: 'airport', maintenance: 0.0006, category: 'civic' },
+  firestation: { kind: 'firestation', label: 'Fire station', w: 2, h: 1, floors: [2, 2], unitsPerFloor: 0, cost: 26_000_000, labor: 7000, materials: 1300, perFloor: false, equipment: 16_000_000, crew: 30, zones: [], biz: 'firestation', maintenance: 0.001, category: 'civic' },
+  gasplant: { kind: 'gasplant', label: 'Gas power plant', w: 3, h: 2, floors: [1, 1], unitsPerFloor: 0, cost: 50_000_000, labor: 15000, materials: 2600, perFloor: false, equipment: 130_000_000, crew: 50, zones: [], biz: 'gasplant', maintenance: 0.0012, category: 'industrial' },
+  solarfarm: { kind: 'solarfarm', label: 'Solar farm', w: 3, h: 3, floors: [1, 1], unitsPerFloor: 0, cost: 12_000_000, labor: 3000, materials: 300, perFloor: false, equipment: 38_000_000, crew: 30, zones: [], biz: 'solarfarm', maintenance: 0.0005, category: 'industrial' },
+  windfarm: { kind: 'windfarm', label: 'Wind turbines', w: 3, h: 3, floors: [1, 1], unitsPerFloor: 0, cost: 30_000_000, labor: 6000, materials: 900, perFloor: false, equipment: 100_000_000, crew: 30, zones: [], biz: 'windfarm', maintenance: 0.0008, category: 'industrial' },
+  waterworks: { kind: 'waterworks', label: 'Waterworks', w: 2, h: 2, floors: [1, 1], unitsPerFloor: 0, cost: 40_000_000, labor: 12000, materials: 2200, perFloor: false, equipment: 40_000_000, crew: 40, zones: [], biz: 'waterworks', maintenance: 0.001, category: 'industrial' },
+  substation: { kind: 'substation', label: 'Grid substation', w: 1, h: 1, floors: [1, 1], unitsPerFloor: 0, cost: 25_000_000, labor: 2500, materials: 300, perFloor: false, equipment: 45_000_000, crew: 20, zones: [], biz: '', maintenance: 0.0008, category: 'industrial' },
 };
 
 export function unitsFor(kind: BuildingKind, floors: number): number {
@@ -128,6 +136,11 @@ export const BUSINESSES: Record<BusinessKind, BizSpec> = {
   stadium: { kind: 'stadium', label: 'Stadium', jobs: [['host', 8], ['security', 6], ['helper', 6], ['supervisor', 2], ['manager', 1]], pub: true, dept: 'culture', building: 'stadium', startup: 0, sector: 'public', serves: 12000 },
   museum: { kind: 'museum', label: 'Museum', jobs: [['curator', 3], ['host', 4], ['security', 3], ['helper', 2], ['officeassist', 1]], pub: true, dept: 'culture', building: 'museum', startup: 0, sector: 'public', serves: 1500 },
   airport: { kind: 'airport', label: 'Regional airport', jobs: [['controller', 4], ['technician', 8], ['security', 12], ['host', 10], ['helper', 8], ['supervisor', 3], ['manager', 2]], pub: true, dept: 'transport', building: 'airport', startup: 0, sector: 'public', serves: 60000 },
+  firestation: { kind: 'firestation', label: 'Fire station', jobs: [['firefighter', 10], ['driver', 2], ['supervisor', 1], ['officeassist', 1]], pub: true, dept: 'safety', building: 'firestation', startup: 0, sector: 'public', serves: 15000 },
+  gasplant: { kind: 'gasplant', label: 'Gas power plant', jobs: [['plantop', 10], ['technician', 5], ['sitemgr', 1], ['manager', 1]], pub: true, dept: 'utilities', building: 'gasplant', startup: 0, sector: 'public' },
+  solarfarm: { kind: 'solarfarm', label: 'Solar farm', jobs: [['technician', 2], ['security', 2]], pub: true, dept: 'utilities', building: 'solarfarm', startup: 0, sector: 'public' },
+  windfarm: { kind: 'windfarm', label: 'Wind farm', jobs: [['technician', 3], ['security', 1]], pub: true, dept: 'utilities', building: 'windfarm', startup: 0, sector: 'public' },
+  waterworks: { kind: 'waterworks', label: 'Waterworks', jobs: [['plantop', 6], ['technician', 3], ['helper', 3], ['supervisor', 1]], pub: true, dept: 'utilities', building: 'waterworks', startup: 0, sector: 'public' },
 };
 
 export interface CropSpec {
@@ -198,12 +211,12 @@ export const ROAD_SPEED = [0, 30, 50, 80]; // km/h free-flow
 export const FOOD_NEED = { adult: 0.6, child: 0.4 };
 export const VEG_NEED = { adult: 0.35, child: 0.25 };
 export const MEAL_PRICE = 90; // restaurant meal, base
-/** Cooking gas, oil, spices, electricity and packaging bought in for each meal, base. */
-export const MEAL_SUPPLIES = 25;
+/** Cooking gas, oil, spices and packaging bought in for each meal, base (electricity is billed by the city). */
+export const MEAL_SUPPLIES = 21;
 /** Meals a restaurant worker can prepare and serve in a day. */
 export const MEALS_PER_STAFF = 30;
-/** Share of a local service's price spent on bought-in parts, cosmetics and fuel. */
-export const SERVICE_SUPPLY_SHARE = 0.2;
+/** Share of a local service's price spent on bought-in parts, cosmetics and fuel (electricity is billed separately). */
+export const SERVICE_SUPPLY_SHARE = 0.18;
 /** Gross rental yield at which investors buy finished homes (sale price = annual rent / yield). */
 export const HOUSING_YIELD = 0.04;
 export const MEAL_INPUT = { food: 0.00025, vegetables: 0.00015 }; // tonnes per meal (grain, pulses, oil; vegetables)
@@ -223,8 +236,8 @@ export const HERITAGE_FEE = { domestic: 40, foreign: 500 };
 export const HOTEL_ROOMS_PER_FLOOR = 8;
 export const ROOM_RATE = 2600; // per night, domestic guests; foreign guests pay more
 export const FOREIGN_RATE = 1.6;
-/** Linen, toiletries, laundry, utilities and booking commissions, as a share of room revenue (bought in). */
-export const HOTEL_SUPPLY_SHARE = 0.24;
+/** Linen, toiletries, laundry and booking commissions, as a share of room revenue (bought in; electricity is billed). */
+export const HOTEL_SUPPLY_SHARE = 0.2;
 /** What a visitor spends per day besides the room. */
 export const VISITOR_SPEND = {
   domestic: { meals: 2, goods: 260, services: 160, museum: 0.25, cinema: 0.08, heritage: 0.8 },
@@ -256,3 +269,41 @@ export const RATION_KG = 5;
 export const RATION_HANDLING = 1.5;
 /** Monthly storage and handling cost of government grain stocks, share of their value. */
 export const STORAGE_COST = 0.012;
+
+// ---------------------------------------------------------------------------------------- electricity and water (base values)
+/** Standard tariffs per kWh. Homes pay half the business rate: businesses cross-subsidise households. */
+export const POWER_TARIFF = { home: 4, business: 8 };
+/** Standard water tariff per m3. */
+export const WATER_TARIFF = 12;
+/** What the regional grid charges per kWh delivered to the town. */
+export const GRID_PRICE = 5;
+/** Gas burned per kWh generated locally. */
+export const GAS_FUEL = 6;
+/** Wells, hand pumps and water tankers where the mains do not reach: cost per m3, bought from outside. */
+export const WELL_WATER = 20;
+/** Generating plants: capacity (MW), share of it that can be counted on at the evening peak, average capacity factor. */
+export const PLANTS: Partial<Record<BuildingKind, { mw: number; peak: number; cf: number }>> = {
+  gasplant: { mw: 5, peak: 1, cf: 1 }, solarfarm: { mw: 1, peak: 0.15, cf: 0.2 }, windfarm: { mw: 2, peak: 0.3, cf: 0.28 },
+};
+/** Extra import capacity a substation adds to the town's connection to the regional grid (MW). */
+export const SUBSTATION_MW = 8;
+/** Treated water a fully staffed waterworks supplies (m3 a day), and the electricity it needs per m3. */
+export const WATERWORKS_M3 = 2500;
+export const PUMP_KWH = 0.6;
+/** Peak demand over average demand: evenings, when lights, fans and cooking overlap. */
+export const PEAK_FACTOR = 1.5;
+/** Electricity used at home per person and per household each day (kWh); water per person (m3). */
+export const HOME_KWH = { person: 0.55, household: 1 };
+export const HOME_WATER = 0.13;
+/** Electricity used per unit of output, billed as it is used (kWh). */
+export const USE_KWH = { crate: 5, foodTonne: 112.5, officeStaff: 15, meal: 0.5, service: 0.3, roomNight: 12 };
+/** Office running costs per member of staff a day besides electricity (connectivity, cloud services, supplies), base. */
+export const OFFICE_OVERHEAD = 130;
+/** Fixed daily electricity use of premises (kWh): lighting, refrigeration, projection, cooling. Public buildings are paid by the city. */
+export const BASE_KWH: Partial<Record<BuildingKind, number>> = {
+  shop: 30, grocery: 45, restaurant: 10, services: 6, office: 20, hotel: 25, cinema: 250, factory: 60, foodplant: 50, depot: 40, yard: 20,
+  townhall: 150, school: 60, college: 200, clinic: 80, hospital: 900, police: 60, firestation: 50, museum: 120, stadium: 150, airport: 1500,
+  park: 5, heritage: 10, waterworks: 40, gasplant: 30, substation: 0,
+};
+/** Street lighting per road tile a day (kWh). */
+export const STREETLIGHT_KWH = 0.3;

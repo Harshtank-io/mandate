@@ -5,19 +5,23 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { Game, type AwayReport, type Progress } from '../game/game';
 import { autoKey, deleteWorld, lastPlayedKey, listSaves, storageAvailable, type SaveMeta } from '../game/persist';
 import { startCloud } from '../net/auth';
-import { cloudConfigured, errText } from '../net/client';
+import { cloudConfigured, errText, within } from '../net/client';
 import { deleteCloudTown, type Claim } from '../net/saves';
 import { cloud, useCloud, type CloudTown } from '../net/store';
 import { CloudSync, fetchCloud, forgetLocal, keepMine, planOpen } from '../net/sync';
+import { visitTown, type WorldTown } from '../net/world';
 import { WorldView } from '../render/view';
 import { getPreset } from '../sim/presets';
 import type { NewWorldOptions } from '../sim/worldgen';
 import { AccountPanel, CloudDialog, CloudTownList, type Ask } from './account';
-import { Hud, type Bus } from './hud';
+import { Hud, type Bus, type VisitInfo } from './hud';
 import { NewGame } from './newgame';
 import { num } from './util';
+import { WorldScreen } from './world';
 
-type Screen = { k: 'menu' } | { k: 'new' } | { k: 'loading'; p: Progress } | { k: 'game' } | { k: 'error'; message: string };
+type Screen =
+  | { k: 'menu' } | { k: 'new' } | { k: 'loading'; p: Progress } | { k: 'game' } | { k: 'error'; message: string }
+  | { k: 'world'; focus?: string };
 
 const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 /** Gives the account a moment to connect before deciding which copy of a town to open. */
@@ -32,6 +36,8 @@ export function App() {
   const [catching, setCatching] = useState<Progress | null>(null);
   const [notice, setNotice] = useState('');
   const [ask, setAsk] = useState<Ask | null>(null);
+  /** The other player's town being visited, if the game on screen is a visit. */
+  const [visit, setVisit] = useState<{ town: WorldTown; info: VisitInfo } | null>(null);
   const busRef = useRef<Bus>({});
   const fileRef = useRef<HTMLInputElement>(null);
   const gameRef = useRef<Game | null>(null);
@@ -57,7 +63,8 @@ export function App() {
     setView(v);
     // opt-in handle for automated browser checks (?debug in the URL); not used by the game itself
     if (new URLSearchParams(location.search).has('debug')) (window as unknown as { __mandate?: unknown }).__mandate = { game, view: v };
-    const detach = game.attachLifecycle((r) => { setCatching(null); setReport(r); }, (p) => setCatching(p.done >= p.total ? null : p));
+    // a visitor coming back to the tab sees the town caught up, without a "while you were away" report meant for its mayor
+    const detach = game.attachLifecycle((r) => { setCatching(null); if (!game.visiting) setReport(r); }, (p) => setCatching(p.done >= p.total ? null : p));
     return () => { detach(); v.dispose(); setView(null); };
   }, [game, screen.k]);
 
@@ -90,12 +97,45 @@ export function App() {
     const g = gameRef.current, sync = syncRef.current;
     gameRef.current = null;
     syncRef.current = null;
-    if (g) await g.save('Autosave');
+    if (g) await g.save('Autosave'); // a visit saves nothing
     if (sync) await sync.stop();
     setGame(null);
+    setVisit(null);
     setReport(null);
     setBriefing(false);
     setCatching(null);
+  };
+
+  /** Leaves whatever is open (saving the player's own town) and shows the world map. */
+  const goWorld = async (focus?: string) => { await leave(); setScreen({ k: 'world', focus }); };
+
+  /** Downloads another player's town and opens it read-only. Nothing about the visit is saved. */
+  const visitOther = async (t: WorldTown) => {
+    await leave();
+    progress({ label: `Travelling to ${t.name}`, done: 0, total: 1 });
+    try {
+      const v = await within(visitTown(t), 90_000, 'The download');
+      const g = await Game.visit(v.state, progress);
+      gameRef.current = g;
+      syncRef.current = null;
+      setVisit({ town: t, info: { mayor: v.mayor, savedAt: v.savedAt, playing: v.playing } });
+      setReport(null);
+      setBriefing(false);
+      setGame(g);
+      setScreen({ k: 'game' });
+    } catch (e) {
+      setScreen({ k: 'world', focus: t.id });
+      setNotice(`Could not visit ${t.name}: ${errText(e)}`);
+    }
+  };
+
+  /** Plays one of the player's own towns picked on the world map: this device's copy if it has one, else the account's. */
+  const openMine = async (worldId: string) => {
+    const local = (await listSaves().catch(() => [] as SaveMeta[])).find((s) => s.worldId === worldId && s.kind === 'auto');
+    if (local) return open(local.key);
+    const t = cloud().towns.find((x) => x.worldId === worldId);
+    if (t) return openCloud(t);
+    setNotice('That town is not on this device, and your account’s list of towns has not loaded yet. Try again in a moment.');
   };
 
   const conflictAsk = (worldId: string, name: string, claim: Claim, act: { onCloud(): Promise<void> | void; onMine(): void }, local?: SaveMeta): Ask => ({
@@ -214,8 +254,10 @@ export function App() {
 
   return (
     <>
-      {screen.k === 'menu' && <Menu onNew={() => setScreen({ k: 'new' })} onOpen={(k) => void open(k)} onOpenCloud={(t) => void openCloud(t)} onImport={() => fileRef.current?.click()} />}
+      {screen.k === 'menu' && <Menu onNew={() => setScreen({ k: 'new' })} onOpen={(k) => void open(k)} onOpenCloud={(t) => void openCloud(t)} onImport={() => fileRef.current?.click()}
+        onWorld={() => setScreen({ k: 'world' })} />}
       {screen.k === 'new' && <NewGame onCreate={(o) => void create(o)} onBack={() => setScreen({ k: 'menu' })} />}
+      {screen.k === 'world' && <WorldScreen focus={screen.focus} onBack={() => setScreen({ k: 'menu' })} onVisit={(t) => void visitOther(t)} onOpenMine={(id) => void openMine(id)} />}
       {screen.k === 'loading' && <Loading p={screen.p} />}
       {screen.k === 'error' && (
         <main class="screen">
@@ -228,7 +270,8 @@ export function App() {
       )}
       {screen.k === 'game' && game && (
         <Hud game={game} view={view} bus={busRef.current} report={report} clearReport={() => setReport(null)} briefing={briefing} clearBriefing={() => setBriefing(false)}
-          catching={catching} onMenu={() => void menu()} onLoad={(k) => void open(k, { catchUp: false })} onExport={() => void exportWorld()} onImport={() => fileRef.current?.click()} />
+          catching={catching} onMenu={() => void menu()} onLoad={(k) => void open(k, { catchUp: false })} onExport={() => void exportWorld()} onImport={() => fileRef.current?.click()}
+          visit={visit?.info ?? null} onLeaveVisit={() => void goWorld(visit?.town.id)} onWorld={cloudConfigured ? () => void goWorld() : undefined} />
       )}
       <input ref={fileRef} type="file" accept=".mandate,.json,.gz,application/gzip,application/json" class="sr-only" tabIndex={-1} aria-hidden="true" onChange={(e) => void onFile(e)} />
       {notice && (
@@ -256,7 +299,7 @@ function Loading({ p }: { p: Progress }) {
   );
 }
 
-function Menu({ onNew, onOpen, onOpenCloud, onImport }: { onNew(): void; onOpen(key: string): void; onOpenCloud(t: CloudTown): void; onImport(): void }) {
+function Menu({ onNew, onOpen, onOpenCloud, onImport, onWorld }: { onNew(): void; onOpen(key: string): void; onOpenCloud(t: CloudTown): void; onImport(): void; onWorld(): void }) {
   const c = useCloud();
   const [saves, setSaves] = useState<SaveMeta[] | null>(null);
   const [confirm, setConfirm] = useState<string | null>(null);
@@ -283,16 +326,19 @@ function Menu({ onNew, onOpen, onOpenCloud, onImport }: { onNew(): void; onOpen(
   };
   return (
     <main class="screen">
-      <div class="screen-card">
+      <div class="screen-card menu">
         <h1>Mandate</h1>
         <p class="lead">A living place, and you are responsible for running it.</p>
         <p class="muted">Govern a town modelled on a real region. Farms plant and harvest with the seasons, businesses open and fail, families move in and out, and every decision works through the economy with a delay. The world keeps going while you are away.</p>
         {!ok && <p class="bad">This browser does not allow storage, so the world cannot be saved.</p>}
         <div class="buttons wrap">
           {lastWorld && <button class="primary" onClick={() => onOpen(lastWorld.key)}>Continue {lastWorld.name}</button>}
-          <button class={lastWorld ? '' : 'primary'} onClick={onNew}>New world</button>
+          {/* only the main action once the saves have loaded, so it does not flash before "Continue" appears */}
+          <button class={saves !== null && !lastWorld ? 'primary' : ''} onClick={onNew}>New world</button>
+          {cloudConfigured && <button onClick={onWorld}>World map</button>}
           <button class="ghost" onClick={onImport}>Import a world file</button>
         </div>
+        {cloudConfigured && <p class="muted small">The world map shows every player's town. Visit any of them to see how its mayor is doing.</p>}
         {worlds.size > 0 && (
           <section>
             <h2>Your worlds</h2>

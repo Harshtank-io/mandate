@@ -2,7 +2,17 @@
 // generation and by the migration of worlds saved before these systems existed.
 
 import type { Preset } from './presets';
-import type { AirLedger, AirState, FoodProgrammes, LeisureState, TourismLedger, TourismState, TradeState, VenueState } from './types';
+import type { AirLedger, AirState, FoodProgrammes, LeisureState, TourismLedger, TourismState, TradeState, UtilityLedger, UtilityState, VenueState } from './types';
+
+export const emptyUtilityLedger = (): UtilityLedger => ({ kwh: 0, short: 0, grid: 0, gas: 0, solar: 0, wind: 0, water: 0, waterShort: 0, bills: 0, cost: 0, blackouts: 0, outages: 0 });
+
+/** Electricity and water before the first day is simulated. The regional grid line is sized by the caller. */
+export function initUtilities(gridBase: number): UtilityState {
+  return {
+    gridBase, outage: 0, unit: 0, peak: 0, cap: 0, waterUse: 0, waterCap: 0, served: 1, waterServed: 1, wind: 0.28, sun: 0.2,
+    m: emptyUtilityLedger(), last: emptyUtilityLedger(),
+  };
+}
 
 export const emptyTourismLedger = (): TourismLedger => ({ domestic: 0, foreign: 0, dayTrips: 0, nights: 0, turned: 0, byAir: 0, spend: 0, rooms: 0 });
 export const emptyAirLedger = (): AirLedger => ({ pax: 0, residents: 0, tourists: 0, business: 0, flights: 0, seats: 0, fees: 0 });

@@ -13,6 +13,8 @@ export type ProgressFn = (p: Progress) => void;
 export interface AwayReport extends AwaySummary { realMs: number; cappedDays?: number }
 
 const AUTOSAVE_MS = 60_000;
+/** The most simulated time a visit catches up when it opens a town (its mayor's own game catches up the rest). */
+const VISIT_CATCH_UP_DAYS = 365;
 const BACKUP_MS = 10 * 60_000;
 const MAX_FRAME_MINUTES = 3 * MIN_PER_DAY;
 
@@ -41,6 +43,11 @@ export class Game {
   busy = false;
   /** Set when another device has taken this town over: time stops here and nothing more is saved. */
   locked = false;
+  /**
+   * A visit to another player's town: time runs here for the visitor, but nothing is ever saved on this device or
+   * uploaded, so the visit cannot change the town or leave a copy of it behind.
+   */
+  readonly visiting: boolean;
   /** Called after every successful save to this device (used by cloud sync). */
   onSaved?: () => void;
   version = 0;
@@ -51,7 +58,10 @@ export class Game {
   private lastBackup = Date.now();
   private hiddenAt = 0;
 
-  constructor(sim: Simulation) { this.sim = sim; }
+  constructor(sim: Simulation, visiting = false) {
+    this.sim = sim;
+    this.visiting = visiting;
+  }
 
   get state(): WorldState { return this.sim.state; }
 
@@ -91,13 +101,24 @@ export class Game {
     return { game: g, report };
   }
 
+  /**
+   * Opens another player's town to look around in. The time since its mayor last saved it is caught up as their own
+   * game would, but by at most `VISIT_CATCH_UP_DAYS`, so a town left alone for months still opens quickly.
+   */
+  static async visit(state: WorldState, onProgress?: ProgressFn): Promise<Game> {
+    const g = new Game(Simulation.fromState(state), true);
+    await g.catchUp(onProgress, { label: `Catching up on ${state.meta.name} since its mayor last saved it`, maxDays: VISIT_CATCH_UP_DAYS });
+    return g;
+  }
+
   /** Simulates the real time elapsed since the state was last saved, at the world's pace (1x). */
-  async catchUp(onProgress?: ProgressFn): Promise<AwayReport | null> {
+  async catchUp(onProgress?: ProgressFn, o: { label?: string; maxDays?: number } = {}): Promise<AwayReport | null> {
     const meta = this.state.meta;
     const now = Date.now();
     const realMs = Math.max(0, now - meta.lastReal);
     let minutes = (realMs / 1000) * meta.pace;
-    const cap = meta.offlineCapDays > 0 ? meta.offlineCapDays * MIN_PER_DAY : Infinity;
+    const capDays = Math.min(meta.offlineCapDays > 0 ? meta.offlineCapDays : Infinity, o.maxDays ?? Infinity);
+    const cap = Number.isFinite(capDays) ? capDays * MIN_PER_DAY : Infinity;
     const capped = minutes > cap;
     if (capped) minutes = cap;
     meta.lastReal = now;
@@ -105,7 +126,7 @@ export class Game {
     const before = snapshot(this.sim.sim);
     this.busy = true;
     try {
-      await runChunked(this.sim, this.state.minute + minutes, 'Catching up on what happened while you were away', onProgress);
+      await runChunked(this.sim, this.state.minute + minutes, o.label ?? 'Catching up on what happened while you were away', onProgress);
     } finally {
       this.busy = false;
     }
@@ -113,7 +134,7 @@ export class Game {
     this.version++;
     if (minutes < MIN_PER_DAY / 4) return null;
     const report: AwayReport = { ...summarize(this.sim.sim, before), realMs };
-    if (capped) report.cappedDays = meta.offlineCapDays;
+    if (capped) report.cappedDays = capDays;
     return report;
   }
 
@@ -131,6 +152,7 @@ export class Game {
       if (minutes > 0) { this.sim.advanceTo(this.state.minute + minutes); this.version++; }
     }
     meta.playedMs += dt;
+    if (this.visiting) return;
     const now = Date.now();
     if (now - this.lastAutosave > AUTOSAVE_MS) void this.save('Autosave');
     if (now - this.lastBackup > BACKUP_MS) {
@@ -140,7 +162,7 @@ export class Game {
   }
 
   async save(label = 'Autosave'): Promise<SaveMeta | null> {
-    if (this.saving || this.locked) return null;
+    if (this.saving || this.locked || this.visiting) return null;
     this.saving = true;
     this.lastAutosave = Date.now();
     this.state.meta.lastReal = Date.now();
@@ -159,12 +181,14 @@ export class Game {
   }
 
   async saveAs(label: string): Promise<SaveMeta> {
+    if (this.visiting) throw new Error('You are visiting this town; only its mayor can save it.');
     if (this.locked) throw new Error('This town is open on another device.');
     this.state.meta.lastReal = Date.now();
     return putSave(this.state, 'manual', label || 'Manual save');
   }
 
   async exportFile(): Promise<{ blob: Blob; filename: string }> {
+    if (this.visiting) throw new Error('You are visiting this town; only its mayor can export it.');
     this.state.meta.lastReal = Date.now();
     const { blob, enc } = await encode(this.state);
     const safe = this.state.meta.name.replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-|-$/g, '') || 'world';

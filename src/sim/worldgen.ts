@@ -5,7 +5,7 @@
 import { dateOf, dayIndex, MIN_PER_DAY } from './calendar';
 import { emptyAcc, emptyGovLedger, emptyHhLedger, idx, inMap, Sim, W } from './core';
 import { businessName, firstName, lastName } from './names';
-import { emptyVenue, initAir, initFood, initLeisure, initTourism, initTrade } from './init';
+import { emptyVenue, initAir, initFood, initLeisure, initTourism, initTrade, initUtilities } from './init';
 import { STATE_VERSION } from './migrate';
 import { getCondition, getPreset, moneyScale, type Preset, type StartCondition } from './presets';
 import { type Rng, seedState } from './rng';
@@ -102,10 +102,12 @@ export function skeleton(o: NewWorldOptions): WorldState {
     housing: { rentIndex: 1, vacancy: cond.vacancy, demandGap: 0 },
     traffic: { volume: new Array(N).fill(0), avgCommute: 0, congestion: 0, lastRun: -999, truckLoad: new Array(N).fill(0), tileTime: new Array(N).fill(0) },
     env: { pollution: new Array(32 * 32).fill(0), co2: 0, water: 0.8 },
-    services: { health: 0.6, education: 0.6, safety: 0.6, crime: 0.03, healthCov: new Array(256).fill(0), schoolCov: new Array(256).fill(0), policeCov: new Array(256).fill(0) },
+    services: { health: 0.6, education: 0.6, safety: 0.6, crime: 0.03, healthCov: new Array(256).fill(0), schoolCov: new Array(256).fill(0), policeCov: new Array(256).fill(0), fireCov: new Array(256).fill(0) },
     stats: { months: [], acc: emptyAcc(), cumHarvest: {} },
     events: [], news: [], milestones: {},
     leisure: initLeisure(), tourism: initTourism(preset), air: initAir(), trade: initTrade(preset), pds: initFood(),
+    // the regional grid line is sized to the town's demand on the first simulated day
+    util: initUtilities(0),
   };
 }
 
@@ -417,6 +419,15 @@ class Generator {
       const a = (2 * Math.PI * k) / this.c.police + 3.4;
       this.place('police', 'police', cx + Math.cos(a) * R * 0.3, cy + Math.sin(a) * R * 0.3, okUrban, 18);
     }
+    const fire = this.c.population >= 7000 ? 2 : 1;
+    for (let k = 0; k < fire; k++) {
+      const a = (2 * Math.PI * k) / fire + 5.1;
+      this.place('firestation', 'firestation', cx + Math.cos(a) * R * 0.35, cy + Math.sin(a) * R * 0.35, okUrban, 18);
+    }
+    // the waterworks draws from the river upstream of the town; mains follow the streets
+    const wy = clamp(Math.round(cy - R * 0.3), 4, W - 6);
+    const riverside = (i: number) => Math.abs((i % W) - this.riverX[(i / W) | 0]) <= 5 && m.zone[i] !== Zone.Industrial;
+    this.place('waterworks', 'waterworks', this.riverX[wy] + 3, wy, riverside, 30);
   }
 
   placeIndustry(): void {
@@ -1202,6 +1213,8 @@ class Generator {
     need.agriculture += (600 * this.farms.length + 800 * canals) * sim.scale;
     need.environment += (25_000 + 10_000 * s.buildings.filter((b) => b.kind === 'park').length + 15_000 * s.businesses.filter((b) => ['factory', 'materials', 'foodplant'].includes(b.kind)).length) * sim.scale;
     need.culture += (15_000 + 60_000 * s.buildings.filter((b) => b.kind === 'heritage').length + 90_000 * s.businesses.filter((b) => b.kind === 'museum' || b.kind === 'stadium').length) * sim.scale;
+    need.safety += 60_000 * s.businesses.filter((b) => b.kind === 'firestation').length * sim.scale;
+    need.utilities += 90_000 * s.businesses.filter((b) => b.kind === 'waterworks').length * sim.scale;
     // departments start at full service; the player adjusts levels from there
     for (const d of DEPTS) {
       s.gov.level[d] = 1;

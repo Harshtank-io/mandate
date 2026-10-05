@@ -5,7 +5,7 @@ import { formatDay, spanText } from './calendar';
 import { hhIncome } from './econ';
 import { idx, sumExp, sumRev, W, type Sim } from './core';
 import { BUILDINGS, BUSINESSES, CROPS, EDU_LABEL, FIELD_LABEL, GOOD_SPECS, ROAD_CAPACITY, ROAD_SPEED, ROLES, cropTempFactor } from './tables';
-import { fmtMoney, isRoadwork, OUTSIDE_CONTRACTOR } from './systems/construction';
+import { fmtMoney, isRoadwork, OUTSIDE_CONTRACTOR, projectLabel } from './systems/construction';
 import { DEPT_LABELS } from './systems/government';
 import { envAt } from './systems/environment';
 import { cellOf, SAT_WEIGHTS, satisfactionParts, type SatParts } from './systems/services';
@@ -300,7 +300,7 @@ export function inspectCitizen(sim: Sim, c: Citizen): Card {
 
 const SAT_LABEL: Record<keyof SatParts, string> = {
   employment: 'Work', income: 'Income', housing: 'Housing', commute: 'Commute', health: 'Health', safety: 'Safety', environment: 'Environment',
-  food: 'Food', taxes: 'Taxes', services: 'Public services', leisure: 'Leisure',
+  food: 'Food', taxes: 'Taxes', services: 'Public services', leisure: 'Leisure', utilities: 'Water & power',
 };
 
 export function satBars(p: SatParts): { label: string; value: number; tone?: 'good' | 'bad' }[] {
@@ -355,7 +355,7 @@ export function inspectProject(sim: Sim, p: Project): Card {
   const delays = Object.entries(p.issues).sort((a, b) => b[1] - a[1]);
   if (delays.length) sections.push({ title: `Delays (${p.delayDays} days)`, rows: delays.map(([k, v]) => [k, `${v} days`]) });
   if (p.reason) sections.push({ title: 'Why', lines: [p.reason] });
-  const kind = isRoadwork(p.kind) ? p.kind : BUILDINGS[p.kind as keyof typeof BUILDINGS].label;
+  const kind = isRoadwork(p.kind) ? p.kind : projectLabel(p.kind);
   const [x, y] = [p.x + p.w / 2, p.y + p.h / 2];
   const focus: [number, number] = p.tiles.length > 1 && isRoadwork(p.kind) ? [(p.tiles[Math.floor(p.tiles.length / 2)] % W) + 0.5, ((p.tiles[Math.floor(p.tiles.length / 2)] / W) | 0) + 0.5] : [x, y];
   return { ref: { k: 'project', id: p.id }, title: p.name, subtitle: `${p.gov ? 'Public project' : 'Private development'} · ${kind}`, rows, sections, focus };
@@ -369,13 +369,15 @@ export const REV_LABELS: Record<RevCat, string> = {
   incomeTax: 'Income tax', corporateTax: 'Corporate tax', smallBizTax: 'Small business tax', salesTax: 'Sales tax', foodTax: 'Sales tax on food', propertyTax: 'Property tax',
   fuelTax: 'Fuel tax', importTariff: 'Import tariffs', exportTax: 'Export tax', agriTax: 'Agricultural tax', luxuryTax: 'Luxury tax', licenseFees: 'Licence fees', rents: 'Public housing rents',
   fares: 'Bus fares', premiums: 'Crop insurance premiums', grants: 'Grants from higher government', tourismTax: 'Hotel room tax', entertainmentTax: 'Entertainment tax',
-  airportFees: 'Airport fees', tickets: 'Museum, stadium and heritage tickets', grainSales: 'Sales of surplus grain', other: 'Other (water charges, estates)',
+  airportFees: 'Airport fees', tickets: 'Museum, stadium and heritage tickets', grainSales: 'Sales of surplus grain', utilityBills: 'Electricity & water bills',
+  other: 'Other (irrigation charges, estates)',
 };
 export const EXP_LABELS: Record<ExpCat, string> = {
-  admin: 'Administration', health: 'Health', education: 'Education', safety: 'Police & safety', transport: 'Transport & roads', agriculture: 'Agriculture', environment: 'Environment',
-  culture: 'Culture, sport & heritage', unemployment: 'Unemployment benefits', pensions: 'Pensions', fertilizer: 'Fertilizer subsidy', insurance: 'Crop insurance payouts',
-  capital: 'Construction projects', interest: 'Interest on debt', land: 'Land acquisition', procurement: 'Grain procurement & storage', rations: 'Ration shops',
-  transfers: 'Cash support for poor families', exportSupport: 'Export incentives', promotion: 'Tourism promotion & festivals',
+  admin: 'Administration', health: 'Health', education: 'Education', safety: 'Police, fire & safety', transport: 'Transport & roads', agriculture: 'Agriculture', environment: 'Environment',
+  culture: 'Culture, sport & heritage', utilities: 'Water & power (staff, upkeep)', unemployment: 'Unemployment benefits', pensions: 'Pensions', fertilizer: 'Fertilizer subsidy',
+  insurance: 'Crop insurance payouts', capital: 'Construction projects', interest: 'Interest on debt', land: 'Land acquisition', procurement: 'Grain procurement & storage',
+  rations: 'Ration shops', transfers: 'Cash support for poor families', exportSupport: 'Export incentives', promotion: 'Tourism promotion & festivals',
+  energy: 'Electricity from the grid & gas',
 };
 
 function lastMonth(sim: Sim) { const m = sim.s.stats.months; return m[m.length - 1]; }

@@ -13,7 +13,7 @@ export interface Look {
   roofColor: number;
   roofH: number;
   floors: number; // window rows
-  extra?: 'chimney' | 'silos' | 'tower' | 'sign' | 'marquee' | 'stands' | 'columns' | 'fort' | 'runway';
+  extra?: 'chimney' | 'silos' | 'tower' | 'sign' | 'marquee' | 'stands' | 'columns' | 'fort' | 'runway' | 'firehall' | 'stacks' | 'panels' | 'turbines' | 'tanks' | 'yard';
   /** The footprint was turned a quarter (it is deeper than it is wide): the usual look, rotated. */
   turned?: boolean;
 }
@@ -60,6 +60,13 @@ export function lookFor(kind: BuildingKind, w: number, h: number, floors: number
     case 'heritage': return { w: w - 0.5, d: h - 0.5, h: 0.3, wall: pick([0xb8a07a, 0xa89272, 0xc2ab86], r), roof: 'flat', roofColor: 0x9a845f, roofH: 0.03, floors: 1, extra: 'fort' };
     // the look is the terminal; the view lays out the runway, taxiway, apron and tower around it
     case 'airport': return { w: Math.min(4.2, w - 0.3), d: 0.72, h: 0.32, wall: 0xdfe6ea, roof: 'flat', roofColor: 0x9aa6ae, roofH: 0.035, floors: 2, extra: 'runway' };
+    case 'firestation': return { w: w - 0.3, d: 0.7, h: FLOOR * 2, wall: 0xc4473c, roof: 'flat', roofColor: 0x7d2c26, roofH: 0.04, floors: 2, extra: 'firehall' };
+    case 'gasplant': return { w: w - 0.9, d: h - 0.6, h: 0.42, wall: 0xa9aeb2, roof: 'flat', roofColor: 0x6d7378, roofH: 0.04, floors: 1, extra: 'stacks' };
+    case 'waterworks': return { w: 0.8, d: 0.7, h: 0.26, wall: 0xc9d2d4, roof: 'flat', roofColor: 0x6f8a94, roofH: 0.03, floors: 1, extra: 'tanks' };
+    // panels, turbines and switchgear are laid out by the view; the look is the control building a click hits
+    case 'solarfarm': return { w: 0.42, d: 0.3, h: 0.14, wall: 0xd9dcd6, roof: 'flat', roofColor: 0x8c9196, roofH: 0.02, floors: 1, extra: 'panels' };
+    case 'windfarm': return { w: 0.36, d: 0.28, h: 0.14, wall: 0xdfe2e4, roof: 'flat', roofColor: 0x9aa0a5, roofH: 0.02, floors: 1, extra: 'turbines' };
+    case 'substation': return { w: 0.34, d: 0.26, h: 0.14, wall: 0xb8bcbf, roof: 'flat', roofColor: 0x7a7f84, roofH: 0.02, floors: 1, extra: 'yard' };
   }
 }
 

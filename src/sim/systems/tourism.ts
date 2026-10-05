@@ -7,8 +7,9 @@ import { emptyTourismLedger } from '../init';
 import { goodsRetail, mealPrice, servicePrice } from '../econ';
 import {
   BUSINESSES, DAY_TRIP_SHARE, FESTIVAL_BOOST, FOREIGN_RATE, HERITAGE_FEE, HOTEL_ROOMS_PER_FLOOR, HOTEL_SUPPLY_SHARE,
-  PROMOTION_COST, PROMOTION_REACH, ROOM_RATE, STAY_NIGHTS, VISITOR_BASE, VISITOR_SPEND,
+  PROMOTION_COST, PROMOTION_REACH, ROOM_RATE, STAY_NIGHTS, USE_KWH, VISITOR_BASE, VISITOR_SPEND,
 } from '../tables';
+import { powerBill } from './utilities';
 import type { Business, HotelState } from '../types';
 import { boardVisitors, connectivity, seatsForVisitors } from './aviation';
 import { purchase, serveMeals, serveServices, visitorStores } from './households';
@@ -159,7 +160,7 @@ export function tourismDaily(sim: Sim): void {
     const supplies = value * HOTEL_SUPPLY_SHARE;
     sim.pay(b, s.ext, supplies);
     b.m.revenue += value;
-    b.m.cogs += supplies;
+    b.m.cogs += supplies + powerBill(sim, b, occ * USE_KWH.roomNight);
     b.m.sales += occ;
     h.nights += occ;
     h.guests += (oD + oF) * housed * share;

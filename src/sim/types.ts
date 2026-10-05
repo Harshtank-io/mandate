@@ -19,17 +19,20 @@ export type BuildingKind =
   | 'factory' | 'foodplant' | 'materials' | 'depot' | 'yard'
   | 'farmhouse'
   | 'townhall' | 'school' | 'college' | 'clinic' | 'hospital' | 'police' | 'park'
-  | 'stadium' | 'museum' | 'heritage' | 'airport';
+  | 'stadium' | 'museum' | 'heritage' | 'airport'
+  | 'firestation' | 'gasplant' | 'solarfarm' | 'windfarm' | 'waterworks' | 'substation';
 
 export type BusinessKind =
   | 'farm' | 'grocery' | 'shop' | 'restaurant' | 'services' | 'office' | 'factory' | 'foodplant' | 'materials'
   | 'logistics' | 'construction' | 'realestate' | 'hotel' | 'cinema'
-  | 'school' | 'college' | 'clinic' | 'hospital' | 'police' | 'townhall' | 'stadium' | 'museum' | 'airport';
+  | 'school' | 'college' | 'clinic' | 'hospital' | 'police' | 'townhall' | 'stadium' | 'museum' | 'airport'
+  | 'firestation' | 'gasplant' | 'solarfarm' | 'windfarm' | 'waterworks';
 
 export type RoleId =
   | 'farmhand' | 'laborer' | 'helper' | 'operator' | 'driver' | 'clerk' | 'cook' | 'officeassist'
   | 'officer' | 'supervisor' | 'support' | 'technician' | 'nurse' | 'engineer' | 'analyst' | 'manager'
-  | 'teacher' | 'lecturer' | 'doctor' | 'sitemgr' | 'host' | 'security' | 'curator' | 'controller';
+  | 'teacher' | 'lecturer' | 'doctor' | 'sitemgr' | 'host' | 'security' | 'curator' | 'controller'
+  | 'firefighter' | 'plantop';
 
 export type Field = 'gen' | 'eng' | 'med' | 'biz' | 'trade';
 
@@ -70,6 +73,7 @@ export interface Citizen {
 export interface HhLedger {
   wages: number; benefits: number; dividends: number; rent: number; food: number; goods: number;
   services: number; leisure: number; transport: number; taxes: number; other: number;
+  utilities: number; // electricity and water bills, wells and water tankers
 }
 
 export interface Household {
@@ -109,6 +113,9 @@ export interface Building {
   access: number; // road tile index giving access
   style: number; // visual variation seed
   name: string;
+  pw?: number; // share of its electricity demand met yesterday (0..1, missing = 1)
+  wt?: number; // share of its water demand met by the mains yesterday (0..1, missing = 1)
+  fire?: number; // days of flames and smoke left after a fire (missing = none)
 }
 
 export interface Job {
@@ -208,7 +215,7 @@ export interface Business {
   venue?: VenueState;
 }
 
-export type ProjectKind = BuildingKind | 'road' | 'avenue' | 'upgrade' | 'canal';
+export type ProjectKind = BuildingKind | 'road' | 'avenue' | 'upgrade' | 'canal' | 'demolish';
 export type ProjectPhase = 'planning' | 'assessment' | 'approval' | 'land' | 'funding' | 'construction' | 'staffing' | 'done' | 'cancelled';
 
 export interface Project {
@@ -312,6 +319,8 @@ export interface TaxSettings {
   tourism: number; // hotel room tax, share of the room rate
   entertainment: number; // tax on cinema and stadium tickets
   passengerFee: number; // airport fee per departing passenger (money)
+  power: number; // electricity tariff as a multiple of the standard tariff (homes pay half the business rate)
+  water: number; // water tariff as a multiple of the standard tariff
 }
 
 export interface Policies {
@@ -335,17 +344,17 @@ export interface Policies {
   festival: number; // 0 none, 1 local festival, 2 grand festival (once a year)
 }
 
-export type Dept = 'admin' | 'health' | 'education' | 'safety' | 'transport' | 'agriculture' | 'environment' | 'culture';
-export const DEPTS: Dept[] = ['admin', 'health', 'education', 'safety', 'transport', 'agriculture', 'environment', 'culture'];
+export type Dept = 'admin' | 'health' | 'education' | 'safety' | 'transport' | 'agriculture' | 'environment' | 'culture' | 'utilities';
+export const DEPTS: Dept[] = ['admin', 'health', 'education', 'safety', 'transport', 'agriculture', 'environment', 'culture', 'utilities'];
 
 export type RevCat =
   | 'incomeTax' | 'corporateTax' | 'smallBizTax' | 'salesTax' | 'foodTax' | 'propertyTax' | 'fuelTax'
   | 'importTariff' | 'exportTax' | 'agriTax' | 'luxuryTax' | 'licenseFees' | 'rents' | 'fares' | 'premiums' | 'grants'
-  | 'tourismTax' | 'entertainmentTax' | 'airportFees' | 'tickets' | 'grainSales' | 'other';
+  | 'tourismTax' | 'entertainmentTax' | 'airportFees' | 'tickets' | 'grainSales' | 'utilityBills' | 'other';
 export type ExpCat =
-  | 'admin' | 'health' | 'education' | 'safety' | 'transport' | 'agriculture' | 'environment' | 'culture'
+  | 'admin' | 'health' | 'education' | 'safety' | 'transport' | 'agriculture' | 'environment' | 'culture' | 'utilities'
   | 'unemployment' | 'pensions' | 'fertilizer' | 'insurance' | 'capital' | 'interest' | 'land'
-  | 'procurement' | 'rations' | 'transfers' | 'exportSupport' | 'promotion';
+  | 'procurement' | 'rations' | 'transfers' | 'exportSupport' | 'promotion' | 'energy';
 
 export interface GovLedger { rev: Record<RevCat, number>; exp: Record<ExpCat, number> }
 
@@ -395,6 +404,37 @@ export interface MonthStats {
   passengers: number; flights: number;
   tradeBalance: number; fx: number;
   procured: number; grainStock: number; rationed: number;
+  // utilities and fire service
+  powerPeak: number; powerCap: number; // MW: peak demand and firm supply on the last day of the month
+  powerServed: number; waterServed: number; // share of demand met over the month
+  waterUse: number; waterCap: number; // m3 a day
+  blackouts: number; // days with rolling blackouts somewhere in town
+  fires: number; burned: number; // fires last month, buildings lost to them
+  fireCoverage: number;
+}
+
+/** Electricity and water, month to date or last month. */
+export interface UtilityLedger {
+  kwh: number; // electricity used
+  short: number; // electricity wanted but not supplied
+  grid: number; gas: number; solar: number; wind: number; // where the electricity came from (kWh)
+  water: number; waterShort: number; // m3 supplied by the mains / wanted but not supplied
+  bills: number; // billed to residents and businesses
+  cost: number; // paid for grid imports and gas
+  blackouts: number; // days with rolling blackouts somewhere in town
+  outages: number; // days the regional grid was down
+}
+
+export interface UtilityState {
+  gridBase: number; // MW the regional grid line can deliver, before substations (grows with regional investment)
+  outage: number; // days of regional grid outage remaining
+  unit: number; // blended cost of a kWh bought today (grid and gas)
+  peak: number; cap: number; // MW: today's peak demand and firm supply
+  waterUse: number; waterCap: number; // m3 a day today
+  served: number; waterServed: number; // share of today's demand met, town-wide
+  wind: number; sun: number; // today's capacity factors
+  m: UtilityLedger; last: UtilityLedger;
+  retrofit?: boolean; // saved before utilities were simulated: give the town the waterworks and fire station it had
 }
 
 /** Visitors to the city, month to date or last month. */
@@ -494,6 +534,7 @@ export interface StatsAcc {
   harvestLoss: Record<string, number>; // tonnes lost by cause
   fuelLitres: number; industryCO2: number;
   foodUnmet: number; foodWanted: number; // kg this month
+  fires: number; burned: number; // fires this month and buildings destroyed by them
 }
 
 export interface SimEvent {
@@ -568,7 +609,7 @@ export interface WorldState {
   housing: { rentIndex: number; vacancy: number; demandGap: number };
   traffic: { volume: number[]; avgCommute: number; congestion: number; lastRun: number; truckLoad: number[]; tileTime: number[] };
   env: { pollution: number[]; co2: number; water: number };
-  services: { health: number; education: number; safety: number; crime: number; healthCov: number[]; schoolCov: number[]; policeCov: number[] };
+  services: { health: number; education: number; safety: number; crime: number; healthCov: number[]; schoolCov: number[]; policeCov: number[]; fireCov: number[] };
   stats: { months: MonthStats[]; acc: StatsAcc; cumHarvest: Record<string, number> };
   events: SimEvent[];
   news: NewsItem[];
@@ -578,4 +619,5 @@ export interface WorldState {
   air: AirState;
   trade: TradeState;
   pds: FoodProgrammes;
+  util: UtilityState;
 }

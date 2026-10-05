@@ -32,7 +32,7 @@ export function basketCost(sim: Sim): number {
 }
 
 export function statsMonthly(sim: Sim): void {
-  const s = sim.s, acc = s.stats.acc, g = s.gov;
+  const s = sim.s, acc = s.stats.acc, g = s.gov, u = s.util;
   let children = 0, students = 0, working = 0, unemployed = 0, retired = 0, wageSum = 0, wageN = 0, healthSum = 0, satSum = 0, adults = 0;
   let kids = 0, enrolled = 0, lit = 0, adults15 = 0, tert = 0, adults25 = 0, pollution = 0, homed = 0;
   for (const c of s.citizens) {
@@ -122,6 +122,12 @@ export function statsMonthly(sim: Sim): void {
     tradeBalance: exportsV - importsV, fx: s.trade.fx,
     // the food programmes close their month before the statistics are taken (see MONTHLY), so read last month's figures
     procured: s.pds.lastProcured, grainStock: s.pds.stock, rationed: s.pds.lastRationed,
+    // utilities close their month after the statistics, so this is the month that just ended
+    powerPeak: u.peak, powerCap: u.cap,
+    powerServed: u.m.kwh + u.m.short > 0 ? u.m.kwh / (u.m.kwh + u.m.short) : 1,
+    waterServed: u.m.water + u.m.waterShort > 0 ? u.m.water / (u.m.water + u.m.waterShort) : 1,
+    waterUse: u.waterUse, waterCap: u.waterCap, blackouts: u.m.blackouts,
+    fires: acc.fires, burned: acc.burned, fireCoverage: cov(s.services.fireCov),
   };
   months.push(st);
   if (months.length > 600) months.splice(1, months.length - 600);

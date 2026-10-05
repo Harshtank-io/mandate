@@ -5,7 +5,7 @@
 import { idx, W, type Account, type Sim } from '../core';
 import { casualWage } from '../econ';
 import { BASE_RENT, BUILDINGS, BUSINESSES, HA_PER_TILE, HOUSING_YIELD, ROADWORKS, unitsFor } from '../tables';
-import { RoadClass, Terrain, type Building, type BuildingKind, type Business, type BusinessKind, type Project, type ProjectKind, type ProjectPhase } from '../types';
+import { RoadClass, Terrain, Zone, type Building, type BuildingKind, type Business, type BusinessKind, type Project, type ProjectKind, type ProjectPhase } from '../types';
 import { businessName } from '../names';
 import { settleFarmFamily } from './population';
 import { refreshTileTimes } from './transport';
@@ -33,6 +33,21 @@ export interface Estimate {
 const ROAD_KINDS = ['road', 'avenue', 'upgrade', 'canal'];
 const BIG_WORKS = new Set<string>(['airport', 'stadium']);
 export const isRoadwork = (k: ProjectKind) => ROAD_KINDS.includes(k);
+/** Demolition with excavators and breakers takes about an eighth of the work it took to build, and no materials. */
+const DEMOLISH_SHARE = 0.12;
+
+/** Largest crew that can work on a project's site. */
+function maxCrewOf(p: { kind: ProjectKind; tiles: number[]; labor: number }): number {
+  if (p.kind === 'demolish') return Math.min(60, 12 + Math.floor(p.labor / 150));
+  if (isRoadwork(p.kind)) return Math.min(60, ROADWORKS[p.kind as keyof typeof ROADWORKS].crew + p.tiles.length);
+  return BUILDINGS[p.kind as BuildingKind].crew;
+}
+
+/** Display name of a project's kind. */
+export function projectLabel(k: ProjectKind): string {
+  if (k === 'demolish') return 'Demolition';
+  return isRoadwork(k) ? ROADWORKS[k as keyof typeof ROADWORKS].label : BUILDINGS[k as BuildingKind].label;
+}
 
 export function laborRate(sim: Sim): number { return (sim.roleWage('laborer') / 26) * 1.35; }
 
@@ -42,10 +57,11 @@ function phaseDays(sim: Sim, p: { kind: ProjectKind; gov: boolean; tiles: number
   const env = sim.s.gov.policies.environmentalRegulation;
   const reg = sim.s.gov.policies.businessRegulation;
   const big = isRoadwork(p.kind) ? p.tiles.length >= 6 : ['hospital', 'college', 'factory', 'materials', 'foodplant'].includes(p.kind);
+  const demolish = p.kind === 'demolish';
   switch (phase) {
-    case 'planning': return p.gov ? (isRoadwork(p.kind) ? 10 : 25) : 12;
+    case 'planning': return demolish ? 5 : p.gov ? (isRoadwork(p.kind) ? 10 : 25) : 12;
     case 'assessment': return big ? [10, 30, 60][env] : 0;
-    case 'approval': return Math.round((p.gov ? 14 : [10, 25, 50][reg]) * adminDelay(sim));
+    case 'approval': return Math.round((demolish ? 7 : p.gov ? 14 : [10, 25, 50][reg]) * adminDelay(sim));
     case 'land': return landTiles > 0 ? Math.min(120, 30 + landTiles * 2) : 0;
     default: return 0;
   }
@@ -63,7 +79,22 @@ export function estimate(sim: Sim, kind: ProjectKind, tiles: number[], floors?: 
   const rate = laborRate(sim);
   const mat = s.market.materials.price * 1.05;
   let labor = 0, materials = 0, equipment = 0, crew = 10, f = floors ?? 1;
-  if (isRoadwork(kind)) {
+  if (kind === 'demolish') {
+    // pulling down what stands on the tiles: roads (bridges take longer) and buildings
+    const seen = new Set<number>();
+    for (const t of tiles) {
+      if (m.road[t]) labor += (m.road[t] >= 2 ? ROADWORKS.avenue.labor : ROADWORKS.road.labor) * DEMOLISH_SHARE * (m.terrain[t] === Terrain.Water ? 3 : 1);
+      const o = m.owner[t];
+      if (o < 0 || seen.has(o)) continue;
+      seen.add(o);
+      const b = sim.bld(o);
+      if (!b) continue;
+      const spec = BUILDINGS[b.kind];
+      labor += spec.labor * (spec.perFloor ? b.floors : b.kind === 'park' ? b.w * b.h : 1) * DEMOLISH_SHARE;
+    }
+    labor = Math.max(20, labor);
+    crew = maxCrewOf({ kind, tiles, labor });
+  } else if (isRoadwork(kind)) {
     const spec = ROADWORKS[kind as keyof typeof ROADWORKS];
     // bridge spans over the river or canals take three times the work and materials
     let spans = 0;
@@ -121,7 +152,7 @@ export function createProject(sim: Sim, spec: ProjectSpec): Project {
   const s = sim.s;
   const tiles = spec.tiles ?? footprintTiles(spec.x, spec.y, spec.w, spec.h);
   const est = estimate(sim, spec.kind, tiles, spec.floors, spec.gov);
-  const label = isRoadwork(spec.kind) ? ROADWORKS[spec.kind as keyof typeof ROADWORKS].label : BUILDINGS[spec.kind as BuildingKind].label;
+  const label = projectLabel(spec.kind);
   const p: Project = {
     id: sim.newId(), kind: spec.kind, name: spec.name ?? `${label}${isRoadwork(spec.kind) ? ` (${tiles.length * 40} m)` : ''}`, sponsor: spec.sponsor, gov: spec.gov,
     tiles, x: spec.x, y: spec.y, w: spec.w, h: spec.h, phase: 'planning', phaseLeft: 0, cost: est.cost, budget: est.cost, spent: 0,
@@ -144,8 +175,11 @@ export function createProject(sim: Sim, spec: ProjectSpec): Project {
   s.projects.push(p);
   sim.ix.proj.set(p.id, p);
   sim.ix.ver.projects++;
-  if (spec.gov) sim.emit('project.proposed', `Government announces ${p.name.toLowerCase().startsWith('a') ? '' : 'a '}${p.name}; estimated cost ${fmtMoney(sim, est.cost)}.`, 2, { k: 'project', id: p.id }, undefined,
-    [`Expected to take about ${Math.round(est.days / 30.4)} months`, ...(est.landCost > 0 ? [`Requires acquiring land (${est.farmsAffected} farms, ${est.displaced} households affected)`] : [])]);
+  const announced = spec.kind === 'demolish' ? `Government orders ${p.name.replace(/^(Demolition|Removal)/, (w) => `the ${w.toLowerCase()}`)}`
+    : `Government announces ${p.name.toLowerCase().startsWith('a') ? '' : 'a '}${p.name}`;
+  if (spec.gov) sim.emit('project.proposed', `${announced}; estimated cost ${fmtMoney(sim, est.cost)}.`, 2, { k: 'project', id: p.id }, undefined,
+    [`Expected to take about ${Math.max(1, Math.round(est.days / 30.4))} month${Math.round(est.days / 30.4) > 1 ? 's' : ''}`,
+      ...(est.landCost > 0 ? [`Requires ${spec.kind === 'demolish' ? 'buying the property' : 'acquiring land'} (${est.farmsAffected ? `${est.farmsAffected} farms, ` : ''}${est.displaced} households affected)`] : [])]);
   return p;
 }
 
@@ -183,7 +217,10 @@ function nextPhase(sim: Sim, p: Project): void {
       p.phase = ph; p.phaseLeft = d;
       if (ph === 'construction' && p.started < 0) p.started = sim.day;
       if (p.gov && (ph === 'land' || ph === 'construction')) {
-        sim.emit('project.phase', ph === 'land' ? `Land acquisition begins for ${p.name}.` : `Construction begins on ${p.name}.`, 1, { k: 'project', id: p.id });
+        const the = p.name.replace(/^(Demolition|Removal)/, (w) => `the ${w.toLowerCase()}`);
+        const text = p.kind === 'demolish' ? (ph === 'land' ? `The city starts buying the property for ${the}.` : `Crews start ${the}.`)
+          : ph === 'land' ? `Land acquisition begins for ${p.name}.` : `Construction begins on ${p.name}.`;
+        sim.emit('project.phase', text, 1, { k: 'project', id: p.id });
       }
       return;
     }
@@ -242,7 +279,12 @@ function acquireLand(sim: Sim, p: Project): void {
     if (farm?.farm && farm.farm.ha < 0.5) sim.closeBusiness(farm, `Most of its land was acquired for ${p.name}.`);
   }
   if (farms || households || businesses) {
-    sim.emit('project.land', `Land acquired for ${p.name}: ${farms} farms lose fields${households ? `, ${households} households relocated` : ''}${businesses ? `, ${businesses} businesses closed` : ''}.`, households + farms >= 5 ? 2 : 1,
+    const parts = [
+      farms ? `${farms} farm${farms > 1 ? 's' : ''} lose${farms > 1 ? '' : 's'} fields` : '', households ? `${households} household${households > 1 ? 's' : ''} relocated` : '',
+      businesses ? `${businesses} business${businesses > 1 ? 'es' : ''} closed` : '',
+    ].filter(Boolean).join(', ');
+    const what = p.kind === 'demolish' ? `Property bought for ${p.name.replace(/^(Demolition|Removal)/, (w) => `the ${w.toLowerCase()}`)}` : `Land acquired for ${p.name}`;
+    sim.emit('project.land', `${what}: ${parts}.`, households + farms >= 5 ? 2 : 1,
       { k: 'project', id: p.id }, undefined, ['Affected residents are unhappy about the acquisition', 'Compensation was paid from the treasury']);
   }
 }
@@ -318,7 +360,7 @@ export function constructionDaily(sim: Sim): void {
     for (const j of b.jobs) if (j.role === 'laborer' && j.worker >= 0) { const c = sim.cit(j.worker); if (c && c.injured <= 0) n++; }
     crews.set(b.id, n);
   }
-  for (const p of s.projects) if (p.phase === 'construction' && p.contractor >= 0) committed.set(p.contractor, (committed.get(p.contractor) ?? 0) + (BUILDINGS[p.kind as BuildingKind]?.crew ?? 20));
+  for (const p of s.projects) if (p.phase === 'construction' && p.contractor >= 0) committed.set(p.contractor, (committed.get(p.contractor) ?? 0) + (BUILDINGS[p.kind as BuildingKind]?.crew ?? (p.kind === 'demolish' ? 12 : 20)));
   let localCrew = 0;
   for (const n of crews.values()) localCrew += n;
   const minLocal = minLocalCrew(sim);
@@ -342,7 +384,7 @@ export function constructionDaily(sim: Sim): void {
       case 'construction': {
         if (weatherStop) { delay(p, 'Heavy rain / flooding halted work'); break; }
         if (!work) break;
-        const maxCrew = isRoadwork(p.kind) ? Math.min(60, ROADWORKS[p.kind as keyof typeof ROADWORKS].crew + p.tiles.length) : BUILDINGS[p.kind as BuildingKind].crew;
+        const maxCrew = maxCrewOf(p);
         let c = p.contractor >= 0 ? sim.biz(p.contractor) : undefined;
         if (p.contractor !== OUTSIDE_CONTRACTOR && (!c || c.status !== 'operating')) {
           c = localCrew >= minLocal ? pickContractor(sim, committed) : undefined;
@@ -350,7 +392,7 @@ export function constructionDaily(sim: Sim): void {
           if (c && sim.frontier() > 0 && (crews.get(c.id) ?? 0) - (committed.get(c.id) ?? 0) < Math.min(8, maxCrew) * 0.75) c = undefined;
           if (c) {
             p.contractor = c.id;
-            committed.set(c.id, (committed.get(c.id) ?? 0) + (BUILDINGS[p.kind as BuildingKind]?.crew ?? 20));
+            committed.set(c.id, (committed.get(c.id) ?? 0) + (BUILDINGS[p.kind as BuildingKind]?.crew ?? (p.kind === 'demolish' ? 12 : 20)));
           } else {
             // no local firm has a crew: a contractor from outside the city takes the job
             p.contractor = OUTSIDE_CONTRACTOR;
@@ -402,7 +444,7 @@ export function constructionDaily(sim: Sim): void {
         p.workersToday = workers;
         p.issue = '';
         const remaining = (Math.max(0, p.labor - p.laborDone) / 0.9) * (outsideFirm ? outRate : rate) + Math.max(0, p.materials - p.matDelivered - p.matOrdered) * s.market.materials.price * 1.05;
-        const equipment = isRoadwork(p.kind) ? 0 : BUILDINGS[p.kind as BuildingKind].equipment * sim.scale * s.ext.trend;
+        const equipment = isRoadwork(p.kind) || p.kind === 'demolish' ? 0 : BUILDINGS[p.kind as BuildingKind].equipment * sim.scale * s.ext.trend;
         p.cost = p.spent + remaining + equipment + (p.phase === 'construction' ? 0 : p.landCost);
         if (p.laborDone >= p.labor && p.matDelivered >= p.materials * 0.98) done.push(p);
         break;
@@ -436,11 +478,95 @@ export function constructionDaily(sim: Sim): void {
   if (s.projects.length !== before) { sim.ix.proj.clear(); for (const p of s.projects) sim.ix.proj.set(p.id, p); sim.ix.ver.projects++; }
 }
 
+/** A road tile along the edge of a building (not its corners), keeping its current access when it can; -1 = none. */
+export function roadAccess(sim: Sim, b: Building, skip?: Set<number>): number {
+  const m = sim.s.map;
+  if (b.access >= 0 && m.road[b.access] && !skip?.has(b.access)) return b.access;
+  for (let y = b.y - 1; y <= b.y + b.h; y++) for (let x = b.x - 1; x <= b.x + b.w; x++) {
+    if (x < 0 || y < 0 || x >= W || y >= W) continue;
+    const inside = x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h;
+    const corner = (x < b.x || x >= b.x + b.w) && (y < b.y || y >= b.y + b.h);
+    if (inside || corner) continue;
+    const t = idx(x, y);
+    if (m.road[t] && !skip?.has(t)) return t;
+  }
+  return -1;
+}
+
+/** Buildings (other than those in `keep`) that would be left without any road if `tiles` lost theirs. */
+export function strandedBy(sim: Sim, tiles: number[], keep = new Set<number>()): Building[] {
+  const m = sim.s.map;
+  const set = new Set(tiles.filter((t) => m.road[t] > 0));
+  const seen = new Set<number>(keep), out: Building[] = [];
+  for (const t of set) {
+    const x = t % W, y = (t / W) | 0;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= W || ny >= W) continue;
+      const o = m.owner[idx(nx, ny)];
+      if (o < 0 || seen.has(o)) continue;
+      seen.add(o);
+      const b = sim.bld(o);
+      if (b && roadAccess(sim, b, set) < 0) out.push(b);
+    }
+  }
+  return out;
+}
+
+/** A demolition is finished: public buildings on the site come down (private ones were bought and cleared) and roads are dug up. */
+function demolish(sim: Sim, p: Project): void {
+  const s = sim.s, m = s.map;
+  const gone = new Set<number>();
+  let buildings = 0, displaced = 0;
+  for (const t of p.tiles) {
+    const o = m.owner[t];
+    if (o < 0 || gone.has(o)) continue;
+    gone.add(o);
+    const b = sim.bld(o);
+    if (!b || b.kind === 'heritage') continue;
+    const biz = b.biz >= 0 ? sim.biz(b.biz) : undefined;
+    if (biz) sim.closeBusiness(biz, 'Its building was demolished.');
+    for (const hid of b.occupants) { const h = sim.hh(hid); if (h) { h.unhappy += 2; displaced++; } }
+    if (b.kind === 'park') {
+      for (let y = b.y; y < b.y + b.h; y++) for (let x = b.x; x < b.x + b.w; x++) if (m.zone[idx(x, y)] === Zone.Park) m.zone[idx(x, y)] = Zone.None;
+      sim.ix.ver.zones++;
+    }
+    sim.removeBuilding(b);
+    buildings++;
+  }
+  // roads: dug up, except where something built since would be cut off from the network
+  let roads = p.tiles.filter((t) => m.road[t] > 0 && m.road[t] < RoadClass.Highway);
+  const stranded = strandedBy(sim, roads);
+  if (stranded.length) {
+    const near = new Set<number>();
+    for (const b of stranded) for (const t of roads) {
+      const x = t % W, y = (t / W) | 0;
+      if (x >= b.x - 1 && x <= b.x + b.w && y >= b.y - 1 && y <= b.y + b.h) near.add(t);
+    }
+    roads = roads.filter((t) => !near.has(t));
+  }
+  if (roads.length) {
+    const cut = new Set(roads);
+    for (const t of roads) { m.road[t] = 0; m.roadCond[t] = 0; s.traffic.volume[t] = 0; s.traffic.truckLoad[t] = 0; }
+    // buildings and building sites that were reached from these tiles use another road along their edge
+    for (const b of s.buildings) if (cut.has(b.access)) b.access = roadAccess(sim, b);
+    for (const q of s.projects) if (cut.has(q.access)) q.access = accessTile(sim, q.tiles);
+    refreshTileTimes(sim);
+    sim.ix.ver.roads++;
+    sim.ix.ver.terrain++;
+  }
+  p.phase = 'done';
+  const what = [buildings ? `${buildings} building${buildings > 1 ? 's' : ''}` : '', roads.length ? `${roads.length * 40} m of road` : ''].filter(Boolean).join(' and ');
+  sim.emit('project.completed', `${p.name} is complete${what ? `: ${what} cleared` : ''}${p.delayDays > 20 ? `, ${p.delayDays} days late` : ''}.`, 1, { k: 'tile', id: p.tiles[0] }, undefined,
+    [...(displaced ? [`${displaced} households had to find new homes`] : []), ...(stranded.length ? ['Road next to buildings put up since the plan was approved was left in place'] : []), ...(lateReasons(p) ?? [])]);
+}
+
 function complete(sim: Sim, p: Project): void {
   const s = sim.s, m = s.map;
   p.completed = sim.day;
   for (const t of p.tiles) if (m.project[t] === p.id) m.project[t] = -1;
   sim.ix.ver.projects++;
+  if (p.kind === 'demolish') { demolish(sim, p); return; }
   if (isRoadwork(p.kind)) {
     if (p.kind === 'canal') {
       for (const t of p.tiles) { m.terrain[t] = Terrain.Canal; m.zone[t] = 0; }
