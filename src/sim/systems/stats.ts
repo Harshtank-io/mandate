@@ -6,6 +6,7 @@ import { foodRetail, goodsRetail, hhIncome, mealPrice, vegRetail } from '../econ
 import { GOODS, Terrain, type MonthStats } from '../types';
 import { envAt } from './environment';
 import { roadStats } from './transport';
+import { totalDebt } from './loans';
 
 const median = (a: number[]) => { if (!a.length) return 0; const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
 
@@ -103,7 +104,7 @@ export function statsMonthly(sim: Sim): void {
     children, working, unemployed, retired, students, laborForce, unemployment: laborForce ? unemployed / laborForce : 0,
     avgWage: wageN ? wageSum / wageN : 0, medianIncome: median(incomes),
     gdp: va, cpi, inflation, foodPrice: foodRetail(sim),
-    revenue: sumRev(g.m), spending: sumExp(g.m), balance: sumRev(g.m) - sumExp(g.m), debt: g.debt, treasury: g.cash,
+    revenue: sumRev(g.m), spending: sumExp(g.m), balance: sumRev(g.m) - sumExp(g.m), debt: totalDebt(sim), treasury: g.cash,
     businesses, opened: acc.opened, closed: acc.closed, jobs, vacancies,
     units, vacantUnits: units - occ, homeless: s.households.filter((h) => h.home < 0).length, avgRent: renters ? rentSum / renters : 0,
     rentIndex: s.housing.rentIndex, rentBurden: median(burdens),

@@ -350,7 +350,7 @@ export const DEPTS: Dept[] = ['admin', 'health', 'education', 'safety', 'transpo
 export type RevCat =
   | 'incomeTax' | 'corporateTax' | 'smallBizTax' | 'salesTax' | 'foodTax' | 'propertyTax' | 'fuelTax'
   | 'importTariff' | 'exportTax' | 'agriTax' | 'luxuryTax' | 'licenseFees' | 'rents' | 'fares' | 'premiums' | 'grants'
-  | 'tourismTax' | 'entertainmentTax' | 'airportFees' | 'tickets' | 'grainSales' | 'utilityBills' | 'other';
+  | 'tourismTax' | 'entertainmentTax' | 'airportFees' | 'tickets' | 'grainSales' | 'utilityBills' | 'powerSales' | 'other';
 export type ExpCat =
   | 'admin' | 'health' | 'education' | 'safety' | 'transport' | 'agriculture' | 'environment' | 'culture' | 'utilities'
   | 'unemployment' | 'pensions' | 'fertilizer' | 'insurance' | 'capital' | 'interest' | 'land'
@@ -360,9 +360,26 @@ export interface GovLedger { rev: Record<RevCat, number>; exp: Record<ExpCat, nu
 
 export interface PendingChange { day: number; kind: 'tax' | 'policy'; key: string; value: number | boolean; label: string }
 
+/** A term loan the city took out, repaid in equal monthly instalments of interest and capital. */
+export type LoanKind = 'development' | 'bank' | 'bond';
+export interface Loan {
+  id: number;
+  kind: LoanKind;
+  lender: string;
+  principal: number; // amount borrowed
+  balance: number; // capital still owed
+  rate: number; // annual interest rate, fixed for the life of the loan
+  months: number; // term
+  left: number; // instalments still to pay
+  payment: number; // monthly instalment
+  taken: number; // sim day borrowed
+  interest: number; // interest paid so far
+}
+
 export interface Government {
   cash: number;
-  debt: number;
+  debt: number; // overdraft the treasury draws on automatically when it runs out of cash (plus debts inherited)
+  loans: Loan[]; // term loans the city chose to take out
   rate: number; // annual interest rate on debt
   rating: string;
   taxes: TaxSettings;
@@ -421,6 +438,7 @@ export interface UtilityLedger {
   water: number; waterShort: number; // m3 supplied by the mains / wanted but not supplied
   bills: number; // billed to residents and businesses
   cost: number; // paid for grid imports and gas
+  exported: number; sales: number; // electricity from the city's plants sold to the regional grid (kWh, money)
   blackouts: number; // days with rolling blackouts somewhere in town
   outages: number; // days the regional grid was down
 }
@@ -559,6 +577,12 @@ export interface NewsItem {
   ref?: SimEvent['ref'];
 }
 
+/**
+ * How construction works: 'realistic' (planning, approvals, land purchase and crews take months), 'public' (the city's
+ * own projects are finished the moment they are approved) or 'all' (developers and businesses build at once too).
+ */
+export type BuildMode = 'realistic' | 'public' | 'all';
+
 export interface WorldMeta {
   id: string;
   name: string;
@@ -573,6 +597,7 @@ export interface WorldMeta {
   createdAt: number;
   lastReal: number; // real ms timestamp the state corresponds to
   playedMs: number;
+  build?: BuildMode; // missing in older saves = 'realistic'
 }
 
 export interface MapState {

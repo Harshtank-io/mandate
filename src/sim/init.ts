@@ -4,7 +4,9 @@
 import type { Preset } from './presets';
 import type { AirLedger, AirState, FoodProgrammes, LeisureState, TourismLedger, TourismState, TradeState, UtilityLedger, UtilityState, VenueState } from './types';
 
-export const emptyUtilityLedger = (): UtilityLedger => ({ kwh: 0, short: 0, grid: 0, gas: 0, solar: 0, wind: 0, water: 0, waterShort: 0, bills: 0, cost: 0, blackouts: 0, outages: 0 });
+export const emptyUtilityLedger = (): UtilityLedger => ({
+  kwh: 0, short: 0, grid: 0, gas: 0, solar: 0, wind: 0, water: 0, waterShort: 0, bills: 0, cost: 0, blackouts: 0, outages: 0, exported: 0, sales: 0,
+});
 
 /** Electricity and water before the first day is simulated. The regional grid line is sized by the caller. */
 export function initUtilities(gridBase: number): UtilityState {

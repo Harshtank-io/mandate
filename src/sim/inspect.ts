@@ -4,13 +4,16 @@
 import { formatDay, spanText } from './calendar';
 import { hhIncome } from './econ';
 import { idx, sumExp, sumRev, W, type Sim } from './core';
-import { BUILDINGS, BUSINESSES, CROPS, EDU_LABEL, FIELD_LABEL, GOOD_SPECS, ROAD_CAPACITY, ROAD_SPEED, ROLES, cropTempFactor } from './tables';
+import {
+  BUILDINGS, BUSINESSES, CROPS, EDU_LABEL, FIELD_LABEL, GOOD_SPECS, PLANTS, ROAD_CAPACITY, ROAD_SPEED, ROLES, SUBSTATION_MW, WATERWORKS_M3, cropTempFactor,
+} from './tables';
+import { feedInPrice, gridCapacity, gridPrice, supplyMap, utilityReport } from './systems/utilities';
 import { fmtMoney, isRoadwork, OUTSIDE_CONTRACTOR, projectLabel } from './systems/construction';
 import { DEPT_LABELS } from './systems/government';
 import { envAt } from './systems/environment';
 import { cellOf, SAT_WEIGHTS, satisfactionParts, type SatParts } from './systems/services';
-import { ZONE_LABELS } from './commands';
-import { GOODS, Mode, Terrain, type Building, type Business, type Citizen, type Household, type Project, type RevCat, type ExpCat, type SimEvent } from './types';
+import { facilityUpkeep, ZONE_LABELS } from './commands';
+import { GOODS, Mode, Terrain, type Building, type BuildingKind, type Business, type Citizen, type Household, type Project, type RevCat, type ExpCat, type SimEvent } from './types';
 
 export type Ref = NonNullable<SimEvent['ref']>;
 export interface Link { label: string; ref: Ref }
@@ -34,6 +37,46 @@ const PHASE_LABEL: Record<string, string> = {
 };
 
 export function money(sim: Sim, v: number): string { return fmtMoney(sim, v); }
+
+const POWER_LINE = ['Not connected to any supply', 'From the regional grid', 'From local plants only (no grid link)'];
+
+/** Electricity, water and fire cover at a building, and the bills or output that go with them. */
+function utilitySection(sim: Sim, b: Building, biz?: Business): Section {
+  const pw = b.pw ?? 1, wt = b.wt ?? 1;
+  const [x, y] = sim.center(b);
+  const rows: [string, string][] = [];
+  const outage = !!sim.recentEvent('utility.outage', 1);
+  rows.push(['Electricity', pw >= 0.995 ? 'Supplied' : pw <= 0.005 ? (outage ? 'Off: the regional grid is down' : 'Off: its roads reach no supply') : `Rolling blackouts: ${pct(pw)} of demand met`]);
+  rows.push(['Water', wt >= 0.995 ? 'Mains water' : wt <= 0.005 ? 'No mains: wells and water tankers' : `Mains cover ${pct(wt)}; the rest from wells and tankers`]);
+  rows.push(['Fire cover', pct(sim.s.services.fireCov?.[cellOf(x, y)] ?? 0)]);
+  const plant = PLANTS[b.kind];
+  if (plant && biz) {
+    rows.push(['Capacity', `${plant.mw} MW${plant.peak < 1 ? ` (${pct(plant.peak)} can be counted on at the evening peak)` : ''}`]);
+    rows.push(['Generated this month', `${num(biz.m.production / 1000)} MWh`]);
+  }
+  if (b.kind === 'waterworks' && biz) rows.push(['Capacity', `${num(WATERWORKS_M3)} m³ a day`], ['Supplied last month', `${num(biz.last.production)} m³`]);
+  if (b.kind === 'substation') rows.push(['Adds', `${SUBSTATION_MW} MW to the regional grid connection`], ['Grid connection now', `${gridCapacity(sim).toFixed(1)} MW for a peak of ${sim.s.util.peak.toFixed(1)} MW`]);
+  return { title: 'Utilities & fire', rows };
+}
+
+/** A city-owned plant's books for last month: what it earned and saved the city, against what it cost to run. */
+function plantBooks(sim: Sim, b: Business): Section | null {
+  if (!PLANTS[b.kind as keyof typeof PLANTS]) return null;
+  const L = b.last;
+  const sold = L.sales, made = L.production;
+  const saved = Math.max(0, made - sold) * gridPrice(sim);
+  const upkeep = facilityUpkeep(sim, b.kind as BuildingKind);
+  const net = L.revenue + saved - L.cogs - L.wages - upkeep;
+  return { title: 'Last month', rows: [
+    ['Generated', `${num(made / 1000)} MWh`],
+    ['Sold to the regional grid', `${num(sold / 1000)} MWh for ${money(sim, L.revenue)}`],
+    ['Saved on power the city would buy', money(sim, saved)],
+    ...(L.cogs > 0 ? [['Gas burned', money(sim, L.cogs)] as [string, string]] : []),
+    ['Staff', money(sim, L.wages)],
+    ['Upkeep', money(sim, upkeep)],
+    ['Net for the city', money(sim, net)],
+  ], lines: [sold > 0 ? `The regional grid pays ${money(sim, feedInPrice(sim))} per kWh for power the town does not use` : 'Power the town does not use is sold to the regional grid when its roads reach the highway'] };
+}
 
 function ownerLabel(sim: Sim, b: Building): string {
   switch (b.ownerT) {
@@ -83,7 +126,16 @@ export function inspectTile(sim: Sim, t: number): Card {
   const sv = sim.s.services;
   const sections: Section[] = [{ title: 'Public services within reach', bar: [
     { label: 'Healthcare', value: sv.healthCov[k] }, { label: 'Schools', value: sv.schoolCov[k] }, { label: 'Police', value: sv.policeCov[k] },
+    { label: 'Fire service', value: sv.fireCov?.[k] ?? 0 },
   ] }];
+  // a building here would be served by the road network of the nearest road along its edge
+  const sup = supplyMap(sim);
+  let net = -1;
+  for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    const nx = x + dx, ny = y + dy;
+    if (nx >= 0 && ny >= 0 && nx < W && ny < W && m.road[idx(nx, ny)]) { net = sup.comp[idx(nx, ny)]; break; }
+  }
+  if (net >= 0) rows.push(['Electricity', POWER_LINE[sup.power[net]]], ['Water mains', sup.water[net] ? 'Along the road' : 'None: wells and tankers']);
   return { ref: { k: 'tile', id: t }, title: terr, subtitle: `Tile ${x}, ${y} · ${(0.16).toFixed(2)} ha`, rows, sections, focus: [x + 0.5, y + 0.5] };
 }
 
@@ -111,6 +163,8 @@ export function inspectRoad(sim: Sim, t: number): Card {
       ['Peak speed', `${Math.round(speed)} km/h (free flow ${ROAD_SPEED[cls]} km/h)`],
       ['Surface', `${pct(cond)} ${cond < 0.35 ? '(potholes slow traffic)' : cond < 0.6 ? '(worn)' : '(good)'}`],
       ['Trucks on this stretch today', num(trucks)],
+      ['Power lines', POWER_LINE[supplyMap(sim).power[supplyMap(sim).comp[t]] ?? 0]],
+      ['Water mains', supplyMap(sim).water[supplyMap(sim).comp[t]] ? 'Yes' : 'No waterworks on this network'],
     ],
     sections: [{ title: 'Why', lines: [
       vol > cap ? 'Demand exceeds capacity at rush hour, so speeds collapse' : vol > cap * 0.7 ? 'Busy at rush hour' : 'Traffic flows freely',
@@ -141,6 +195,8 @@ export function inspectBuilding(sim: Sim, b: Building): Card {
     if (links.length) sections.push({ title: 'Residents', links, lines: b.occupants.length > 12 ? [`and ${b.occupants.length - 12} more households`] : undefined });
   }
   if (b.kind === 'park') rows.push(['Use', 'Public green space']);
+  if (b.kind === 'substation') rows.push(['Use', 'Grid substation (city-owned)']);
+  if (b.kind !== 'park') sections.push(utilitySection(sim, b));
   if (b.kind === 'heritage') {
     const T = sim.s.tourism.last;
     rows.push(['Use', 'Historic site open to visitors'], ['Visitors to the city last month', num(T.domestic + T.foreign)]);
@@ -225,6 +281,9 @@ export function inspectBusiness(sim: Sim, b: Business): Card {
     }
   }
   venueRows(sim, b, rows, sections);
+  if (bl) sections.push(utilitySection(sim, bl, b));
+  const books = b.pub ? plantBooks(sim, b) : null;
+  if (books) sections.push(books);
   if (b.reason) sections.push({ title: b.lossMonths > 0 ? 'Why it is struggling' : 'Why it is here', lines: [b.reason] });
   if (b.jobs.length) sections.push(staffLines(sim, b));
   const title = b.name;
@@ -320,6 +379,7 @@ export function inspectHousehold(sim: Sim, h: Household): Card {
   const spend: [string, string][] = [
     ['Wages', money(sim, L.wages)], ['Benefits & pensions', money(sim, L.benefits)], ['Business & rental income', money(sim, L.dividends)], ['Income tax', money(sim, L.taxes)],
     ['Rent', money(sim, L.rent)], ['Food', money(sim, L.food)], ['Goods', money(sim, L.goods)], ['Meals & services', money(sim, L.services)], ['Transport', money(sim, L.transport)],
+    ['Electricity & water', money(sim, L.utilities ?? 0)],
   ];
   const links = h.members.map((id) => sim.cit(id)).filter((c): c is Citizen => !!c).map((c) => ({ label: `${sim.fullName(c)} (${Math.floor(sim.age(c))}, ${STATUS_LABEL[c.status].toLowerCase()})`, ref: { k: 'citizen' as const, id: c.id } }));
   const sections: Section[] = [{ title: 'Members', links }, { title: 'Last month', rows: spend }];
@@ -363,13 +423,14 @@ export function inspectProject(sim: Sim, p: Project): Card {
 
 // ------------------------------------------------------------------------------------------------ dashboard explanations
 
-export type MetricKey = 'population' | 'unemployment' | 'budget' | 'housing' | 'food' | 'traffic' | 'satisfaction' | 'health' | 'environment' | 'education' | 'agriculture';
+export type MetricKey = 'population' | 'unemployment' | 'budget' | 'housing' | 'food' | 'traffic' | 'satisfaction' | 'health' | 'environment' | 'education' | 'agriculture' | 'utilities';
 
 export const REV_LABELS: Record<RevCat, string> = {
   incomeTax: 'Income tax', corporateTax: 'Corporate tax', smallBizTax: 'Small business tax', salesTax: 'Sales tax', foodTax: 'Sales tax on food', propertyTax: 'Property tax',
   fuelTax: 'Fuel tax', importTariff: 'Import tariffs', exportTax: 'Export tax', agriTax: 'Agricultural tax', luxuryTax: 'Luxury tax', licenseFees: 'Licence fees', rents: 'Public housing rents',
   fares: 'Bus fares', premiums: 'Crop insurance premiums', grants: 'Grants from higher government', tourismTax: 'Hotel room tax', entertainmentTax: 'Entertainment tax',
   airportFees: 'Airport fees', tickets: 'Museum, stadium and heritage tickets', grainSales: 'Sales of surplus grain', utilityBills: 'Electricity & water bills',
+  powerSales: 'Electricity sold to the regional grid',
   other: 'Other (irrigation charges, estates)',
 };
 export const EXP_LABELS: Record<ExpCat, string> = {
@@ -469,6 +530,28 @@ export function explain(sim: Sim, key: MetricKey): Section[] {
       { title: 'Education', rows: [['Children in school', pct(st.enrollment)], ['Adult literacy', pct(st.literacy)], ['Adults with a diploma or degree', pct(st.tertiary)], ['Education funding', pct(s.gov.deptFunding.education)]] },
       { title: 'What drives it', lines: ['School places and staffed classrooms near where families live', 'A college turns school leavers into engineers, nurses and technicians after 3–4 years'] },
     ];
+    case 'utilities': {
+      const r = utilityReport(sim);
+      const plants = r.plants.map((p) => [`${BUILDINGS[p.kind].label}${p.n > 1 ? ` ×${p.n}` : ''}`, `${p.mw} MW`] as [string, string]);
+      return [
+        { title: 'Electricity', rows: [
+          ['Evening peak today', `${r.peak.toFixed(2)} MW`], ['Firm supply', `${r.cap.toFixed(2)} MW`],
+          ['Regional grid connection', `${r.grid.toFixed(2)} MW${r.substations ? ` (${r.substations} substation${r.substations > 1 ? 's' : ''})` : ''}${r.outage ? ' · down today' : ''}`],
+          ...plants, ['Supplied last month', pct(st.powerServed, 1)], ['Days with blackouts', num(st.blackouts)],
+        ], lines: r.lines },
+        { title: 'Water', rows: [['Wanted today', `${num(r.waterUse)} m³`], ['Waterworks can supply', `${num(r.waterCap)} m³ a day`], ['From the mains last month', pct(st.waterServed)]] },
+        { title: 'Tariffs', rows: [
+          ['Homes', `${money(sim, r.home)} per kWh`], ['Businesses', `${money(sim, r.business)} per kWh`], ['Water', `${money(sim, r.water)} per m³`],
+          ['Cost of a kWh bought', money(sim, r.unit)], ['The regional grid pays', `${money(sim, feedInPrice(sim))} per kWh for the city’s surplus`],
+        ] },
+        { title: 'What drives it', lines: [
+          'Power lines and water mains follow the roads: a building gets what its road network connects to',
+          'The regional grid line grows slowly; a substation adds 8 MW, and plants add supply of their own that keeps running when the grid fails',
+          'Without mains water families buy from wells and tankers, pay more and fall ill more often',
+        ] },
+        { title: 'Recent', lines: recent(sim, ['utility', 'fire'], 120) },
+      ];
+    }
     case 'agriculture': {
       const crops = Object.entries(st.cropOutput).map(([k, v]) => [CROPS[k as keyof typeof CROPS]?.label ?? k, `${num(v)} t`] as [string, string]);
       const farms = s.businesses.filter((b) => b.farm);

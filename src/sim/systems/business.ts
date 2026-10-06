@@ -20,11 +20,13 @@ function adminDelay(sim: Sim): number {
 export function businessDaily(sim: Sim): void {
   const s = sim.s;
   const reg = s.gov.policies.businessRegulation;
+  // with everything built instantly, the paperwork is quick too: a new business registers and is licensed in a day each
+  const fast = s.meta.build === 'all';
   for (const b of s.businesses) {
     const days = sim.day - b.statusDay;
     switch (b.status) {
       case 'registering':
-        if (days >= REG_DAYS[reg] * adminDelay(sim)) {
+        if (fast || days >= REG_DAYS[reg] * adminDelay(sim)) {
           sim.tax('licenseFees', b, s.gov.taxes.licenseFee);
           b.m.other += s.gov.taxes.licenseFee;
           b.status = 'licensing'; b.statusDay = sim.day;
@@ -32,7 +34,7 @@ export function businessDaily(sim: Sim): void {
         break;
       case 'licensing': {
         const industrial = ['factory', 'foodplant', 'materials'].includes(b.kind);
-        if (days >= LIC_DAYS[reg] * adminDelay(sim) * (industrial ? 1 + 0.5 * s.gov.policies.environmentalRegulation : 1)) {
+        if (fast || days >= LIC_DAYS[reg] * adminDelay(sim) * (industrial ? 1 + 0.5 * s.gov.policies.environmentalRegulation : 1)) {
           b.status = 'hiring'; b.statusDay = sim.day;
           sim.ix.storesDirty = true;
         }

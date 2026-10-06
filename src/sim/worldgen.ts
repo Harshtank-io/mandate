@@ -16,7 +16,7 @@ import {
 import { computeAppeal } from './systems/tourism';
 import {
   DEPTS, GOODS, RoadClass, Terrain, Zone,
-  type Building, type BuildingKind, type Business, type BusinessKind, type Citizen, type CropId, type Dept, type FarmState, type Field,
+  type Building, type BuildingKind, type BuildMode, type Business, type BusinessKind, type Citizen, type CropId, type Dept, type FarmState, type Field,
   type Good, type Household, type MarketGood, type RoleId, type WorldState,
 } from './types';
 
@@ -30,9 +30,13 @@ export interface NewWorldOptions {
   pace: number;
   offlineCapDays: number;
   now: number;
+  /** How construction works (see BuildMode); realistic when left out. */
+  build?: BuildMode;
 }
 
 const N = W * W;
+/** Towns of at least this many people start with a fire station of their own. */
+export const FIRE_STATION_TOWN = 4000;
 const mod = (a: number, n: number) => ((a % n) + n) % n;
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
@@ -77,6 +81,7 @@ export function skeleton(o: NewWorldOptions): WorldState {
     meta: {
       id: `w${o.now.toString(36)}${Math.floor(o.seed % 1e6).toString(36)}`, name: o.name, preset: o.preset, startYear: epoch,
       officeYear: o.startYear, officeDay, condition: o.condition, seed: o.seed, pace: o.pace, offlineCapDays: o.offlineCapDays, createdAt: o.now, lastReal: o.now, playedMs: 0,
+      build: o.build ?? 'realistic',
     },
     minute: (empty ? officeDay * MIN_PER_DAY : 0) + 8 * 60,
     rng: seedState(o.seed),
@@ -91,7 +96,7 @@ export function skeleton(o: NewWorldOptions): WorldState {
     ext: { cash: 0, demand: 1, phase: 'normal', phaseLeft: 0, fuel: 60 * scale * trend, fuelDev: 0, prices, dev, trend },
     weather: { temp: preset.climate.temp[0], tempDev: 0, rain: 0, rainLog: [], normalLog: [], anomaly: 1, anomalyQuarter: -1, drought: false, flood: 999, heatDays: 0, pandemic: 0 },
     gov: {
-      cash: cond.treasury * scale, debt: cond.debt * scale, rate: 0.07, rating: 'A',
+      cash: cond.treasury * scale, debt: cond.debt * scale, loans: [], rate: 0.07, rating: 'A',
       taxes: { ...t, allowance: t.allowance * scale, topThreshold: t.topThreshold * scale, licenseFee: t.licenseFee * scale, passengerFee: t.passengerFee * scale },
       level: { ...oneDept }, deptSpend: { ...zeroDept },
       policies: { ...p, minWage: p.minWage * scale, unemploymentBenefit: p.unemploymentBenefit * scale, pension: p.pension * scale, povertyTransfer: p.povertyTransfer * scale },
@@ -419,11 +424,9 @@ class Generator {
       const a = (2 * Math.PI * k) / this.c.police + 3.4;
       this.place('police', 'police', cx + Math.cos(a) * R * 0.3, cy + Math.sin(a) * R * 0.3, okUrban, 18);
     }
-    const fire = this.c.population >= 7000 ? 2 : 1;
-    for (let k = 0; k < fire; k++) {
-      const a = (2 * Math.PI * k) / fire + 5.1;
-      this.place('firestation', 'firestation', cx + Math.cos(a) * R * 0.35, cy + Math.sin(a) * R * 0.35, okUrban, 18);
-    }
+    // one central station covers a town of this size (about 15,000 people within 1-2 km); small developing towns
+    // have none yet and rely on the district's engines from further away
+    if (this.c.population >= FIRE_STATION_TOWN) this.place('firestation', 'firestation', cx + Math.cos(5.1) * R * 0.25, cy + Math.sin(5.1) * R * 0.25, okUrban, 18);
     // the waterworks draws from the river upstream of the town; mains follow the streets
     const wy = clamp(Math.round(cy - R * 0.3), 4, W - 6);
     const riverside = (i: number) => Math.abs((i % W) - this.riverX[(i / W) | 0]) <= 5 && m.zone[i] !== Zone.Industrial;

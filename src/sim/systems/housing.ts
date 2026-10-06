@@ -9,6 +9,8 @@ import { createProject, estimate } from './construction';
 import { findHome } from './population';
 
 export function housingDaily(sim: Sim): void {
+  // when everything is built instantly, developers look at the market every week rather than every month
+  if (sim.s.meta.build === 'all' && sim.date.dow === 1 && sim.date.dom !== 1) { const k = stock(sim); developers(sim, k.vacancy, k.homeless, k.units - k.occupied); }
   if (sim.day % 3 !== 0) return;
   for (const h of sim.s.households) {
     if (h.home >= 0) continue;
@@ -19,17 +21,21 @@ export function housingDaily(sim: Sim): void {
   }
 }
 
-export function housingMonthly(sim: Sim): void {
-  const s = sim.s, hs = s.housing, t = s.gov.taxes;
-  const nominal = sim.scale * s.ext.trend;
+/** Homes, how many are lived in, the vacancy rate and families without a home. */
+function stock(sim: Sim): { units: number; occupied: number; vacancy: number; homeless: number } {
   let units = 0, occupied = 0;
-  for (const b of s.buildings) {
+  for (const b of sim.s.buildings) {
     if (b.units <= 0 || b.kind === 'farmhouse') continue;
     units += b.units;
     occupied += Math.min(b.units, b.occupants.length);
   }
-  const vacancy = units ? (units - occupied) / units : 0;
-  const homeless = s.households.filter((h) => h.home < 0).length;
+  return { units, occupied, vacancy: units ? (units - occupied) / units : 0, homeless: sim.s.households.filter((h) => h.home < 0).length };
+}
+
+export function housingMonthly(sim: Sim): void {
+  const s = sim.s, hs = s.housing, t = s.gov.taxes;
+  const nominal = sim.scale * s.ext.trend;
+  const { units, occupied, vacancy, homeless } = stock(sim);
   // families without a home only push rents up when there is genuinely nothing to rent; with empty flats
   // around they are priced out rather than short of supply
   const pressure = vacancy < 0.03 ? homeless / Math.max(1, s.households.length) : 0;

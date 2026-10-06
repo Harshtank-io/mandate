@@ -5,7 +5,7 @@ import { initAir, initFood, initLeisure, initTourism, initTrade, initUtilities }
 import { getPreset, moneyScale } from './presets';
 import { DEPTS, type MonthStats, type WorldState } from './types';
 
-export const STATE_VERSION = 3;
+export const STATE_VERSION = 4;
 
 const MONTH_DEFAULTS_V2: Partial<MonthStats> = {
   leisure: 0.6, tourists: 0, foreignTourists: 0, touristNights: 0, tourismSpend: 0, turnedAway: 0, hotelRooms: 0, occupancy: 0, appeal: 0,
@@ -74,11 +74,20 @@ function toV3(s: WorldState): void {
   monthDefaults(s, MONTH_DEFAULTS_V3);
 }
 
+/** v3 -> v4: term loans, electricity sold to the regional grid, the construction setting. */
+function toV4(s: WorldState): void {
+  ledgers(s);
+  s.gov.loans ??= [];
+  s.meta.build ??= 'realistic';
+  for (const l of [s.util.m, s.util.last]) { l.exported ??= 0; l.sales ??= 0; }
+}
+
 export function migrate(s: WorldState): WorldState {
   const v = s.v ?? 1;
   if (v >= STATE_VERSION) return s;
   if (v < 2) toV2(s);
   if (v < 3) toV3(s);
+  if (v < 4) toV4(s);
   s.v = STATE_VERSION;
   return s;
 }

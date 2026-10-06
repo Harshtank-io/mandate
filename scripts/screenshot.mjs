@@ -67,20 +67,32 @@ try {
   await page.waitForTimeout(300);
   await shot('08-overview-why');
 
-  // data layers
-  await page.getByRole('button', { name: 'Layers' }).click();
-  await page.getByRole('button', { name: 'Traffic' }).click();
+  // info views (the tray stays open while views are compared)
+  await page.getByRole('button', { name: 'Info views', exact: true }).click();
+  await page.getByRole('button', { name: 'Traffic', exact: true }).click();
   await page.waitForTimeout(800);
   await shot('09-layer-traffic');
-  await page.getByRole('button', { name: 'Layers' }).click();
-  await page.getByRole('button', { name: 'Healthcare reach' }).click();
+  await page.getByRole('button', { name: 'Electricity', exact: true }).click();
   await page.waitForTimeout(800);
-  await shot('10-layer-health');
-  await page.getByRole('button', { name: 'Layers' }).click();
-  await page.getByRole('button', { name: 'Normal view' }).click();
+  await shot('10-layer-power');
+  await page.getByRole('button', { name: 'Healthcare reach', exact: true }).click();
+  await page.waitForTimeout(800);
+  await shot('10b-layer-health');
+  await page.getByRole('button', { name: 'Normal view', exact: true }).click();
+  await page.keyboard.press('Escape');
+
+  // the demand meter opens the zoning tray, which explains it; then the water & power cards
+  await page.getByRole('button', { name: /Demand for zoned land/ }).click();
+  await page.waitForTimeout(300);
+  await shot('11a-zoning-demand');
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: 'Water & power', exact: true }).click();
+  await page.waitForTimeout(300);
+  await shot('11b-tray-utilities');
+  await page.keyboard.press('Escape');
 
   // build tool: propose a clinic where the cursor is
-  await page.getByRole('button', { name: 'Build' }).click();
+  await page.getByRole('button', { name: 'Services', exact: true }).click();
   await page.getByRole('button', { name: /Health clinic/ }).click();
   const b = await canvasCenter(80, -30);
   await page.mouse.move(b.x, b.y);
@@ -89,6 +101,64 @@ try {
   await page.waitForTimeout(500);
   await shot('11-build-proposal');
   await page.keyboard.press('Escape');
+  await page.keyboard.press('Escape');
+
+  // bulldozer: point at a building, then click it for a demolition order
+  await page.getByRole('button', { name: 'Bulldoze', exact: true }).click();
+  const d = await canvasCenter(-60, 40);
+  await page.mouse.move(d.x, d.y);
+  await page.waitForTimeout(400);
+  await page.mouse.click(d.x, d.y);
+  await page.waitForTimeout(500);
+  await shot('11c-bulldoze');
+  await page.keyboard.press('Escape');
+  await page.keyboard.press('Escape');
+
+  // instant construction without changing any setting: "Build instantly" on the proposal
+  const clinics = () => game(() => window.__mandate.game.state.buildings.filter((x) => x.kind === 'clinic').length);
+  const clinicsBefore = await clinics();
+  await page.getByRole('button', { name: 'Services', exact: true }).click();
+  await page.waitForTimeout(300);
+  await shot('11d-tray-instant-switch');
+  await page.getByRole('button', { name: /Health clinic/ }).click();
+  let built = false;
+  for (const [dx, dy] of [[120, 60], [-140, 80], [60, 140], [-80, -120], [180, -60], [0, 180], [-200, 20]]) {
+    const pt = await canvasCenter(dx, dy);
+    await page.mouse.move(pt.x, pt.y);
+    await page.waitForTimeout(200);
+    await page.mouse.click(pt.x, pt.y);
+    await page.waitForTimeout(300);
+    const btn = page.getByRole('button', { name: 'Build instantly' });
+    if ((await btn.count()) && (await btn.isEnabled())) { await shot('11e-instant-proposal'); await btn.click(); built = true; break; }
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click().catch(() => {});
+  }
+  await page.waitForTimeout(600);
+  const clinicsAfter = await clinics();
+  console.log(`instant build: approved ${built}, clinics ${clinicsBefore} -> ${clinicsAfter}`);
+  if (!built || clinicsAfter !== clinicsBefore + 1) problems.push('instant build did not add a clinic');
+  await shot('11f-instant-built');
+  await page.keyboard.press('Escape');
+
+  // loans: borrow from the development fund in the Budget tab
+  await page.getByRole('tab', { name: 'Budget', exact: true }).click();
+  const loans = () => game(() => window.__mandate.game.state.gov.loans.length);
+  const loansBefore = await loans();
+  await page.getByRole('button', { name: /^Borrow / }).first().click();
+  await page.waitForTimeout(400);
+  const loansAfter = await loans();
+  console.log(`loans: ${loansBefore} -> ${loansAfter}`);
+  if (loansAfter !== loansBefore + 1) problems.push('borrowing did not add a loan');
+  await page.getByRole('heading', { name: 'Loans', exact: true }).scrollIntoViewIfNeeded();
+  await shot('11g-loans');
+
+  // the switch on the build trays turns instant construction on for every project
+  await page.getByRole('button', { name: 'Water & power', exact: true }).click();
+  await page.getByRole('checkbox', { name: 'Instant construction' }).check();
+  await page.waitForTimeout(300);
+  const mode = await game(() => window.__mandate.game.state.meta.build);
+  console.log(`tray switch: construction is ${mode}`);
+  if (mode !== 'public') problems.push(`tray switch left construction at ${mode}`);
+  await shot('11h-tray-instant-on');
   await page.keyboard.press('Escape');
 
   // camera modes
@@ -115,7 +185,7 @@ try {
 
   // persistence: leave to the menu (saves), make the stored save look six hours old, reload and continue
   const before = await game(() => ({ minute: window.__mandate.game.state.minute, name: window.__mandate.game.state.meta.name }));
-  await page.getByRole('button', { name: 'Menu' }).click();
+  await page.getByRole('button', { name: 'Menu', exact: true }).click();
   await page.getByRole('button', { name: new RegExp(`Continue ${before.name}`) }).waitFor({ timeout: 30_000 });
   await page.evaluate(async (hours) => {
     const db = await new Promise((res, rej) => { const r = indexedDB.open('mandate'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });

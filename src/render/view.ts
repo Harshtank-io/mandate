@@ -12,7 +12,7 @@ import { flightsOn } from '../sim/systems/aviation';
 import { findPath } from '../sim/systems/transport';
 import { isRoadwork } from '../sim/systems/construction';
 import { projectProgress, refAtTile, type Ref } from '../sim/inspect';
-import { previewBuilding, previewRoad, rectTiles, routeTiles, zoneable, type RoadTool } from '../sim/commands';
+import { previewBuilding, previewDemolish, previewRoad, rectTiles, routeTiles, zoneable, type RoadTool } from '../sim/commands';
 import { CameraRig, type CameraPreset } from './camera';
 import { buildingLook, CAR_COLORS, GOOD_COLORS, lookFor } from './look';
 import { N, paintOverlay, paintTerrain, roadColor, TEX, ZONE_RGB, type Overlay } from './paint';
@@ -41,7 +41,25 @@ export interface ViewOptions {
 }
 
 const UP = new THREE.Vector3(0, 1, 0);
+const AX_X = new THREE.Vector3(1, 0, 0);
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+/** Direction the wind blows towards today, shared by turbines and smoke; it shifts every few days. */
+const windYaw = (day: number) => hash01(Math.floor(day / 3), 23) * Math.PI * 2;
+
+/** What the bulldozer takes from a press at `from` dragged to `to`: the building pressed on, or the roads along the drag. */
+function demolishTarget(sim: Sim, from: number, to: number): number[] {
+  if (from < 0) return [];
+  const m = sim.s.map;
+  const o = m.owner[from];
+  const b = o >= 0 ? sim.bld(o) : undefined;
+  if (b) {
+    const out: number[] = [];
+    for (let y = b.y; y < b.y + b.h; y++) for (let x = b.x; x < b.x + b.w; x++) out.push(y * N + x);
+    return out;
+  }
+  const t = to < 0 ? from : to;
+  return routeTiles(from % N, (from / N) | 0, t % N, (t / N) | 0).filter((i) => m.road[i] > 0);
+}
 const LEFT_HAND = new Set(['in-deccan', 'in-punjab', 'ke-rift']);
 
 /** A resizable instanced mesh with per-instance colour and optional float attributes. */
@@ -105,6 +123,13 @@ class Layer {
     if (this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
     for (const a of this.attrs) (this.mesh.geometry.getAttribute(a) as THREE.InstancedBufferAttribute).needsUpdate = true;
     this.mesh.boundingSphere = null;
+  }
+
+  /** Swaps the material, e.g. unlit while an info view colours the instances. */
+  setMaterial(mat: THREE.Material): void {
+    if (this.mat === mat) return;
+    this.mat = mat;
+    this.mesh.material = mat;
   }
 
   dispose(): void { this.parent.remove(this.mesh); this.mesh.geometry.dispose(); this.mesh.dispose(); }
@@ -254,7 +279,11 @@ const SIGN_COLORS = [0xff4d3d, 0x3dc8ff, 0xffd23d, 0xf2f2f2];
 const TEAM_COLORS = [0x2f6fb0, 0xc0392b, 0x2e8b57, 0xe0a020, 0x6c3fb0];
 const LIVERY = [0xd8432f, 0x2f6fd8, 0x2fae6a, 0xe0a020, 0x7a3fc0, 0x1f9fb0];
 /** Upper bound on extra parts drawn for each decorated building type. */
-const PARTS: Partial<Record<BuildingKind, number>> = { airport: 150, stadium: 40, heritage: 30, museum: 12, hotel: 4, cinema: 6 };
+const PARTS: Partial<Record<BuildingKind, number>> = {
+  airport: 150, stadium: 40, heritage: 30, museum: 12, hotel: 4, cinema: 6, solarfarm: 32, windfarm: 12, substation: 14, waterworks: 8, firestation: 8, gasplant: 4,
+};
+/** Sites laid out across their whole footprint, outlined by it (height of the outline box). */
+const WHOLE: Partial<Record<BuildingKind, number>> = { airport: 0.45, stadium: 1.08, heritage: 0.9, solarfarm: 0.3, windfarm: 1.75, substation: 0.5, waterworks: 0.9 };
 const URBAN = new Set<number>([Zone.Residential, Zone.Commercial, Zone.Industrial]);
 const hashStr = (t: string) => { let h = 7; for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0; return Math.abs(h); };
 
@@ -283,6 +312,8 @@ export class WorldView {
   private geos: THREE.BufferGeometry[] = [];
   private mats: THREE.Material[] = [];
   private roads: Layer; private walls: Layer; private gables: Layer; private flats: Layer; private extras: Layer; private trees: Layer;
+  /** Roads are lit like the rest of the world, except under info views that colour them (readable by night too). */
+  private roadMat: THREE.Material; private roadFlat: THREE.Material;
   private siteSolid: Layer; private siteMark: Layer; private cranes: Layer; private trucks: Layer; private cars: Layer; private marks: Layer; private preview: Layer;
   // landmarks, street lighting and aircraft
   private spires: Layer; private signs: Layer; private bldPools: Layer; private posts: Layer; private lampHeads: Layer; private lampPools: Layer;
@@ -413,7 +444,9 @@ export class WorldView {
     this.night = wm.night;
     this.keepMat(wm.mat);
     const glass = (opacity: number) => this.keepMat(new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity, depthWrite: false }));
-    this.roads = new Layer(this.scene, box, lambert(), 8000, [], false, true);
+    this.roadMat = lambert();
+    this.roadFlat = this.keepMat(new THREE.MeshBasicMaterial({ color: 0xffffff }));
+    this.roads = new Layer(this.scene, box, this.roadMat, 8000, [], false, true);
     this.walls = new Layer(this.scene, box, wm.mat, 2000, ['aLit', 'aFloors'], true, true);
     this.gables = new Layer(this.scene, gable, lambert(), 1500, [], true, true);
     this.flats = new Layer(this.scene, box, lambert(), 1500, [], true, true);
@@ -594,7 +627,7 @@ export class WorldView {
       this.terrainTex.needsUpdate = true;
       this.paintedDay = day;
     }
-    const roadOverlay = this.overlay === 'traffic' || this.overlay === 'roads';
+    const roadOverlay = this.overlay === 'traffic' || this.overlay === 'roads' || this.overlay === 'power' || this.overlay === 'water';
     if (this.changed(sim, 'roads') || this.overlay !== this.overlayKind || (roadOverlay && day !== this.overlayDay)) this.buildRoads(sim);
     if (this.changed(sim, 'buildings') || day !== this.builtDay) { this.buildBuildings(sim); this.builtDay = day; }
     if (this.changed(sim, 'terrain', 'zones', 'buildings')) this.buildTrees(sim);
@@ -619,6 +652,8 @@ export class WorldView {
 
   private buildRoads(sim: Sim): void {
     const m = sim.s.map;
+    const coloured = this.overlay === 'traffic' || this.overlay === 'roads' || this.overlay === 'power' || this.overlay === 'water';
+    this.roads.setMaterial(coloured ? this.roadFlat : this.roadMat);
     let count = 0;
     for (let t = 0; t < N * N; t++) if (m.road[t]) count++;
     this.roads.begin(count * 5);
@@ -653,7 +688,19 @@ export class WorldView {
 
   private buildBuildings(sim: Sim): void {
     const bs = sim.s.buildings;
-    let parts = 4;
+    // buildings on fire, and smouldering ruins where a fire destroyed one in the last two days
+    this.burning.length = 0;
+    for (const b of bs) {
+      if (!b.fire || b.fire <= 0 || b.kind === 'park') continue;
+      const L = buildingLook(b);
+      this.burning.push({ x: b.x + b.w / 2, z: b.y + b.h / 2, w: Math.max(0.4, Math.min(L.w, L.d)), h: Math.min(1.2, L.h + L.roofH * 0.5), seed: b.id });
+    }
+    const ev = sim.s.events;
+    for (let k = ev.length - 1; k >= 0 && sim.day - ev[k].day <= 2; k--) {
+      const e = ev[k];
+      if (e.type === 'fire.destroyed' && e.ref?.k === 'tile') this.burning.push({ x: (e.ref.id % N) + 0.5, z: ((e.ref.id / N) | 0) + 0.5, w: 0.6, h: 0.06, seed: e.id });
+    }
+    let parts = 4 + this.burning.length;
     for (const b of bs) parts += PARTS[b.kind] ?? 0;
     this.walls.begin(bs.length + parts);
     this.gables.begin(bs.length + parts);
@@ -664,13 +711,9 @@ export class WorldView {
     this.bldPools.begin(parts);
     this.buildingIds.length = 0;
     this.turbines.length = 0;
-    this.burning.length = 0;
+    for (const f of this.burning) this.bldPools.add(f.x, 0.05, f.z, 2.2, 1, 2.2, 0, 0xff8a3a);
     const heritage = sim.preset.tourism.heritageStyle;
     for (const b of bs) {
-      if (b.fire && b.fire > 0 && b.kind !== 'park') {
-        const L = buildingLook(b);
-        this.burning.push({ x: b.x + b.w / 2, z: b.y + b.h / 2, w: Math.max(0.4, Math.min(L.w, L.d)), h: Math.min(1.2, L.h + L.roofH * 0.5), seed: hash01(b.id, 9) * 10 });
-      }
       if (b.kind === 'park') continue;
       if (b.kind === 'airport') { this.airport(sim, b); continue; }
       if (b.kind === 'stadium') { this.stadium(sim, b); continue; }
@@ -678,6 +721,8 @@ export class WorldView {
       if (b.kind === 'solarfarm') { this.solarFarm(sim, b); continue; }
       if (b.kind === 'windfarm') { this.windFarm(sim, b); continue; }
       if (b.kind === 'substation') { this.substation(sim, b); continue; }
+      if (b.kind === 'waterworks') { this.waterworks(sim, b); continue; }
+      if (b.kind === 'firestation') { this.firestation(sim, b); continue; }
       const L = buildingLook(b);
       const cx = b.x + b.w / 2, cz = b.y + b.h / 2;
       const small = b.kind === 'house' || b.kind === 'farmhouse' || b.kind === 'luxury';
@@ -698,6 +743,16 @@ export class WorldView {
         case 'chimney': this.extras.add(cx + L.w * 0.32, 0, cz - L.d * 0.28, 0.12, L.h + 0.75, 0.12, 0, 0x8b8b8b); break;
         case 'silos': for (let k = 0; k < 3; k++) this.extras.add(b.x + 0.35 + k * 0.32, 0, b.y + b.h - 0.22, 0.26, 0.8, 0.26, 0, 0xd8d6cf); break;
         case 'tower': this.extras.add(cx, L.h, cz, 0.34, 0.36, 0.34, 0, 0xcdb88f); break;
+        case 'stacks': { // gas plant: exhaust stacks beside the turbine hall, a fuel tank at the other end
+          const long = b.w >= b.h;
+          for (const k of [-1, 1]) {
+            const [x, z] = long ? [b.x + b.w - 0.24, cz + k * 0.4] : [cx + k * 0.4, b.y + b.h - 0.24];
+            this.extras.add(x, 0, z, 0.17, 1.2, 0.17, 0, 0xb9bdc1);
+          }
+          const [tx, tz] = long ? [b.x + 0.24, cz] : [cx, b.y + 0.24];
+          this.extras.add(tx, 0, tz, 0.32, 0.34, 0.32, 0, 0xe2ded2);
+          break;
+        }
         case 'sign': { // hotel: an illuminated name board on the roof and a canopy over the entrance
           const [sx, sz] = at(0, L.d / 2 - 0.05);
           this.signs.add(sx, L.h + L.roofH + 0.01, sz, Math.min(0.5, L.w * 0.7), 0.11, 0.035, rot, SIGN_COLORS[Math.floor(hash01(b.style, 4) * SIGN_COLORS.length)]);
@@ -728,6 +783,155 @@ export class WorldView {
       }
     }
     this.walls.end(); this.gables.end(); this.flats.end(); this.extras.end(); this.spires.end(); this.signs.end(); this.bldPools.end();
+  }
+
+  /** A low perimeter fence around a plot. */
+  private fence(b: Building, inset = 0.06, h = 0.06): void {
+    const x0 = b.x + inset, x1 = b.x + b.w - inset, z0 = b.y + inset, z1 = b.y + b.h - inset, c = 0x8e9296;
+    this.flats.add((x0 + x1) / 2, 0, z0, x1 - x0, h, 0.015, 0, c);
+    this.flats.add((x0 + x1) / 2, 0, z1, x1 - x0, h, 0.015, 0, c);
+    this.flats.add(x0, 0, (z0 + z1) / 2, 0.015, h, z1 - z0, 0, c);
+    this.flats.add(x1, 0, (z0 + z1) / 2, 0.015, h, z1 - z0, 0, c);
+  }
+
+  /** The small control or inverter house that a click on a utility site hits, on the side facing its road. */
+  private controlHouse(sim: Sim, b: Building, F: Frame, u: number, v: number): [number, number] {
+    const L = buildingLook(b);
+    const [x, z] = F.at(u, v), [sx, sz] = F.size(L.w, L.d);
+    const i = this.walls.add(x, 0, z, sx, L.h, sz, 0, L.wall, [this.lit(sim, b), 1]);
+    if (i >= 0) this.buildingIds[i] = b.id;
+    this.flats.add(x, L.h, z, sx + 0.02, L.roofH, sz + 0.02, 0, L.roofColor);
+    return [x, z];
+  }
+
+  /** Rows of panels tilted to the sun, an inverter house by the road and a fence. */
+  private solarFarm(sim: Sim, b: Building): void {
+    const F = frameOf(b);
+    const [hx, hz] = this.controlHouse(sim, b, F, 0.42, 0.3);
+    const tilt = this.qb.setFromAxisAngle(AX_X, 0.42);
+    const rows = Math.max(2, Math.round((b.h - 0.3) / 0.46));
+    const x0 = b.x + 0.16, x1 = b.x + b.w - 0.16;
+    for (let k = 0; k < rows; k++) {
+      const z = b.y + 0.3 + (k + 0.5) * ((b.h - 0.45) / rows);
+      // rows stop short of the inverter house
+      const segs: [number, number][] = Math.abs(z - hz) < 0.38 ? [[Math.min(x1, hx + 0.32), x1], [x0, Math.max(x0, hx - 0.32)]] : [[x0, x1]];
+      for (const [a, c] of segs) {
+        if (c - a < 0.2) continue;
+        this.flats.addQ((a + c) / 2, 0.07, z, c - a, 0.018, 0.3, tilt, 0x29406a);
+        this.flats.add((a + c) / 2, 0, z, c - a - 0.1, 0.07, 0.03, 0, 0x8a8f94);
+      }
+    }
+    this.fence(b);
+  }
+
+  /** Three turbines on tall towers; their rotors are drawn every frame (see animate). */
+  private windFarm(sim: Sim, b: Building): void {
+    const F = frameOf(b);
+    this.controlHouse(sim, b, F, 0.35, 0.28);
+    const biz = b.biz >= 0 ? sim.biz(b.biz) : undefined;
+    const on = !!biz && biz.status === 'operating' && biz.downDays <= 0 && biz.jobs.some((j) => j.worker >= 0);
+    const yaw = windYaw(sim.day);
+    const spots: [number, number][] = [[0.3, 0.72], [0.75, 0.36], [0.62, 0.84]];
+    spots.forEach(([fu, fv], k) => {
+      const x = b.x + fu * b.w, z = b.y + fv * b.h;
+      const top = 1.55;
+      this.extras.add(x, 0, z, 0.075, top, 0.075, 0, 0xeef1f3);
+      this.flats.add(x, 0, z, 0.22, 0.03, 0.22, 0, 0xb4b8bc);
+      this.flats.add(x, top - 0.02, z, 0.2, 0.075, 0.08, yaw, 0xe4e7ea);
+      this.turbines.push({ x: x + Math.cos(yaw) * 0.12, y: top + 0.016, z: z - Math.sin(yaw) * 0.12, yaw, phase: hash01(b.id, k) * Math.PI * 2, on });
+    });
+  }
+
+  /** Transformers and a gantry inside a fenced gravel yard, with a control room by the road. */
+  private substation(sim: Sim, b: Building): void {
+    const F = frameOf(b);
+    this.controlHouse(sim, b, F, 0.3, 0.22);
+    for (const [u, v] of [[0.35, 0.68], [0.7, 0.68]]) {
+      const [x, z] = F.at(u, v);
+      this.flats.add(x, 0, z, 0.16, 0.13, 0.13, 0, 0x6c7a68);
+      this.extras.add(x, 0.13, z, 0.04, 0.08, 0.04, 0, 0xc9b98a);
+    }
+    for (const u of [0.16, 0.84]) { const [x, z] = F.at(u, 0.5); this.flats.add(x, 0, z, 0.025, 0.42, 0.025, 0, 0x9aa0a6); }
+    const [gx, gz] = F.at(0.5, 0.5), [gw, gd] = F.size(0.72, 0.025);
+    this.flats.add(gx, 0.4, gz, gw, 0.025, gd, 0, 0x9aa0a6);
+    this.fence(b, 0.04, 0.08);
+  }
+
+  /** Treatment hall by the road, settling tanks and an elevated storage tank. */
+  private waterworks(sim: Sim, b: Building): void {
+    const F = frameOf(b);
+    const L = buildingLook(b);
+    const [x, z] = F.at(F.long / 2, 0.42), [sx, sz] = F.size(Math.min(1.25, F.long - 0.5), 0.5);
+    const i = this.walls.add(x, 0, z, sx, L.h, sz, 0, L.wall, [this.lit(sim, b), 1]);
+    if (i >= 0) this.buildingIds[i] = b.id;
+    this.flats.add(x, L.h, z, sx + 0.02, L.roofH, sz + 0.02, 0, L.roofColor);
+    for (const u of [F.long * 0.27, F.long * 0.73]) {
+      const [tx, tz] = F.at(u, F.short - 0.5);
+      this.extras.add(tx, 0, tz, 0.72, 0.09, 0.72, 0, 0xb9b6ad);
+      this.extras.add(tx, 0.005, tz, 0.62, 0.09, 0.62, 0, 0x4f8fb3);
+    }
+    const [wx, wz] = F.at(F.long - 0.2, 0.3);
+    this.extras.add(wx, 0, wz, 0.05, 0.62, 0.05, 0, 0x9aa0a6);
+    this.extras.add(wx, 0.62, wz, 0.3, 0.2, 0.3, 0, 0xd6dde0);
+  }
+
+  /** A red station with its engine-bay doors facing the road and a drill tower at one end. */
+  private firestation(sim: Sim, b: Building): void {
+    const L = buildingLook(b);
+    const rot = frontRot(b);
+    const cx = b.x + b.w / 2, cz = b.y + b.h / 2;
+    const c = Math.cos(rot), s = Math.sin(rot);
+    const at = (lx: number, lz: number): [number, number] => [cx + lx * c + lz * s, cz - lx * s + lz * c];
+    const i = this.walls.add(cx, 0, cz, L.w, L.h, L.d, rot, L.wall, [this.lit(sim, b), L.floors]);
+    if (i >= 0) this.buildingIds[i] = b.id;
+    this.flats.add(cx, L.h, cz, L.w + 0.02, L.roofH, L.d + 0.02, rot, L.roofColor);
+    const bays = 3, span = L.w * 0.62;
+    for (let k = 0; k < bays; k++) {
+      const [dx, dz] = at(-L.w / 2 + 0.16 + (k + 0.5) * (span / bays), L.d / 2 + 0.006);
+      this.flats.add(dx, 0, dz, span / bays - 0.05, 0.17, 0.015, rot, 0xe9e6df);
+    }
+    const [tx, tz] = at(L.w / 2 - 0.14, -L.d / 2 + 0.14);
+    this.flats.add(tx, 0, tz, 0.2, 0.62, 0.2, rot, 0xb03a30);
+    this.flats.add(tx, 0.62, tz, 0.23, 0.03, 0.23, rot, 0x6e2620);
+    const [px, pz] = at(-0.1, L.d / 2 + 0.25);
+    this.flats.add(px, 0, pz, L.w * 0.7, 0.012, 0.36, rot, 0x9c9a94);
+  }
+
+  /** Turbine rotors turn while the game runs, faster in a strong wind; fires flicker and smoke drifts downwind. */
+  private animate(sim: Sim, dt: number): void {
+    const running = sim.s.minute !== this.spinMinute;
+    this.spinMinute = sim.s.minute;
+    const wind = clamp((sim.s.util?.wind ?? 0.28) / 0.28, 0.25, 2.2);
+    if (running) this.spin += dt * 0.0024 * wind;
+    this.blades.begin(this.turbines.length * 3);
+    for (const t of this.turbines) {
+      this.qb.setFromAxisAngle(UP, t.yaw);
+      const a = (t.on ? this.spin : 0) + t.phase;
+      for (let k = 0; k < 3; k++) {
+        this.qa.setFromAxisAngle(AX_X, a + (k * 2 * Math.PI) / 3).premultiply(this.qb);
+        this.blades.addQ(t.x, t.y, t.z, 0.045, 0.5, 0.012, this.qa, 0xf4f6f7);
+      }
+    }
+    this.blades.end();
+    const now = performance.now() / 1000;
+    const yaw = windYaw(sim.day), dx = Math.cos(yaw), dz = -Math.sin(yaw);
+    this.flames.begin(this.burning.length * 3);
+    this.smoke.begin(this.burning.length * 5);
+    for (const f of this.burning) {
+      const ruin = f.h < 0.1;
+      if (!ruin) for (let k = 0; k < 3; k++) {
+        const fl = 0.72 + 0.28 * Math.sin(now * (7 + k * 2.3) + f.seed + k * 1.7);
+        const ox = (hash01(f.seed, k) - 0.5) * f.w * 0.6, oz = (hash01(f.seed, k + 7) - 0.5) * f.w * 0.6;
+        this.flames.add(f.x + ox, f.h * 0.4, f.z + oz, 0.24 * fl, (0.32 + 0.14 * k) * fl, 0.24 * fl, now + k, k === 1 ? 0xffc040 : 0xff6a1a);
+      }
+      for (let k = 0; k < 5; k++) {
+        const ph = (now * 0.16 + k / 5 + hash01(f.seed, 3)) % 1;
+        const r = (ruin ? 0.08 : 0.14) + ph * (ruin ? 0.25 : 0.45);
+        this.smoke.add(f.x + dx * ph * 0.9, f.h + 0.15 + ph * (ruin ? 0.8 : 1.5), f.z + dz * ph * 0.9, r, r, r, 0, ruin ? 0x77736c : 0x56524c);
+      }
+    }
+    this.flames.end();
+    this.smoke.end();
   }
 
   /** Runway with markings and edge lights, taxiway, apron, terminal, control tower and hangar. */
@@ -982,6 +1186,20 @@ export class WorldView {
     for (const p of ps) {
       const prog = projectProgress(p);
       const building = p.phase === 'construction';
+      if (p.kind === 'demolish') {
+        p.tiles.forEach((t, k) => {
+          const done = building && k / p.tiles.length < prog;
+          this.siteMark.add((t % N) + 0.5, 0.005, ((t / N) | 0) + 0.5, 0.92, 0.05, 0.92, 0, done ? 0x9a8f80 : building ? 0xd8503a : 0xe8907a);
+        });
+        if (building && p.tiles.length) { // an excavator at work, its arm swinging
+          const t = p.tiles[Math.floor(hash01(p.id, 3) * p.tiles.length)];
+          const x = (t % N) + 0.5, z = ((t / N) | 0) + 0.5;
+          const th = hash01(p.id, 5) * Math.PI * 2 + Math.sin(sim.s.minute * 0.01) * 0.8;
+          this.cranes.add(x, 0, z, 0.22, 0.1, 0.14, th, 0xe6c229);
+          this.cranes.add(x + 0.17 * Math.cos(th), 0.08, z - 0.17 * Math.sin(th), 0.3, 0.035, 0.035, th, 0x3a3a3a);
+        }
+        continue;
+      }
       if (isRoadwork(p.kind)) {
         p.tiles.forEach((t, k) => {
           const done = building && k / p.tiles.length < prog;
@@ -995,6 +1213,7 @@ export class WorldView {
       const cx = p.x + p.w / 2, cz = p.y + p.h / 2;
       if (!building) { this.siteMark.add(cx, 0.005, cz, p.w - 0.08, 0.04, p.h - 0.08, 0, 0xf0b04a); continue; }
       const hh = Math.max(0.04, L.h * prog);
+      if (WHOLE[p.kind as BuildingKind]) this.siteMark.add(cx, 0.005, cz, p.w - 0.08, 0.04, p.h - 0.08, 0, 0xf0a030);
       this.siteSolid.add(cx, 0, cz, L.w, hh, L.d, 0, 0xb9b4aa);
       this.siteMark.add(cx, 0, cz, L.w + 0.07, L.h + 0.05, L.d + 0.07, 0, 0xf0a030);
       if (L.h > 0.45 || p.w >= 2) {
@@ -1146,8 +1365,7 @@ export class WorldView {
       if (!b) return;
       if (b.kind === 'park') { for (let y = b.y; y < b.y + b.h; y++) for (let x = b.x; x < b.x + b.w; x++) this.marks.add(x + 0.5, 0.01, y + 0.5, 0.96, 0.04, 0.96, 0, 0xffffff); return; }
       // sites laid out across their whole footprint are outlined by it
-      const whole = { airport: 0.45, stadium: 1.08, heritage: 0.9 } as Partial<Record<BuildingKind, number>>;
-      const hh = whole[b.kind];
+      const hh = WHOLE[b.kind];
       if (hh !== undefined) {
         this.edges.position.set(b.x + b.w / 2, 0, b.y + b.h / 2);
         this.edges.scale.set(b.w - 0.08, hh, b.h - 0.08);
@@ -1197,7 +1415,7 @@ export class WorldView {
   private onDown = (e: PointerEvent) => {
     this.downAt = { x: e.clientX, y: e.clientY };
     if (e.button !== 0 || e.ctrlKey || e.altKey) return;
-    if (this.tool.mode === 'road' || this.tool.mode === 'zone') {
+    if (this.tool.mode === 'road' || this.tool.mode === 'zone' || this.tool.mode === 'bulldoze') {
       const t = this.tileAt(e);
       if (t < 0) return;
       this.pendingTiles = null;
@@ -1221,6 +1439,7 @@ export class WorldView {
       this.pendingTiles = tiles;
       if (this.tool.mode === 'road') this.events.route(tiles);
       else if (this.tool.mode === 'zone') this.events.zone(tiles);
+      else if (this.tool.mode === 'bulldoze') this.events.demolish(tiles);
       return;
     }
     if (e.target !== this.canvas) return;
@@ -1246,6 +1465,7 @@ export class WorldView {
     const ax = this.dragFrom % N, ay = (this.dragFrom / N) | 0, bx = this.hover % N, by = (this.hover / N) | 0;
     if (this.tool.mode === 'road') return routeTiles(ax, ay, bx, by);
     if (this.tool.mode === 'zone') return rectTiles(ax, ay, bx, by).filter((t) => zoneable(sim, t));
+    if (this.tool.mode === 'bulldoze') return demolishTarget(sim, this.dragFrom, this.hover);
     return [];
   }
 
@@ -1306,7 +1526,7 @@ export class WorldView {
     }
     // route / zone preview
     let tiles: number[] | null = null, ok = true, color = 0x55cc77;
-    if (this.dragging && (tool.mode === 'road' || tool.mode === 'zone')) {
+    if (this.dragging && (tool.mode === 'road' || tool.mode === 'zone' || tool.mode === 'bulldoze')) {
       tiles = this.dragTiles(sim);
       if (tool.mode === 'road') {
         const key = `r:${this.dragFrom}:${this.hover}:${tool.kind}`;
@@ -1314,10 +1534,28 @@ export class WorldView {
         ok = this.hoverOk;
       }
     } else if (this.pendingTiles) tiles = this.pendingTiles;
+    else if (tool.mode === 'bulldoze' && this.hover >= 0) tiles = demolishTarget(sim, this.hover, this.hover);
+    if (tool.mode === 'bulldoze' && tiles && tiles.length) {
+      // red where the bulldozer may go, grey where it may not (heritage, the highway, a building's only road)
+      const key = `d:${tiles[0]}:${tiles[tiles.length - 1]}:${tiles.length}:${sim.ix.ver.buildings}:${sim.ix.ver.projects}:${sim.ix.ver.roads}`;
+      if (key !== this.hoverKey) { this.hoverKey = key; this.hoverOk = previewDemolish(sim, tiles).ok; }
+      ok = this.hoverOk;
+      const o = sim.s.map.owner[tiles[0]];
+      const b = o >= 0 ? sim.bld(o) : undefined;
+      if (b) {
+        const L = buildingLook(b);
+        const hgt = WHOLE[b.kind] ?? (b.kind === 'park' ? 0.1 : Math.max(0.12, L.h + L.roofH + 0.04));
+        this.ghost.position.set(b.x + b.w / 2, 0, b.y + b.h / 2);
+        this.ghost.scale.set(b.w - 0.04, hgt, b.h - 0.04);
+        this.ghostMat.color.setHex(ok ? 0xe0503c : 0x8a8f96);
+        this.ghost.visible = true;
+      }
+    }
     if (tool.mode === 'zone') {
       const c = ZONE_RGB[tool.zone];
       if (c) color = (Math.round(c[0]) << 16) | (Math.round(c[1]) << 8) | Math.round(c[2]);
-    } else if (!ok) color = 0xe05050;
+    } else if (tool.mode === 'bulldoze') color = ok ? 0xe0503c : 0x8a8f96;
+    else if (!ok) color = 0xe05050;
     else color = this.pendingTiles && !this.dragging ? this.pendingColor : 0x55cc77;
     this.preview.begin(tiles ? tiles.length : 0);
     if (tiles) for (const t of tiles) this.preview.add((t % N) + 0.5, 0.02, ((t / N) | 0) + 0.5, 0.94, 0.06, 0.94, 0, color);

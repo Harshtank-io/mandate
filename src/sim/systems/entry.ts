@@ -232,12 +232,31 @@ function proForma(sim: Sim, kind: BusinessKind): ProForma | null {
 
 const BASE_P: Partial<Record<BusinessKind, number>> = { factory: 0.12, foodplant: 0.1, materials: 0.08, office: 0.12, logistics: 0.3, construction: 0.3 };
 
+/** Return investors want before they build: higher under heavy regulation or when the city cannot pay its bills. */
+function hurdleRate(sim: Sim): number {
+  const g = sim.s.gov;
+  return 0.12 + [0, 0.01, 0.03][g.policies.businessRegulation] + (g.arrears > 0 ? 0.05 : 0) + (g.rating === 'B' ? 0.02 : 0);
+}
+
+export interface Appetite { kind: BusinessKind; roi: number; hurdle: number; reasons: string[] }
+
+/** What investors expect to earn on each kind of plant, office or contractor today, against the return they want. Read-only. */
+export function investorAppetite(sim: Sim): Appetite[] {
+  const hurdle = hurdleRate(sim);
+  const out: Appetite[] = [];
+  for (const kind of ['factory', 'foodplant', 'materials', 'office', 'construction', 'logistics'] as BusinessKind[]) {
+    const pf = proForma(sim, kind);
+    if (pf) out.push({ kind, roi: pf.roi, hurdle, reasons: pf.reasons });
+  }
+  return out;
+}
+
 function invest(sim: Sim, kind: BusinessKind): void {
   const s = sim.s, r = sim.rng;
   if (s.businesses.some((b) => b.kind === kind && (b.status === 'planned' || b.status === 'registering' || b.status === 'licensing'))) return;
   const pf = proForma(sim, kind);
   if (!pf) return;
-  const hurdle = 0.12 + [0, 0.01, 0.03][s.gov.policies.businessRegulation] + (s.gov.arrears > 0 ? 0.05 : 0) + (s.gov.rating === 'B' ? 0.02 : 0);
+  const hurdle = hurdleRate(sim);
   const p = (BASE_P[kind] ?? 0.05) / (1 + Math.exp(-(pf.roi - hurdle) / 0.03));
   if (!r.chance(p)) return;
   const bs = BUILDINGS[BUSINESSES[kind].building as keyof typeof BUILDINGS];

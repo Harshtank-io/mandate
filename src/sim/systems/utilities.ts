@@ -9,7 +9,7 @@ import { idx, inMap, W, type Sim } from '../core';
 import { emptyUtilityLedger } from '../init';
 import { businessName } from '../names';
 import {
-  BASE_KWH, BUILDINGS, BUSINESSES, GAS_FUEL, GRID_PRICE, HOME_KWH, HOME_WATER, MEALS_PER_STAFF, PEAK_FACTOR, PLANTS, POWER_TARIFF, PUMP_KWH, ROLES,
+  BASE_KWH, BUILDINGS, BUSINESSES, FEED_IN_PRICE, GAS_FUEL, GRID_PRICE, HOME_KWH, HOME_WATER, MEALS_PER_STAFF, PEAK_FACTOR, PLANTS, POWER_TARIFF, PUMP_KWH, ROLES,
   STREETLIGHT_KWH, SUBSTATION_MW, USE_KWH, WATER_TARIFF, WATERWORKS_M3, WELL_WATER,
 } from '../tables';
 import { RoadClass, Terrain, Zone, type Building, type BuildingKind, type Business } from '../types';
@@ -33,6 +33,8 @@ export function bizTariff(sim: Sim): number { return POWER_TARIFF.business * nom
 export function waterTariff(sim: Sim): number { return WATER_TARIFF * nominalOf(sim) * sim.s.gov.taxes.water; }
 /** What the regional grid charges per kWh. */
 export function gridPrice(sim: Sim): number { return GRID_PRICE * nominalOf(sim); }
+/** What the regional grid pays per kWh fed into it. */
+export function feedInPrice(sim: Sim): number { return FEED_IN_PRICE * nominalOf(sim); }
 /** Gas burned per kWh generated: it follows world oil prices and the exchange rate. */
 export function gasPrice(sim: Sim): number { return GAS_FUEL * nominalOf(sim) * (sim.s.ext.fuel / (60 * nominalOf(sim))); }
 
@@ -98,6 +100,36 @@ export function network(sim: Sim): Net {
   const net = { comp, count, grid, tiles };
   nets.set(sim, { ver: sim.ix.ver.roads, net });
   return net;
+}
+
+export interface SupplyMap {
+  comp: Int32Array; // network of each road tile (-1 = none)
+  power: Uint8Array; // per network: 0 no supply, 1 regional grid, 2 local plants only
+  water: Uint8Array; // per network: 1 = mains water from a waterworks
+}
+const supplies = new WeakMap<Sim, { key: string; map: SupplyMap }>();
+
+/** Which road networks carry electricity and mains water today. Cached; read-only. */
+export function supplyMap(sim: Sim): SupplyMap {
+  const net = network(sim);
+  const key = `${sim.ix.ver.roads}:${sim.ix.ver.buildings}:${sim.day}`;
+  const c = supplies.get(sim);
+  if (c && c.key === key) return c.map;
+  const power = new Uint8Array(net.count), water = new Uint8Array(net.count);
+  for (let k = 0; k < net.count; k++) if (net.grid[k]) power[k] = 1;
+  for (const b of sim.s.buildings) {
+    const plant = !!PLANTS[b.kind], works = b.kind === 'waterworks';
+    if (!plant && !works) continue;
+    const biz = b.biz >= 0 ? sim.biz(b.biz) : undefined;
+    if (!biz || biz.status !== 'operating') continue;
+    const k = networkOf(sim, net, b);
+    if (k < 0) continue;
+    if (plant && !power[k]) power[k] = 2;
+    if (works) water[k] = 1;
+  }
+  const map = { comp: net.comp, power, water };
+  supplies.set(sim, { key, map });
+  return map;
 }
 
 /** The network a building is connected to through its access road, or any road along its edge (-1 = none). */
@@ -311,18 +343,53 @@ export function utilitiesDaily(sim: Sim): void {
     wServed[c] = Wd[c] > 0 ? got / Wd[c] : wcap[c] > 0 ? 1 : 0;
     water += got; wantW += Wd[c]; wcapAll += wcap[c];
   }
-  // what each plant and waterworks produced today
+  // power the town cannot use goes out on the regional grid, which pays for it: wind and sun first, then gas when the
+  // price beats the fuel. The line into town carries it, less whatever it brought in today.
+  const fi = feedInPrice(sim);
+  let lineLeft = Math.max(0, G * 24_000 * 0.9 - gridE);
+  const solarOut = new Float64Array(C), windOut = new Float64Array(C), gasOut = new Float64Array(C);
+  for (let c = 0; c < C && lineLeft > 0; c++) {
+    if (!net.grid[c]) continue;
+    const sol = solarMW[c] * 24_000 * u.sun - solarBy[c], wnd = windMW[c] * 24_000 * u.wind - windBy[c];
+    const spare = Math.max(0, sol) + Math.max(0, wnd);
+    if (spare <= 0) continue;
+    const out = Math.min(spare, lineLeft);
+    solarOut[c] = (out * Math.max(0, sol)) / spare;
+    windOut[c] = (out * Math.max(0, wnd)) / spare;
+    lineLeft -= out;
+  }
+  if (fp < fi) for (let c = 0; c < C && lineLeft > 0; c++) {
+    if (!net.grid[c]) continue;
+    const out = Math.min(Math.max(0, gasMW[c] * 24_000 - gasBy[c]), lineLeft);
+    gasOut[c] = out;
+    lineLeft -= out;
+  }
+  let exported = 0;
+  for (let c = 0; c < C; c++) exported += solarOut[c] + windOut[c] + gasOut[c];
+  if (exported > 0) sim.tax('powerSales', s.ext, exported * fi);
+  // what each plant and waterworks produced today. A plant's books: income from what it sold to the grid, and the fuel
+  // it burned; what it saved the city on grid purchases is shown alongside (see inspect)
   for (const pl of plants) {
     const tot = pl.kind === 'gasplant' ? gasMW[pl.c] : pl.kind === 'solarfarm' ? solarMW[pl.c] : windMW[pl.c];
-    const made = pl.kind === 'gasplant' ? gasBy[pl.c] : pl.kind === 'solarfarm' ? solarBy[pl.c] : windBy[pl.c];
-    if (tot > 0) pl.b.m.production += made * (pl.mw / tot);
+    if (tot <= 0) continue;
+    const k = pl.mw / tot;
+    const made = (pl.kind === 'gasplant' ? gasBy[pl.c] : pl.kind === 'solarfarm' ? solarBy[pl.c] : windBy[pl.c]) * k;
+    const sold = (pl.kind === 'gasplant' ? gasOut[pl.c] : pl.kind === 'solarfarm' ? solarOut[pl.c] : windOut[pl.c]) * k;
+    pl.b.m.production += made + sold;
+    pl.b.m.sales += sold;
+    pl.b.m.revenue += sold * fi;
+    if (pl.kind === 'gasplant') pl.b.m.cogs += (made + sold) * fp;
   }
   for (const ww of waterworks) if (wcap[ww.c] > 0) ww.b.m.production += Math.min(Wd[ww.c], wcap[ww.c]) * ((ww.cap * pumping(ww.c)) / wcap[ww.c]);
-  // the city pays for what it buys
-  const cost = gridE * gp + gasE * fp;
+  // the city pays for what it buys, and for gas burned to sell
+  let gasSold = 0;
+  for (let c = 0; c < C; c++) gasSold += gasOut[c];
+  const cost = gridE * gp + (gasE + gasSold) * fp;
   if (cost > 0) sim.spend('energy', s.ext, cost);
-  s.stats.acc.industryCO2 += (gasE * GAS_CO2) / 1000;
-  u.unit = E > 0 ? cost / E : gp;
+  s.stats.acc.industryCO2 += ((gasE + gasSold) * GAS_CO2) / 1000;
+  u.m.exported += exported;
+  u.m.sales += exported * fi;
+  u.unit = E > 0 ? (gridE * gp + gasE * fp) / E : gp;
   u.peak = P; u.cap = cap;
   u.served = Dsum > 0 ? E / Dsum : 1;
   u.waterUse = wantW; u.waterCap = wcapAll;
@@ -414,7 +481,8 @@ export function peakDemand(sim: Sim): number {
 function firstDay(sim: Sim): void {
   const u = sim.s.util;
   if (u.retrofit) { retrofit(sim); delete u.retrofit; }
-  u.gridBase = Math.max(0.6, 1.25 * peakDemand(sim));
+  // a fresh business has no books yet and is counted at a cautious level of activity, so allow for that as well
+  u.gridBase = Math.max(0.6, 1.4 * peakDemand(sim));
 }
 
 function retrofit(sim: Sim): void {
@@ -427,7 +495,7 @@ function retrofit(sim: Sim): void {
     const site = findSite(sim, 2, 2, cx - 8, cy, (x, y) => nearWaterTiles(sim, x, y, 2, 2, 4));
     if (site) staffNow(sim, addFacility(sim, 'waterworks', site.x, site.y, site.access));
   }
-  if (!has('firestation') && s.citizens.length >= 1500) {
+  if (!has('firestation') && s.citizens.length >= 4000) {
     const site = findSite(sim, 2, 1, cx + 3, cy + 3, () => true);
     if (site) staffNow(sim, addFacility(sim, 'firestation', site.x, site.y, site.access));
   }
@@ -535,6 +603,7 @@ export function utilityReport(sim: Sim): UtilityReport {
     lines.push(`Electricity came ${[`${pc(L.grid)}% from the regional grid`, L.gas > 0 ? `${pc(L.gas)}% from gas` : '', L.solar + L.wind > 0 ? `${pc(L.solar + L.wind)}% from solar and wind` : ''].filter(Boolean).join(', ')}`);
   }
   if (L.cost > 0 || L.bills > 0) lines.push(`Bills raised ${fmtMoney(sim, L.bills)}; electricity bought cost ${fmtMoney(sim, L.cost)}`);
+  if (L.exported > 0) lines.push(`The city’s plants sold ${Math.round(L.exported / 1000).toLocaleString('en-US')} MWh to the regional grid for ${fmtMoney(sim, L.sales)}`);
   if (L.blackouts > 0) lines.push(`${L.blackouts} day${L.blackouts > 1 ? 's' : ''} with rolling blackouts${L.outages ? `, ${L.outages} with the regional grid down` : ''}`);
   return {
     peak: u.peak, cap: u.cap, grid: gridCapacity(sim), served: u.served, waterUse: u.waterUse, waterCap: u.waterCap, waterServed: u.waterServed,

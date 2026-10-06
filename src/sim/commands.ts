@@ -6,12 +6,17 @@ import { dateOf, dayIndex, formatDay } from './calendar';
 import { idx, inMap, W, type Sim } from './core';
 import { BUILDINGS, BUSINESSES, PLANTS, POWER_TARIFF, ROADWORKS, ROLES, SUBSTATION_MW, WATER_TARIFF, WATERWORKS_M3 } from './tables';
 import {
-  cancelProject, createProject, estimate, fmtMoney, footprintTiles, isRoadwork, localLabourers, minLocalCrew, OUTSIDE_PREMIUM, strandedBy, type Estimate,
+  buildNow, cancelProject, createProject, estimate, fmtMoney, footprintTiles, instantBlocker, isInstant, isRoadwork, isUnderWay, localLabourers, minLocalCrew,
+  OUTSIDE_PREMIUM, strandedBy, type Estimate,
 } from './systems/construction';
+import { loanOffers, LOAN_PRODUCTS, newLoan } from './systems/loans';
+import { feedInPrice } from './systems/utilities';
 import { DEPT_LABELS, POLICY_DELAY, POLICY_LABELS, TAX_LABELS } from './systems/government';
 import { projectedPassengers } from './systems/aviation';
 import { AIRPORT_COFUND, AIRPORT_MIN_DEMAND } from './tables';
-import { RoadClass, Terrain, Zone, type BuildingKind, type Dept, type Policies, type ProjectKind, type RoleId, type TaxSettings } from './types';
+import {
+  RoadClass, Terrain, Zone, type BuildingKind, type BuildMode, type Dept, type LoanKind, type Policies, type Project, type ProjectKind, type RoleId, type TaxSettings,
+} from './types';
 
 export type CommandResult = { ok: true; message: string; id?: number } | { ok: false; error: string };
 
@@ -322,7 +327,7 @@ export function previewBuilding(sim: Sim, kind: BuildingKind, x: number, y: numb
   base.est = est;
   const n = sim.scale * sim.s.ext.trend;
   const staff = staffNeed(sim, kind);
-  base.monthly = staff.reduce((a, s) => a + sim.roleWage(s.role) * s.n * 1.2, 0) + (UPKEEP[kind] ?? 0) * n + est.cost * BUILDINGS[kind].maintenance * 0.2;
+  base.monthly = runningCost(sim, kind, est.cost);
   // requirements
   requirements.push(`Budget: ${fmtMoney(sim, est.cost)}${est.equipment > 0 ? ` including ${fmtMoney(sim, est.equipment)} of equipment` : ''}`);
   if (est.landCost > 0) requirements.push(`Land: ${fmtMoney(sim, est.landCost)} to acquire${est.farmsAffected ? ` fields from ${est.farmsAffected} farm${est.farmsAffected > 1 ? 's' : ''}` : ''}${est.displaced ? `, relocating ${est.displaced} household${est.displaced > 1 ? 's' : ''}` : ''}`);
@@ -371,7 +376,10 @@ export function previewBuilding(sim: Sim, kind: BuildingKind, x: number, y: numb
         warnings.push('Gas costs more per kWh than buying from the regional grid: the plant runs when the grid cannot cover demand');
         risks.push('Air pollution and CO₂ around the plant');
       } else {
-        benefits.push(`${pl.mw} MW of ${kind === 'solarfarm' ? 'panels' : 'turbines'}: free electricity, about ${Math.round(pl.cf * 100)}% of capacity on average`, 'No fuel, no emissions; cuts what the city buys from the grid');
+        const mwh = Math.round(pl.mw * 24 * 30 * pl.cf);
+        benefits.push(`${pl.mw} MW of ${kind === 'solarfarm' ? 'panels' : 'turbines'}: about ${mwh.toLocaleString('en-US')} MWh a month, ${Math.round(pl.cf * 100)}% of capacity on average`,
+          'No fuel, no emissions; cuts what the city buys from the grid',
+          `Power the town does not use is sold to the regional grid at ${fmtMoney(sim, feedInPrice(sim))}/kWh: up to ${fmtMoney(sim, mwh * 1000 * feedInPrice(sim))} a month (needs a road link to the highway)`);
         risks.push(`Only ${Math.round(pl.peak * 100)}% of its capacity can be counted on at the evening peak${kind === 'solarfarm' ? ', when the sun has set' : ', when the wind may drop'}`);
       }
       break;
@@ -379,19 +387,96 @@ export function previewBuilding(sim: Sim, kind: BuildingKind, x: number, y: numb
   }
   if (jobs) benefits.push(`${jobs} public jobs once staffed`);
   benefits.push(outside ? 'Day labour on the site for local residents' : `Construction work for local contractors (${fmtMoney(sim, (est.labor / 0.9) * (sim.roleWage('laborer') / 26) * 1.35)} in wages)`);
-  // risks
-  const wet = wetMonths(sim, est.construction);
+  // risks (under instant construction there is no building period to go wrong)
+  const instant = isInstant(sim, { gov: true });
+  const wet = instant ? 0 : wetMonths(sim, est.construction);
   if (wet) risks.push(`${wet} rainy-season month${wet > 1 ? 's' : ''} during construction: heavy rain stops work on site`);
-  if (cl.active >= 3) risks.push(`${cl.active} other projects are competing for contractors`);
+  if (!instant && cl.active >= 3) risks.push(`${cl.active} other projects are competing for contractors`);
   for (const s of staff) if (ROLES[s.role].edu >= 3 && s.avail < s.n * 0.5) risks.push(`Staff shortage: only ${s.avail} of ${s.n} ${ROLES[s.role].label.toLowerCase()}s can be found locally; it may open below capacity`);
   if (est.cost > 50_000_000 * n) risks.push('Large contracts attract inflated invoices unless the administration is well funded');
-  risks.push('Material prices and delays can push costs above the estimate');
+  if (!instant) risks.push('Material prices and delays can push costs above the estimate');
   if (est.displaced > 0) risks.push(`${est.displaced} relocated household${est.displaced > 1 ? 's' : ''} will be unhappy`);
-  const g = sim.s.gov;
-  if (g.cash < est.cost * 0.1) warnings.push('The treasury is low: the project will wait for funds after approval, or be financed by borrowing.');
+  fundingNotes(sim, est.cost, errors, warnings);
   if (base.monthly > 0) warnings.push(`Running cost at full service: about ${fmtMoney(sim, base.monthly)} a month (added to the ${deptOf(kind)} budget).`);
   base.ok = errors.length === 0;
   return base;
+}
+
+/** Treasury checks for a public project: instant construction pays everything now; otherwise the project waits for funds. */
+function fundingNotes(sim: Sim, cost: number, errors: string[], warnings: string[]): void {
+  if (isInstant(sim, { gov: true })) {
+    const why = instantBlocker(sim, { gov: true, sponsor: -1, cost });
+    if (why) errors.push(`${why}.`);
+    else if (sim.s.gov.cash < cost) warnings.push('The treasury does not hold enough: the city borrows the rest at the start of next month.');
+  } else if (sim.s.gov.cash < cost * 0.1) warnings.push('The treasury is low: the project will wait for funds after approval, or be financed by borrowing.');
+}
+
+/**
+ * Finishes a public project at once when construction is instant, or when the player asked for it (`force`).
+ * Returns the completion message, or null when it goes ahead at the usual pace.
+ */
+function finishIfInstant(sim: Sim, p: Project, force = false): string | null {
+  if (!(force || isInstant(sim, p)) || !buildNow(sim, p)) return null;
+  const biz = p.bizId >= 0 ? sim.biz(p.bizId) : undefined;
+  const opening = biz?.pub ? `; ${biz.name} is open and hiring its ${biz.jobs.length} staff` : '';
+  // what it cost all told: building work, equipment and the land or property bought for it
+  return `${p.name} ${p.kind === 'demolish' ? 'done' : 'built'} for ${fmtMoney(sim, p.spent + p.landCost)}${opening}.`;
+}
+
+/** Why a public project costing `cost` cannot be built at once right now (null = it can). */
+export function instantProblem(sim: Sim, cost: number): string | null {
+  return instantBlocker(sim, { gov: true, sponsor: -1, cost });
+}
+
+/** Finishes a public project under way today, paying what is left of its cost at once. */
+export function finishNow(sim: Sim, projectId: number): CommandResult {
+  const p = sim.ix.proj.get(projectId);
+  if (!p) return fail('No such project.');
+  if (!p.gov) return fail('Only the city’s own projects can be finished early.');
+  if (!isUnderWay(p)) return fail('This project is not under way.');
+  const why = instantBlocker(sim, p);
+  if (why) return fail(`${why}.`);
+  const done = finishIfInstant(sim, p, true);
+  return done ? ok(done) : fail('It could not be finished now.');
+}
+
+/** Monthly operating costs of a facility besides its staff (supplies, spares, upkeep). */
+export function facilityUpkeep(sim: Sim, kind: BuildingKind): number { return (UPKEEP[kind] ?? 0) * sim.scale * sim.s.ext.trend; }
+
+/** Monthly running cost of a public facility at full service: staff, operations and upkeep. */
+export function runningCost(sim: Sim, kind: BuildingKind, cost: number): number {
+  const n = sim.scale * sim.s.ext.trend;
+  const biz = BUILDINGS[kind].biz;
+  const staff = biz && BUSINESSES[biz].pub ? BUSINESSES[biz].jobs.reduce((a, [role, k]) => a + sim.roleWage(role) * k * 1.2, 0) : 0;
+  return staff + (UPKEEP[kind] ?? 0) * n + cost * BUILDINGS[kind].maintenance * 0.2;
+}
+
+const CARD_NOTES: Partial<Record<BuildingKind, string>> = {
+  school: 'Places for 420 pupils', college: '600 students; graduates after 3–4 years', clinic: 'Primary care for 3,500 residents', hospital: 'Hospital care for 22,000',
+  police: 'Policing for 9,000 residents', firestation: 'Fire cover for 15,000 residents', affordable: 'Low-rent homes owned by the city', townhall: 'Faster approvals, better tax collection',
+  park: 'Green space and cleaner air nearby', museum: 'Somewhere to go; draws visitors', stadium: 'Matches and concerts for 12,000', airport: 'Flights for visitors and business',
+  waterworks: '2,500 m³ of water a day; by the river', substation: '+8 MW from the regional grid', gasplant: '5 MW, also when the grid fails',
+  solarfarm: '1 MW by day; surplus sold to the grid', windfarm: '2 MW; surplus sold to the grid',
+};
+
+export interface FacilityCard { kind: BuildingKind; label: string; note: string; cost: number; monthly: number; months: number; w: number; h: number; disabled: string | null }
+
+/** What a facility costs and does, for the build bar: built on clear land, so without land to buy. */
+export function facilityCard(sim: Sim, kind: BuildingKind): FacilityCard {
+  const spec = BUILDINGS[kind];
+  const est = estimate(sim, kind, new Array(spec.w * spec.h).fill(-1), spec.floors[0], true);
+  const disabled = kind === 'townhall' && sim.s.businesses.some((b) => b.kind === 'townhall') ? 'The city already has a town hall' : null;
+  return {
+    kind, label: spec.label, note: CARD_NOTES[kind] ?? '', cost: est.cost, monthly: runningCost(sim, kind, est.cost), months: Math.max(1, Math.round(est.days / 30.4)),
+    w: spec.w, h: spec.h, disabled,
+  };
+}
+
+/** Cost and upkeep of 40 m of each kind of roadwork on open land. */
+export function roadCard(sim: Sim, tool: RoadTool): { cost: number; monthly: number } {
+  const n = sim.scale * sim.s.ext.trend;
+  const est = estimate(sim, tool, [-1], 1, true);
+  return { cost: est.cost, monthly: tool === 'canal' ? 800 * n : [0, 120, 600, 1500][tool === 'road' ? 1 : 2] * 1.3 * n };
 }
 
 function deptOf(kind: BuildingKind): string {
@@ -400,11 +485,16 @@ function deptOf(kind: BuildingKind): string {
   return d ? DEPT_LABELS[d].toLowerCase() : 'city';
 }
 
-export function proposeBuilding(sim: Sim, kind: BuildingKind, x: number, y: number, floors?: number, rot = false): CommandResult {
+/** `instant`: build it now whatever the world's construction setting, paying the whole cost at once. */
+export function proposeBuilding(sim: Sim, kind: BuildingKind, x: number, y: number, floors?: number, rot = false, instant = false): CommandResult {
   const pv = previewBuilding(sim, kind, x, y, floors, rot);
   if (!pv.ok) return fail(pv.errors.join(' '));
+  const why = instant ? instantProblem(sim, pv.est!.cost) : null;
+  if (why) return fail(`${why}.`);
   const name = kind === 'affordable' ? `Public housing (${pv.floors} floors)` : BUILDINGS[kind].label;
   const p = createProject(sim, { kind, x, y, w: pv.w, h: pv.h, floors: pv.floors, gov: true, sponsor: -1, name, reason: 'Commissioned by the government', cofund: cofundShare(sim, kind) });
+  const done = finishIfInstant(sim, p, instant);
+  if (done) return ok(done);
   return ok(`${name} proposed: planning starts now. Expected completion in about ${Math.round(pv.est!.days / 30.4)} months.`, p.id);
 }
 
@@ -476,20 +566,26 @@ export function previewRoad(sim: Sim, tool: RoadTool, route: number[]): Preview 
       break;
     }
   }
-  if (tool === 'upgrade') risks.push('Traffic is disrupted while the street is rebuilt');
-  const wet = wetMonths(sim, est.construction);
+  const instant = isInstant(sim, { gov: true });
+  if (tool === 'upgrade' && !instant) risks.push('Traffic is disrupted while the street is rebuilt');
+  const wet = instant ? 0 : wetMonths(sim, est.construction);
   if (wet) risks.push('Heavy rain stops work on site');
+  if (instant) fundingNotes(sim, est.cost, errors, warnings);
   if (Object.keys(skipped).length) warnings.push(`Skipped ${Object.entries(skipped).map(([k, v]) => `${v} tile${v > 1 ? 's' : ''} (${k})`).join(', ')}.`);
   warnings.push(`Upkeep about ${fmtMoney(sim, base.monthly)} a month (${tool === 'canal' ? 'agriculture' : 'transport'} budget).`);
   base.ok = errors.length === 0;
   return base;
 }
 
-export function proposeRoad(sim: Sim, tool: RoadTool, route: number[]): CommandResult {
+export function proposeRoad(sim: Sim, tool: RoadTool, route: number[], instant = false): CommandResult {
   const pv = previewRoad(sim, tool, route);
   if (!pv.ok) return fail(pv.errors.join(' '));
+  const why = instant ? instantProblem(sim, pv.est!.cost) : null;
+  if (why) return fail(`${why}.`);
   const name = `${pv.label} (${(pv.tiles.length * 40).toLocaleString()} m)`;
   const p = createProject(sim, { kind: tool, x: pv.x, y: pv.y, w: 1, h: 1, tiles: pv.tiles, gov: true, sponsor: -1, name, reason: 'Commissioned by the government' });
+  const done = finishIfInstant(sim, p, instant);
+  if (done) return ok(done);
   return ok(`${name} proposed. Expected completion in about ${Math.max(1, Math.round(pv.est!.days / 30.4))} months.`, p.id);
 }
 
@@ -586,16 +682,72 @@ export function previewDemolish(sim: Sim, tiles: number[]): Preview {
   }
   if (target && target.ownerT !== 0 && est.landCost > 0) risks.push('Owners and tenants resent compulsory purchase');
   warnings.push('Cannot be undone once the work is done.');
-  if (sim.s.gov.cash < est.cost * 0.1) warnings.push('The treasury is low: the work will wait for funds after approval.');
-  base.ok = true;
+  fundingNotes(sim, est.cost, errors, warnings);
+  base.ok = errors.length === 0;
   return base;
 }
 
-export function proposeDemolish(sim: Sim, tiles: number[]): CommandResult {
+export function proposeDemolish(sim: Sim, tiles: number[], instant = false): CommandResult {
   const pv = previewDemolish(sim, tiles);
   if (!pv.ok) return fail(pv.errors.join(' '));
+  const why = instant ? instantProblem(sim, pv.est!.cost) : null;
+  if (why) return fail(`${why}.`);
   const p = createProject(sim, { kind: 'demolish', x: pv.x, y: pv.y, w: pv.w, h: pv.h, tiles: pv.tiles, gov: true, sponsor: -1, name: pv.label, reason: 'Ordered by the government' });
+  const done = finishIfInstant(sim, p, instant);
+  if (done) return ok(done);
   return ok(`${pv.label} ordered. Expected to be finished in about ${Math.max(1, Math.round(pv.est!.days / 30.4))} month${Math.round(pv.est!.days / 30.4) > 1 ? 's' : ''}.`, p.id);
+}
+
+// ------------------------------------------------------------------------------------------------ construction setting
+
+export const BUILD_MODES: { id: BuildMode; label: string; note: string }[] = [
+  { id: 'realistic', label: 'Realistic', note: 'Planning, approvals, land purchase and building crews: a street takes weeks, a hospital years' },
+  { id: 'public', label: 'Instant for your projects', note: 'Roads, facilities and demolitions are finished the moment you approve them; developers still build at their own pace' },
+  { id: 'all', label: 'Instant for everything', note: 'Developers’ homes, shops and plants also go up the day they decide to build' },
+];
+
+/**
+ * Changes how construction works in this world. Projects already under way that the new setting builds instantly are
+ * finished at once (when the treasury can pay for them). Costs are the same either way; only the waiting changes.
+ */
+export function setBuildMode(sim: Sim, mode: BuildMode): CommandResult {
+  const m = BUILD_MODES.find((x) => x.id === mode);
+  if (!m) return fail('Unknown construction setting.');
+  if ((sim.s.meta.build ?? 'realistic') === mode) return ok(`Construction is already ${m.label.toLowerCase()}.`);
+  sim.s.meta.build = mode;
+  let finished = 0;
+  for (const p of [...sim.s.projects]) if (isInstant(sim, p) && buildNow(sim, p)) finished++;
+  sim.emit('gov.buildMode', `Construction: ${m.label.toLowerCase()}.`, 1, undefined, undefined, [m.note]);
+  return ok(`Construction set to ${m.label.toLowerCase()}.${finished ? ` ${finished} project${finished > 1 ? 's' : ''} under way ${finished > 1 ? 'were' : 'was'} finished at once.` : ''}`);
+}
+
+// ------------------------------------------------------------------------------------------------ loans
+
+/** Borrows `amount` from a lender; the money is in the treasury at once and repaid in monthly instalments. */
+export function borrow(sim: Sim, kind: LoanKind, amount: number): CommandResult {
+  const o = loanOffers(sim, (v) => fmtMoney(sim, v)).find((x) => x.kind === kind);
+  if (!o) return fail('Unknown lender.');
+  if (o.blocked) return fail(`${o.blocked}.`);
+  if (!Number.isFinite(amount) || amount < o.min * 0.999 || amount > o.max * 1.001) return fail(`Choose an amount between ${fmtMoney(sim, o.min)} and ${fmtMoney(sim, o.max)}.`);
+  const l = newLoan(sim, o, amount);
+  const until = dateOf(sim.s.meta.startYear, sim.day + Math.round(o.years * 365.25)).year;
+  const what = kind === 'bond' ? `issues ${fmtMoney(sim, amount)} of municipal bonds` : `borrows ${fmtMoney(sim, amount)} from the ${o.lender}`;
+  sim.emit('gov.loan', `The city ${what} at ${(o.rate * 100).toFixed(1)}% over ${o.years} years.`, 2, undefined, undefined,
+    [`Repayments of ${fmtMoney(sim, l.payment)} a month until ${until}`, LOAN_PRODUCTS[kind].note]);
+  return ok(`${fmtMoney(sim, amount)} borrowed: ${fmtMoney(sim, l.payment)} a month for ${o.years} years.`);
+}
+
+/** Repays a loan in full from the treasury. */
+export function repayLoan(sim: Sim, loanId: number): CommandResult {
+  const g = sim.s.gov;
+  const l = g.loans.find((x) => x.id === loanId);
+  if (!l) return fail('No such loan.');
+  if (g.cash < l.balance) return fail(`Repaying needs ${fmtMoney(sim, l.balance)}; the treasury holds ${fmtMoney(sim, g.cash)}.`);
+  sim.pay(g, sim.s.ext, l.balance);
+  g.loans = g.loans.filter((x) => x !== l);
+  sim.emit('gov.loanRepaid', `The city repays its ${l.kind === 'bond' ? 'bonds' : `loan from the ${l.lender}`} early (${fmtMoney(sim, l.balance)}).`, 1, undefined, undefined,
+    [`Saves ${fmtMoney(sim, Math.max(0, l.payment * l.left - l.balance))} of future interest`]);
+  return ok(`Repaid ${fmtMoney(sim, l.balance)}; no more instalments on this loan.`);
 }
 
 export function cancel(sim: Sim, projectId: number): CommandResult {

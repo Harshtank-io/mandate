@@ -7,9 +7,11 @@ import type { Selection } from '../render/view';
 import { alerts } from '../sim/summary';
 import { explain, projectProgress, REV_LABELS, type MetricKey, type Ref } from '../sim/inspect';
 import {
-  announcePolicy, announceTax, cancel, cofundShare, describeValue, leaveAgreement, openTalks, policyEffects, policyRange, setFunding, taxEffects, taxRange,
-  type CommandResult,
+  announcePolicy, announceTax, borrow, BUILD_MODES, cancel, cofundShare, describeValue, finishNow, instantProblem, leaveAgreement, openTalks, policyEffects, policyRange,
+  repayLoan, setBuildMode, setFunding, taxEffects, taxRange, type CommandResult,
 } from '../sim/commands';
+import { isUnderWay } from '../sim/systems/construction';
+import { instalment, loanOffers, loanPayments, totalDebt } from '../sim/systems/loans';
 import { DEPT_LABELS, POLICY_DELAY, POLICY_LABELS, TAX_LABELS } from '../sim/systems/government';
 import { milestonesFor } from '../sim/systems/milestones';
 import { DISPUTE_TARIFF, exportDest, importSource, ourTariff, theirTariff } from '../sim/systems/trade';
@@ -84,7 +86,7 @@ export function Overview({ ctx }: { ctx: Ctx }) {
       { label: 'Spending last month', value: money(sim, st.spending), spark: hist('spending') },
       { label: 'Balance', value: money(sim, st.balance), tone: st.balance >= 0 ? 'good' : 'bad' },
       { label: 'Treasury', value: money(sim, g.cash), tone: g.cash < 0 ? 'bad' : undefined },
-      { label: 'Debt', value: `${money(sim, g.debt)} · rated ${g.rating}`, spark: hist('debt') },
+      { label: 'Debt', value: `${money(sim, totalDebt(sim))} · rated ${g.rating}`, note: g.loans?.length ? `loan instalments ${money(sim, loanPayments(sim))} a month` : undefined, spark: hist('debt') },
     ] },
     { title: 'Population', key: 'population', items: [
       { label: 'Residents', value: num(st.population), spark: hist('population') },
@@ -110,6 +112,15 @@ export function Overview({ ctx }: { ctx: Ctx }) {
       { label: 'Satisfaction', value: pct(st.satisfaction), spark: hist('satisfaction'), tone: st.satisfaction < 0.45 ? 'bad' : st.satisfaction > 0.7 ? 'good' : undefined },
       { label: 'Crime index', value: (st.crime * 100).toFixed(1), spark: hist('crime') },
       { label: 'Police coverage', value: pct(st.policeCoverage) },
+      { label: 'Fire cover', value: pct(st.fireCoverage), tone: st.population > 1200 && st.fireCoverage < 0.5 ? 'bad' : undefined },
+      { label: 'Fires last month', value: num(st.fires), note: st.burned ? `${st.burned} building${st.burned > 1 ? 's' : ''} destroyed` : undefined, tone: st.burned ? 'bad' : undefined },
+    ] },
+    { title: 'Water & power', key: 'utilities', items: [
+      { label: 'Evening peak', value: `${st.powerPeak.toFixed(1)} MW`, note: `of ${st.powerCap.toFixed(1)} MW available`, spark: hist('powerPeak'), tone: st.powerCap > 0 && st.powerPeak > st.powerCap * 0.95 ? 'bad' : undefined },
+      { label: 'Electricity supplied', value: pct(st.powerServed, 1), note: st.blackouts ? `blackouts on ${st.blackouts} day${st.blackouts > 1 ? 's' : ''}` : undefined, spark: hist('powerServed'), tone: st.powerServed < 0.98 ? 'bad' : undefined },
+      { label: 'Water from the mains', value: pct(st.waterServed), note: `${num(st.waterUse)} m³ a day wanted · ${num(st.waterCap)} m³ capacity`, tone: st.waterServed < 0.9 ? 'bad' : undefined },
+      { label: 'Bills and energy last month', value: money(sim, g.last.rev.utilityBills ?? 0), note: `electricity bought ${money(sim, g.last.exp.energy ?? 0)}` },
+      { label: 'Power sold to the regional grid', value: money(sim, g.last.rev.powerSales ?? 0), note: sim.s.util.last.exported > 0 ? `${num(sim.s.util.last.exported / 1000)} MWh from the city’s plants` : 'surplus from the city’s plants is sold' },
     ] },
     { title: 'Health', key: 'health', items: [
       { label: 'Life expectancy', value: `${st.lifeExp.toFixed(1)} years`, spark: hist('lifeExp') },
@@ -189,13 +200,15 @@ export function Budget({ ctx }: { ctx: Ctx }) {
         <h3>Treasury</h3>
         <dl class="rows">
           <div><dt>Cash</dt><dd class={g.cash < 0 ? 'bad' : ''}>{money(sim, g.cash)}</dd></div>
-          <div><dt>Debt</dt><dd>{money(sim, g.debt)} at {pct(g.rate, 1)} · rated {g.rating}</dd></div>
+          <div><dt>Debt</dt><dd>{money(sim, totalDebt(sim))} · rated {g.rating}</dd></div>
+          {g.debt > 0 && <div><dt>Overdraft</dt><dd>{money(sim, g.debt)} at {pct(g.rate, 1)}</dd></div>}
           <div><dt>Revenue this year</dt><dd>{money(sim, Object.values(g.ytd.rev).reduce((a, x) => a + x, 0))}</dd></div>
           <div><dt>Spending this year</dt><dd>{money(sim, Object.values(g.ytd.exp).reduce((a, x) => a + x, 0))}</dd></div>
         </dl>
         <Chart series={[{ label: 'Revenue', values: ms.map((m) => m.revenue), color: '#7fd18b' }, { label: 'Spending', values: ms.map((m) => m.spending), color: '#f08a6c' }]}
           fmt={(v) => money(sim, v)} labels={monthLabels(sim, ms)} />
       </section>
+      <Loans ctx={ctx} />
       <section>
         <h3>Department funding</h3>
         <VisitorNote ctx={ctx} />
@@ -218,6 +231,57 @@ export function Budget({ ctx }: { ctx: Ctx }) {
       </section>
       {explain(sim, 'budget').map((s, i) => <SectionView key={i} s={s} onLink={ctx.openRef} />)}
     </div>
+  );
+}
+
+/** The city's loans, and what each lender would lend it today. */
+function Loans({ ctx }: { ctx: Ctx }) {
+  const { sim } = ctx;
+  const g = sim.s.gov;
+  const [amounts, setAmounts] = useState<Record<string, number>>({});
+  const [confirm, setConfirm] = useState<number | null>(null);
+  const offers = loanOffers(sim, (v) => money(sim, v));
+  const act = (r: CommandResult) => ctx.toast(r.ok ? r.message : r.error, r.ok ? 'good' : 'bad');
+  const loans = g.loans ?? [];
+  return (
+    <section>
+      <h3>Loans</h3>
+      {loans.length > 0 ? (
+        <>
+          <ul class="loans">
+            {loans.map((l) => (
+              <li key={l.id}>
+                <div class="loan-head"><b>{l.kind === 'bond' ? 'Municipal bonds' : l.lender}</b><span>{money(sim, l.balance)} owed</span></div>
+                <p class="muted small">{pct(l.rate, 1)} · {money(sim, l.payment)} a month · {l.left} instalment{l.left === 1 ? '' : 's'} left of {l.months} · borrowed {money(sim, l.principal)} on {dayLabel(sim, l.taken)}</p>
+                {!ctx.readOnly && (confirm === l.id
+                  ? <div class="buttons"><span class="small">Repay {money(sim, l.balance)} from the treasury?</span><button class="primary small" onClick={() => { act(repayLoan(sim, l.id)); setConfirm(null); }}>Repay</button><button class="ghost small" onClick={() => setConfirm(null)}>Keep</button></div>
+                  : <button class="ghost small" disabled={g.cash < l.balance} title={g.cash < l.balance ? 'The treasury does not hold enough' : undefined} onClick={() => setConfirm(l.id)}>Repay early</button>)}
+              </li>
+            ))}
+          </ul>
+          <p class="muted small">Instalments come to {money(sim, loanPayments(sim))} a month; the interest counts as spending, the capital repaid does not.</p>
+        </>
+      ) : <p class="muted">The city has no loans. Borrowing pays for projects now; instalments then come out of every month’s budget.</p>}
+      <h4>Borrow</h4>
+      <VisitorNote ctx={ctx} />
+      {offers.map((o) => {
+        const v = Math.min(o.max, Math.max(o.min, amounts[o.kind] ?? Math.min(o.max, o.min * Math.max(1, Math.round(o.max / o.min / 2)))));
+        const pay = instalment(v, o.rate, o.years * 12);
+        return (
+          <div class="setting" key={o.kind}>
+            <div class="setting-head">
+              <label for={`loan-${o.kind}`}>{o.label} <span class="muted small">· {o.lender}</span></label>
+              <output>{money(sim, v)}</output>
+            </div>
+            <input id={`loan-${o.kind}`} type="range" min={o.min} max={o.max} step={o.min} value={v} disabled={ctx.readOnly || !!o.blocked || o.max <= o.min}
+              onInput={(e) => setAmounts((x) => ({ ...x, [o.kind]: Number((e.currentTarget as HTMLInputElement).value) }))} />
+            <p class="muted small">{pct(o.rate, 1)} a year over {o.years} years · {money(sim, pay)} a month · {money(sim, pay * o.years * 12 - v)} interest in all. {o.note}.</p>
+            {o.blocked ? <p class="small bad">{o.blocked}</p>
+              : !ctx.readOnly && <div class="buttons"><button class="primary small" onClick={() => { act(borrow(sim, o.kind, v)); setAmounts((x) => { const n = { ...x }; delete n[o.kind]; return n; }); }}>Borrow {money(sim, v)}</button></div>}
+          </div>
+        );
+      })}
+    </section>
   );
 }
 
@@ -698,7 +762,17 @@ export function Projects({ ctx }: { ctx: Ctx }) {
             {p.issue && <p class="bad small">{p.issue}</p>}
             {!ctx.readOnly && p.phase !== 'staffing' && (confirm === p.id
               ? <div class="buttons"><span class="small">Cancel after spending {money(sim, p.spent)}?</span><button class="danger small" onClick={() => { const r = cancel(sim, p.id); ctx.toast(r.ok ? r.message : r.error, r.ok ? undefined : 'bad'); setConfirm(null); }}>Yes, cancel</button><button class="ghost small" onClick={() => setConfirm(null)}>Keep</button></div>
-              : <button class="ghost small" onClick={() => setConfirm(p.id)}>Cancel project</button>)}
+              : (
+                <div class="buttons">
+                  {isUnderWay(p) && (() => {
+                    const left = Math.max(0, p.cost - p.spent);
+                    const why = instantProblem(sim, left);
+                    return <button class="small" disabled={!!why} title={why ?? `Pays about ${money(sim, left)} more today and finishes it at once`}
+                      onClick={() => { const r = finishNow(sim, p.id); ctx.toast(r.ok ? r.message : r.error, r.ok ? 'good' : 'bad'); }}>Finish now · {money(sim, left)}</button>;
+                  })()}
+                  <button class="ghost small" onClick={() => setConfirm(p.id)}>Cancel project</button>
+                </div>
+              ))}
           </article>
         ))}
       </section>
@@ -806,6 +880,17 @@ export function Saves({ ctx }: { ctx: Ctx }) {
           <div><dt>Last saved</dt><dd>{game.lastSaved ? new Date(game.lastSaved).toLocaleTimeString() : 'not yet'} (saves automatically every minute)</dd></div>
         </dl>
         {game.saveError && <p class="bad small">Saving failed: {game.saveError}</p>}
+        <fieldset class="field">
+          <legend>Construction</legend>
+          {BUILD_MODES.map((m) => (
+            <label key={m.id} class="radio">
+              <input type="radio" name="build-mode" checked={(meta.build ?? 'realistic') === m.id} disabled={ctx.readOnly}
+                onChange={() => { const r = setBuildMode(sim, m.id); ctx.toast(r.ok ? r.message : r.error, r.ok ? 'good' : 'bad'); }} />
+              <span><b>{m.label}</b> <span class="muted small">{m.note}</span></span>
+            </label>
+          ))}
+          <p class="muted small">Costs are the same either way; only the waiting changes. Switching to instant finishes what is under way now.</p>
+        </fieldset>
         <div class="buttons wrap">
           <button disabled={busy} onClick={() => run(() => game.save('Autosave'), 'Saved.')}>Save now</button>
           <button disabled={busy} onClick={() => ctx.exportWorld()}>Export file</button>

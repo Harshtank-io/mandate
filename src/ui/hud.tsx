@@ -4,10 +4,13 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import type { AwayReport, Game, Progress } from '../game/game';
 import type { Sim } from '../sim/core';
 import type { Overlay, Selection, Tool, WorldView } from '../render/view';
-import type { CameraPreset } from '../render/camera';
 import { inspect, inspectCitizen, type Card, type Ref } from '../sim/inspect';
-import { GOV_BUILDINGS, previewBuilding, previewRoad, proposeBuilding, proposeRoad, rezone, ZONE_LABELS, type Preview, type RoadTool } from '../sim/commands';
-import { BUILDINGS, GOOD_SPECS, ROADWORKS } from '../sim/tables';
+import {
+  instantProblem, previewBuilding, previewDemolish, previewRoad, proposeBuilding, proposeDemolish, proposeRoad, rezone, setBuildMode, ZONE_LABELS, type Preview, type RoadTool,
+} from '../sim/commands';
+import { BUILDINGS, GOOD_SPECS } from '../sim/tables';
+import { isInstant } from '../sim/systems/construction';
+import { Dock, INFO_VIEWS, type DockMenu } from './dock';
 import { getPreset, SPEEDS } from '../sim/presets';
 import { alerts, foundingSteps } from '../sim/summary';
 import { activeSync } from '../net/sync';
@@ -24,12 +27,14 @@ export interface Bus {
   place?(x: number, y: number): void;
   route?(tiles: number[]): void;
   zone?(tiles: number[]): void;
+  demolish?(tiles: number[]): void;
 }
 
 type Proposal =
   | { k: 'build'; kind: BuildingKind; x: number; y: number; rot: boolean }
   | { k: 'road'; tool: RoadTool; tiles: number[] }
-  | { k: 'zone'; zone: number; tiles: number[] };
+  | { k: 'zone'; zone: number; tiles: number[] }
+  | { k: 'demolish'; tiles: number[] };
 
 interface HudProps {
   game: Game;
@@ -60,26 +65,12 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'milestones', label: 'Milestones' }, { id: 'saves', label: 'World' },
 ];
 
-const OVERLAYS: { id: Overlay; label: string; legend?: string }[] = [
-  { id: 'none', label: 'Normal view' },
-  { id: 'zoning', label: 'Zoning', legend: 'Green residential · blue commercial · yellow industrial · olive agricultural' },
-  { id: 'landValue', label: 'Land value', legend: 'Blue low → red high' },
-  { id: 'pollution', label: 'Air pollution', legend: 'Shaded where the air is polluted; red is worst' },
-  { id: 'traffic', label: 'Traffic', legend: 'Rush-hour load: green free-flowing → red over capacity' },
-  { id: 'roads', label: 'Road condition', legend: 'Green good surface → red potholed' },
-  { id: 'health', label: 'Healthcare reach', legend: 'Share of residents a clinic or hospital can serve: red none → green all' },
-  { id: 'schools', label: 'School places', legend: 'School places for local children: red none → green enough' },
-  { id: 'police', label: 'Police coverage', legend: 'Red none → green full coverage' },
-];
-
-const ROAD_TOOLS: RoadTool[] = ['road', 'avenue', 'upgrade', 'canal'];
 const ROAD_HINT: Record<RoadTool, string> = {
   road: 'Drag from an existing road to draw a street.',
   avenue: 'Drag from an existing road to draw an avenue; avenues can bridge the river.',
   upgrade: 'Drag along existing streets to widen them to avenues.',
   canal: 'Drag across open land or fields to dig an irrigation canal.',
 };
-const ZONES = [Zone.Residential, Zone.Commercial, Zone.Industrial, Zone.Agricultural];
 const visitAgo = (iso: string | null) => {
   if (!iso) return 'at an unknown time';
   const ms = Date.now() - Date.parse(iso);
@@ -127,7 +118,7 @@ export function Hud(p: HudProps) {
   const [sel, setSel] = useState<Selection | null>(null);
   const [tool, setToolState] = useState<Tool>({ mode: 'inspect' });
   const [overlay, setOverlayState] = useState<Overlay>('none');
-  const [menu, setMenu] = useState<'build' | 'roads' | 'zone' | 'layers' | 'camera' | null>(null);
+  const [menu, setMenu] = useState<DockMenu | null>(null);
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [floors, setFloors] = useState<number | undefined>(undefined);
   const [toasts, setToasts] = useState<{ id: number; text: string; tone?: string }[]>([]);
@@ -161,7 +152,8 @@ export function Hud(p: HudProps) {
     view?.turn(!!next.rot);
     setProposal((pr) => (pr && pr.k === 'build' ? { ...pr, rot: !!next.rot } : pr));
   };
-  const setOverlay = (o: Overlay) => { setOverlayState(o); view?.setOverlay(o); setMenu(null); };
+  // the info views tray stays open so views can be compared; picking one from elsewhere closes any menu
+  const setOverlay = (o: Overlay) => { setOverlayState(o); view?.setOverlay(o); setMenu((m) => (m === 'info' ? m : null)); };
   const openRef = (ref: Ref) => {
     const card = inspect(sim, ref);
     const next: Selection = { ref };
@@ -176,6 +168,7 @@ export function Hud(p: HudProps) {
     p.bus.place = (x, y) => { const t = toolRef.current; if (t.mode === 'build') setProposal({ k: 'build', kind: t.kind, x, y, rot: !!t.rot }); };
     p.bus.route = (tiles) => { const t = toolRef.current; if (t.mode === 'road') setProposal({ k: 'road', tool: t.kind, tiles }); };
     p.bus.zone = (tiles) => { const t = toolRef.current; if (t.mode === 'zone') setProposal({ k: 'zone', zone: t.zone, tiles }); };
+    p.bus.demolish = (tiles) => { if (toolRef.current.mode === 'bulldoze') setProposal({ k: 'demolish', tiles }); };
   }, [p.bus]);
 
   useEffect(() => {
@@ -185,6 +178,7 @@ export function Hud(p: HudProps) {
       if (e.key === ' ') { e.preventDefault(); setSpeed(game.speed > 0 ? 0 : lastSpeed.current); }
       else if (/^[1-5]$/.test(e.key)) { if (!ro || e.key === '1') setSpeed(SPEEDS[Number(e.key)]); }
       else if ((e.key === 't' || e.key === 'T') && toolRef.current.mode === 'build') turn();
+      else if ((e.key === 'b' || e.key === 'B') && !ro && !e.ctrlKey && !e.metaKey) setTool(toolRef.current.mode === 'bulldoze' ? { mode: 'inspect' } : { mode: 'bulldoze' });
       else if (e.key === 'Escape') {
         if (p.report || p.briefing) return;
         if (proposal) { setProposal(null); view?.clearPending(); }
@@ -209,8 +203,9 @@ export function Hud(p: HudProps) {
   const latest = s.news[s.news.length - 1];
   const hint = tool.mode === 'build' ? `Click a spot next to a road to place a ${BUILDINGS[tool.kind].label.toLowerCase()} (${footprint(tool.kind, tool.rot)} tiles).${turnable(tool.kind) ? ' T turns it.' : ''} Esc to stop.`
     : tool.mode === 'road' ? `${ROAD_HINT[tool.kind]} Esc to stop.`
-      : tool.mode === 'zone' ? `Drag to rezone land as ${ZONE_LABELS[tool.zone].toLowerCase()}. Esc to stop.` : '';
-  const legend = OVERLAYS.find((o) => o.id === overlay)?.legend;
+      : tool.mode === 'zone' ? `Drag to rezone land as ${ZONE_LABELS[tool.zone].toLowerCase()}. Esc to stop.`
+        : tool.mode === 'bulldoze' ? 'Click a building, or drag along a road, to demolish it. Grey means it cannot go: heritage sites, the highway, a building’s only road. Esc to stop.' : '';
+  const legend = INFO_VIEWS.find((o) => o.id === overlay)?.legend;
 
   const panel = () => {
     switch (tab) {
@@ -310,10 +305,11 @@ export function Hud(p: HudProps) {
 
       {proposal && (
         <ProposalPanel sim={sim} proposal={proposal} floors={floors} setFloors={setFloors} onTurn={turn}
-          onApprove={() => {
+          onApprove={(now) => {
             let r;
-            if (proposal.k === 'build') r = proposeBuilding(sim, proposal.kind, proposal.x, proposal.y, floors, proposal.rot);
-            else if (proposal.k === 'road') r = proposeRoad(sim, proposal.tool, proposal.tiles);
+            if (proposal.k === 'build') r = proposeBuilding(sim, proposal.kind, proposal.x, proposal.y, floors, proposal.rot, now);
+            else if (proposal.k === 'road') r = proposeRoad(sim, proposal.tool, proposal.tiles, now);
+            else if (proposal.k === 'demolish') r = proposeDemolish(sim, proposal.tiles, now);
             else r = rezone(sim, proposal.tiles, proposal.zone);
             toast(r.ok ? r.message : r.error, r.ok ? 'good' : 'bad');
             view?.clearPending();
@@ -333,40 +329,8 @@ export function Hud(p: HudProps) {
             {overlay === 'none' && tool.mode === 'inspect' && view && view.carScale > 1.5 && <p class="muted">Each moving car stands for about {Math.round(view.carScale)} commuters.</p>}
           </div>
         )}
-        <nav class="toolbar panel" aria-label="Tools">
-          <button class={tool.mode === 'inspect' ? 'on' : ''} aria-pressed={tool.mode === 'inspect'} onClick={() => setTool({ mode: 'inspect' })}>Inspect</button>
-          {!ro && <>
-          <div class="tool-group">
-            <button class={tool.mode === 'build' ? 'on' : ''} aria-expanded={menu === 'build'} onClick={() => setMenu(menu === 'build' ? null : 'build')}>Build</button>
-            {menu === 'build' && (
-              <div class="flyout panel">
-                {GOV_BUILDINGS.map((k) => <button key={k} onClick={() => setTool({ mode: 'build', kind: k })}>{BUILDINGS[k].label}<small>{BUILDINGS[k].w}×{BUILDINGS[k].h}</small></button>)}
-              </div>
-            )}
-          </div>
-          <div class="tool-group">
-            <button class={tool.mode === 'road' ? 'on' : ''} aria-expanded={menu === 'roads'} onClick={() => setMenu(menu === 'roads' ? null : 'roads')}>Roads</button>
-            {menu === 'roads' && <div class="flyout panel">{ROAD_TOOLS.map((k) => <button key={k} onClick={() => setTool({ mode: 'road', kind: k })}>{ROADWORKS[k].label}</button>)}</div>}
-          </div>
-          <div class="tool-group">
-            <button class={tool.mode === 'zone' ? 'on' : ''} aria-expanded={menu === 'zone'} onClick={() => setMenu(menu === 'zone' ? null : 'zone')}>Zone</button>
-            {menu === 'zone' && <div class="flyout panel">{ZONES.map((z) => <button key={z} onClick={() => { setTool({ mode: 'zone', zone: z }); setOverlay('zoning'); }}>{ZONE_LABELS[z]}</button>)}</div>}
-          </div>
-          </>}
-          <div class="tool-group">
-            <button class={overlay !== 'none' ? 'on' : ''} aria-expanded={menu === 'layers'} onClick={() => setMenu(menu === 'layers' ? null : 'layers')}>Layers</button>
-            {menu === 'layers' && <div class="flyout panel">{OVERLAYS.map((o) => <button key={o.id} class={overlay === o.id ? 'on' : ''} onClick={() => setOverlay(o.id)}>{o.label}</button>)}</div>}
-          </div>
-          <div class="tool-group">
-            <button aria-expanded={menu === 'camera'} onClick={() => setMenu(menu === 'camera' ? null : 'camera')}>Camera</button>
-            {menu === 'camera' && (
-              <div class="flyout panel">
-                {(['strategic', 'city', 'street'] as CameraPreset[]).map((c) => <button key={c} onClick={() => { view?.preset(c); setMenu(null); }}>{c === 'strategic' ? 'Strategic map' : c === 'city' ? 'City view' : 'Street level'}</button>)}
-                <p class="muted small">Drag to pan · right-drag to rotate · scroll to zoom · WASD/arrows move · Q/E rotate · R/F tilt</p>
-              </div>
-            )}
-          </div>
-        </nav>
+        <Dock sim={sim} tool={tool} overlay={overlay} menu={menu} readOnly={ro} setMenu={setMenu} setTool={setTool} setOverlay={setOverlay} camera={(c) => view?.preset(c)}
+          setInstant={(on) => { const r = setBuildMode(sim, on ? 'public' : 'realistic'); toast(r.ok ? r.message : r.error, r.ok ? 'good' : 'bad'); }} />
       </div>
 
       {latest && (
@@ -402,7 +366,8 @@ export function Hud(p: HudProps) {
 }
 
 function ProposalPanel({ sim, proposal, floors, setFloors, onTurn, onApprove, onCancel }: {
-  sim: Sim; proposal: Proposal; floors?: number; setFloors(f: number): void; onTurn(): void; onApprove(): void; onCancel(): void;
+  /** `now`: build it at once, whatever the world's construction setting. */
+  sim: Sim; proposal: Proposal; floors?: number; setFloors(f: number): void; onTurn(): void; onApprove(now: boolean): void; onCancel(): void;
 }) {
   if (proposal.k === 'zone') {
     const m = sim.s.map;
@@ -412,22 +377,31 @@ function ProposalPanel({ sim, proposal, floors, setFloors, onTurn, onApprove, on
       <section class="proposal panel" aria-label="Rezoning proposal">
         <h3>Rezone {(proposal.tiles.length * 0.16).toFixed(1)} ha as {ZONE_LABELS[proposal.zone].toLowerCase()}</h3>
         <ul class="lines">
-          <li>{proposal.tiles.length} tiles; roads, water, buildings and project sites are left ads they are</li>
+          <li>{proposal.tiles.length} tiles; roads, water, buildings and project sites are left as they are</li>
           {proposal.zone !== Zone.Agricultural && <li>Developers and businesses can build here once there is road access and demand</li>}
           {farmed > 0 && <li>{farmed} tiles are farmed today: farmers keep working them until a developer buys the land</li>}
           {forest > 0 && <li class="bad">{forest} tiles are woodland that would be cleared for building</li>}
         </ul>
-        <div class="buttons"><button class="primary" onClick={onApprove}>Rezone</button><button class="ghost" onClick={onCancel}>Cancel</button></div>
+        <div class="buttons"><button class="primary" onClick={() => onApprove(false)}>Rezone</button><button class="ghost" onClick={onCancel}>Cancel</button></div>
       </section>
     );
   }
-  const pv: Preview = proposal.k === 'build' ? previewBuilding(sim, proposal.kind, proposal.x, proposal.y, floors, proposal.rot) : previewRoad(sim, proposal.tool, proposal.tiles);
+  const demolish = proposal.k === 'demolish';
+  const instant = isInstant(sim, { gov: true });
+  const pv: Preview = proposal.k === 'build' ? previewBuilding(sim, proposal.kind, proposal.x, proposal.y, floors, proposal.rot)
+    : proposal.k === 'road' ? previewRoad(sim, proposal.tool, proposal.tiles) : previewDemolish(sim, proposal.tiles);
   const spec = proposal.k === 'build' ? BUILDINGS[proposal.kind] : null;
   const months = pv.est ? Math.max(1, Math.round(pv.est.days / 30.4)) : 0;
+  const time = instant ? (demolish ? 'cleared at once (instant construction)' : spec?.biz ? 'built and open at once; it hires its staff as people apply' : 'built at once (instant construction)')
+    : demolish ? `about ${months} month${months > 1 ? 's' : ''} until the site is clear, or at once with “Demolish instantly”`
+      : `about ${months} month${months > 1 ? 's' : ''} from proposal to opening, or at once with “Build instantly”`;
+  const rush = pv.est ? instantProblem(sim, pv.est.cost) : null;
   return (
-    <section class="proposal panel" aria-label="Project proposal">
+    <section class="proposal panel" aria-label={demolish ? 'Demolition order' : 'Project proposal'}>
       <h3>{proposal.k === 'build' && proposal.kind === 'affordable' ? `Public housing` : pv.label}{proposal.k === 'road' ? ` · ${(pv.tiles.length * 40).toLocaleString()} m` : ''}</h3>
-      {pv.est && <Rows rows={[['Cost', money(sim, pv.est.cost)], ['Time', `about ${months} month${months > 1 ? 's' : ''} from proposal to opening`], ['Running cost', `${money(sim, pv.monthly)} a month`]]} />}
+      {pv.est && <Rows rows={demolish
+        ? [['Cost', money(sim, pv.est.cost)], ['Time', time]]
+        : [['Cost', money(sim, pv.est.cost)], ['Time', time], ['Running cost', `${money(sim, pv.monthly)} a month`]]} />}
       {spec && spec.floors[1] > spec.floors[0] && (
         <div class="inline">
           <label for="floors">Floors</label>
@@ -442,10 +416,23 @@ function ProposalPanel({ sim, proposal, floors, setFloors, onTurn, onApprove, on
       </div>
       {pv.warnings.length > 0 && <ul class="lines muted">{pv.warnings.map((x) => <li key={x}>{x}</li>)}</ul>}
       <div class="buttons sticky-actions">
-        <button class="primary" disabled={!pv.ok} onClick={onApprove}>Approve project</button>
+        <button class={demolish ? 'primary danger' : 'primary'} disabled={!pv.ok} onClick={() => onApprove(instant)}>
+          {demolish ? (instant ? 'Demolish now' : 'Order demolition') : instant ? 'Build now' : 'Approve project'}
+        </button>
+        {/* at the realistic pace the city can still pay to have this one done at once */}
+        {!instant && pv.ok && pv.est && (
+          <button class={demolish ? 'danger' : ''} disabled={!!rush} title={rush ?? `Pays the whole ${money(sim, pv.est.cost)} today; skips planning, approvals and the building months`}
+            onClick={() => onApprove(true)}>
+            {demolish ? 'Demolish instantly' : 'Build instantly'}
+          </button>
+        )}
         {proposal.k === 'build' && turnable(proposal.kind) && <button onClick={onTurn}>Turn ({pv.w}×{pv.h})</button>}
         <button class="ghost" onClick={onCancel}>Cancel</button>
         {!pv.ok && <span class="small bad">{pv.errors[0]}</span>}
+        {!instant && pv.ok && rush && <span class="small muted">Not instantly: {rush.charAt(0).toLowerCase() + rush.slice(1)}</span>}
+        {pv.ok && !rush && pv.est && pv.est.cost > sim.s.gov.cash && (instant || !demolish) && (
+          <span class="small muted">Building at once costs more than the {money(sim, Math.max(0, sim.s.gov.cash))} in the treasury: the rest is borrowed next month, or take a loan in the Budget tab</span>
+        )}
       </div>
     </section>
   );
@@ -490,7 +477,9 @@ function FoundingBriefing({ sim, onClose }: { sim: Sim; onClose(): void }) {
       </ol>
       <h3>Good to know</h3>
       <ul class="lines">
-        <li>Zone land straight along the highway to get going at once; a new street takes months to build.</li>
+        {isInstant(sim, { gov: true })
+          ? <li>Construction is instant: your streets and facilities are ready the moment you approve them. You can change this in the World tab.</li>
+          : <li>Zone land straight along the highway to get going at once; a new street takes months to build. Instant construction can be switched on in the World tab.</li>}
         <li>Public housing (Build menu) lets you house the first settlers yourself.</li>
         <li>Settlers stay only if they find work: public facilities, building sites, shops and farms all hire.</li>
         <li>Until local firms exist, building materials and food come in by truck at import prices.</li>

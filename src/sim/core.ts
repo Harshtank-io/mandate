@@ -18,7 +18,7 @@ export const tx = (i: number) => i % W;
 export const ty = (i: number) => (i / W) | 0;
 export const inMap = (x: number, y: number) => x >= 0 && y >= 0 && x < W && y < W;
 
-export const REV_CATS: RevCat[] = ['incomeTax', 'corporateTax', 'smallBizTax', 'salesTax', 'foodTax', 'propertyTax', 'fuelTax', 'importTariff', 'exportTax', 'agriTax', 'luxuryTax', 'licenseFees', 'rents', 'fares', 'premiums', 'grants', 'tourismTax', 'entertainmentTax', 'airportFees', 'tickets', 'grainSales', 'utilityBills', 'other'];
+export const REV_CATS: RevCat[] = ['incomeTax', 'corporateTax', 'smallBizTax', 'salesTax', 'foodTax', 'propertyTax', 'fuelTax', 'importTariff', 'exportTax', 'agriTax', 'luxuryTax', 'licenseFees', 'rents', 'fares', 'premiums', 'grants', 'tourismTax', 'entertainmentTax', 'airportFees', 'tickets', 'grainSales', 'utilityBills', 'powerSales', 'other'];
 export const EXP_CATS: ExpCat[] = ['admin', 'health', 'education', 'safety', 'transport', 'agriculture', 'environment', 'culture', 'utilities', 'unemployment', 'pensions', 'fertilizer', 'insurance', 'capital', 'interest', 'land', 'procurement', 'rations', 'transfers', 'exportSupport', 'promotion', 'energy'];
 
 export function emptyLedger(): Ledger {

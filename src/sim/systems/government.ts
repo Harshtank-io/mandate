@@ -6,6 +6,7 @@ import { maintenanceWork, payWage } from '../econ';
 import { BUSINESSES, ROAD_MAINT, ROAD_WEAR_COST } from '../tables';
 import { DEPTS, Terrain, type Dept, type Policies, type TaxSettings } from '../types';
 import { roadMaintenance } from './transport';
+import { annualRevenue, DEBT_LIMIT, marketDebt, ratingFor, serviceLoans } from './loans';
 
 export const TAX_LABELS: Record<keyof TaxSettings, string> = {
   income: 'Income tax (basic rate)', incomeTop: 'Income tax (top rate)', allowance: 'Tax-free allowance', topThreshold: 'Top-rate threshold',
@@ -161,15 +162,16 @@ export function governmentMonthly(sim: Sim): void {
     sim.spend(cat, h, amt);
     h.m.benefits += amt;
   }
-  // debt service
+  // debt service: instalments on the city's loans, interest on the overdraft
+  serviceLoans(sim);
   const interest = (g.debt * g.rate) / 12;
   if (interest > 0) sim.spend('interest', s.ext, interest);
-  const annualRev = Math.max(1, sumRev(g.ytd) > 0 && sim.date.month > 2 ? (sumRev(g.ytd) / sim.date.month) * 12 : sumRev(g.last) * 12 || sumRev(g.m) * 12);
-  const limit = annualRev * 4.5;
+  const annualRev = annualRevenue(sim);
+  const limit = annualRev * DEBT_LIMIT;
   const monthlySpend = Math.max(sumExp(g.last), sumExp(g.m) * 0.5);
   if (g.cash < 0) {
     const want = -g.cash + monthlySpend * 0.5;
-    const room = Math.max(0, limit - g.debt);
+    const room = Math.max(0, limit - marketDebt(sim));
     const borrow = Math.min(want, room);
     if (borrow > 0) {
       sim.pay(s.ext, g, borrow);
@@ -178,7 +180,7 @@ export function governmentMonthly(sim: Sim): void {
     if (g.cash < 0) {
       g.arrears++;
       sim.emit('gov.arrears', `The treasury cannot borrow more: bills worth ${Math.round(-g.cash).toLocaleString()} are unpaid.`, 3, undefined, undefined,
-        [`Debt has reached ${(g.debt / annualRev).toFixed(1)}x annual revenue; lenders refuse new loans`, 'Unpaid suppliers delay public services']);
+        [`Debt has reached ${(marketDebt(sim) / annualRev).toFixed(1)}x annual revenue; lenders refuse new loans`, 'Unpaid suppliers delay public services']);
     }
   } else {
     g.arrears = 0;
@@ -188,8 +190,8 @@ export function governmentMonthly(sim: Sim): void {
       g.debt -= repay;
     }
   }
-  const ratio = g.debt / annualRev;
-  const [rating, rate] = ratio < 1 ? ['AA', 0.065] : ratio < 2 ? ['A', 0.075] : ratio < 3 ? ['BBB', 0.09] : ratio < 4 ? ['BB', 0.11] : ['B', 0.14];
+  const ratio = marketDebt(sim) / annualRev;
+  const [rating, rate] = ratingFor(ratio);
   if (rating !== g.rating) {
     const worse = rate > g.rate;
     sim.emit('gov.rating', `Credit rating ${worse ? 'downgraded' : 'upgraded'} to ${rating}; new borrowing costs ${(rate * 100).toFixed(1)}%.`, worse ? 2 : 1, undefined, undefined,

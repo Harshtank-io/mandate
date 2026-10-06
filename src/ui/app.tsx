@@ -55,6 +55,7 @@ export function App() {
         place: (x, y) => busRef.current.place?.(x, y),
         route: (t) => busRef.current.route?.(t),
         zone: (t) => busRef.current.zone?.(t),
+        demolish: (t) => busRef.current.demolish?.(t),
       });
     } catch (e) {
       setScreen({ k: 'error', message: `The 3D view could not start (${e instanceof Error ? e.message : String(e)}). This game needs a browser with WebGL enabled.` });

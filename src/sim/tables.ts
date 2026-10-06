@@ -140,7 +140,7 @@ export const BUSINESSES: Record<BusinessKind, BizSpec> = {
   gasplant: { kind: 'gasplant', label: 'Gas power plant', jobs: [['plantop', 10], ['technician', 5], ['sitemgr', 1], ['manager', 1]], pub: true, dept: 'utilities', building: 'gasplant', startup: 0, sector: 'public' },
   solarfarm: { kind: 'solarfarm', label: 'Solar farm', jobs: [['technician', 2], ['security', 2]], pub: true, dept: 'utilities', building: 'solarfarm', startup: 0, sector: 'public' },
   windfarm: { kind: 'windfarm', label: 'Wind farm', jobs: [['technician', 3], ['security', 1]], pub: true, dept: 'utilities', building: 'windfarm', startup: 0, sector: 'public' },
-  waterworks: { kind: 'waterworks', label: 'Waterworks', jobs: [['plantop', 6], ['technician', 3], ['helper', 3], ['supervisor', 1]], pub: true, dept: 'utilities', building: 'waterworks', startup: 0, sector: 'public' },
+  waterworks: { kind: 'waterworks', label: 'Waterworks', jobs: [['plantop', 4], ['technician', 2], ['helper', 2], ['supervisor', 1]], pub: true, dept: 'utilities', building: 'waterworks', startup: 0, sector: 'public' },
 };
 
 export interface CropSpec {
@@ -277,6 +277,8 @@ export const POWER_TARIFF = { home: 4, business: 8 };
 export const WATER_TARIFF = 12;
 /** What the regional grid charges per kWh delivered to the town. */
 export const GRID_PRICE = 5;
+/** What the regional grid pays per kWh the city's plants feed into it (power the town does not need itself). */
+export const FEED_IN_PRICE = 3.2;
 /** Gas burned per kWh generated locally. */
 export const GAS_FUEL = 6;
 /** Wells, hand pumps and water tankers where the mains do not reach: cost per m3, bought from outside. */
@@ -301,7 +303,7 @@ export const USE_KWH = { crate: 5, foodTonne: 112.5, officeStaff: 15, meal: 0.5,
 export const OFFICE_OVERHEAD = 130;
 /** Fixed daily electricity use of premises (kWh): lighting, refrigeration, projection, cooling. Public buildings are paid by the city. */
 export const BASE_KWH: Partial<Record<BuildingKind, number>> = {
-  shop: 30, grocery: 45, restaurant: 10, services: 6, office: 20, hotel: 25, cinema: 250, factory: 60, foodplant: 50, depot: 40, yard: 20,
+  shop: 8, grocery: 12, restaurant: 10, services: 4, office: 20, hotel: 25, cinema: 250, factory: 60, foodplant: 50, depot: 40, yard: 20,
   townhall: 150, school: 60, college: 200, clinic: 80, hospital: 900, police: 60, firestation: 50, museum: 120, stadium: 150, airport: 1500,
   park: 5, heritage: 10, waterworks: 40, gasplant: 30, substation: 0,
 };

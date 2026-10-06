@@ -177,7 +177,8 @@ export function createProject(sim: Sim, spec: ProjectSpec): Project {
   sim.ix.ver.projects++;
   const announced = spec.kind === 'demolish' ? `Government orders ${p.name.replace(/^(Demolition|Removal)/, (w) => `the ${w.toLowerCase()}`)}`
     : `Government announces ${p.name.toLowerCase().startsWith('a') ? '' : 'a '}${p.name}`;
-  if (spec.gov) sim.emit('project.proposed', `${announced}; estimated cost ${fmtMoney(sim, est.cost)}.`, 2, { k: 'project', id: p.id }, undefined,
+  // under instant construction the completion is the news; there is nothing to announce in advance
+  if (spec.gov && !isInstant(sim, spec)) sim.emit('project.proposed', `${announced}; estimated cost ${fmtMoney(sim, est.cost)}.`, 2, { k: 'project', id: p.id }, undefined,
     [`Expected to take about ${Math.max(1, Math.round(est.days / 30.4))} month${Math.round(est.days / 30.4) > 1 ? 's' : ''}`,
       ...(est.landCost > 0 ? [`Requires ${spec.kind === 'demolish' ? 'buying the property' : 'acquiring land'} (${est.farmsAffected ? `${est.farmsAffected} farms, ` : ''}${est.displaced} households affected)`] : [])]);
   return p;
@@ -301,6 +302,79 @@ function pickContractor(sim: Sim, committed: Map<number, number>): Business | un
   return best;
 }
 
+// ------------------------------------------------------------------------------------------------ instant construction
+
+const UNDER_WAY = new Set<ProjectPhase>(['planning', 'assessment', 'approval', 'land', 'funding', 'construction']);
+/** Whether a project is still being planned or built. */
+export const isUnderWay = (p: { phase: ProjectPhase }) => UNDER_WAY.has(p.phase);
+
+/** Whether a project is built the moment it is approved, under the world's construction setting. */
+export function isInstant(sim: Sim, p: { gov: boolean }): boolean {
+  const mode = sim.s.meta.build ?? 'realistic';
+  return mode === 'all' || (mode === 'public' && p.gov);
+}
+
+/** Why a project cannot be paid for in one go right now (null = it can). The same test the funding stage applies. */
+export function instantBlocker(sim: Sim, p: { gov: boolean; sponsor: number; cost: number }): string | null {
+  const g = sim.s.gov;
+  if (p.gov) return g.cash > p.cost * 0.1 || (g.arrears === 0 && g.rating !== 'B') ? null : 'The treasury cannot pay for this now and lenders will not cover it';
+  return sim.biz(p.sponsor) ? null : 'The developer has gone out of business';
+}
+
+/**
+ * Instant construction: settles everything the project still had to pay for (land, labour, materials) and completes it
+ * now. It costs what a project built at the usual pace would; only the waiting is skipped. Public facilities still
+ * have to hire their staff before they open.
+ */
+export function buildNow(sim: Sim, p: Project): boolean {
+  if (!UNDER_WAY.has(p.phase) || instantBlocker(sim, p)) return false;
+  const s = sim.s;
+  const sponsor = p.gov ? undefined : sim.biz(p.sponsor);
+  // compulsory purchase of fields and buildings on the site (a no-op once the land stage has run)
+  if (p.gov) acquireLand(sim, p);
+  // the labour still to do goes to a local firm with a crew, or to an outside contractor at its premium
+  const local = localLabourers(sim) >= minLocalCrew(sim) ? pickContractor(sim, new Map()) : undefined;
+  const labour = (Math.max(0, p.labor - p.laborDone) / 0.9) * laborRate(sim) * (local ? 1 : OUTSIDE_PREMIUM);
+  // materials not yet ordered: from the local plant's stock first, the rest bought in
+  const price = s.market.materials.price;
+  let need = Math.max(0, p.materials - p.matDelivered - p.matOrdered);
+  const plant = s.businesses.find((b) => b.kind === 'materials' && b.status === 'operating' && (b.inv.materials ?? 0) > 0);
+  const fromPlant = plant ? Math.min(need, plant.inv.materials ?? 0) : 0;
+  need -= fromPlant;
+  const total = labour + (fromPlant + need) * price * 1.05;
+  if (sponsor && sponsor.cash < total) {
+    const borrow = total - sponsor.cash;
+    sim.pay(s.ext, sponsor, borrow);
+    sponsor.loan += borrow;
+  }
+  const pay = (to: Account, amt: number) => { if (!(amt > 0)) return; if (sponsor) sim.pay(sponsor, to, amt); else sim.spend('capital', to, amt); };
+  if (local) { pay(local, labour); local.m.revenue += labour; } else pay(s.ext, labour);
+  if (plant && fromPlant > 0) {
+    const v = fromPlant * price;
+    pay(plant, v);
+    plant.inv.materials! -= fromPlant;
+    plant.m.revenue += v;
+    plant.m.sales += fromPlant;
+    s.market.materials.local += fromPlant;
+    pay(s.ext, fromPlant * price * 0.05); // haulage
+  }
+  pay(s.ext, need * price * 1.05);
+  p.spent += total;
+  p.laborDone = p.labor;
+  p.matDelivered = Math.max(p.matDelivered, p.materials - p.matOrdered);
+  p.contractor = local ? local.id : OUTSIDE_CONTRACTOR;
+  p.issue = '';
+  if (p.started < 0) p.started = sim.day;
+  complete(sim, p);
+  // built at once means open at once: a public facility starts work and fills its posts as people apply
+  if (p.phase === 'staffing') {
+    const b = sim.biz(p.bizId);
+    if (b) { b.status = 'operating'; b.statusDay = sim.day; sim.ix.storesDirty = true; }
+    p.phase = 'done';
+  }
+  return true;
+}
+
 /** Contractor id used for projects built by a firm from outside the city. */
 export const OUTSIDE_CONTRACTOR = -2;
 /** Outside firms charge more for labour: travel, lodging and their overheads. */
@@ -368,6 +442,8 @@ export function constructionDaily(sim: Sim): void {
   const ordered = [...s.projects].sort((a, b) => Number(b.gov) - Number(a.gov) || a.created - b.created);
   for (const p of ordered) {
     p.workersToday = 0;
+    // instant construction: developers' projects (and any public project still under way) are finished today
+    if (UNDER_WAY.has(p.phase) && isInstant(sim, p) && buildNow(sim, p)) continue;
     switch (p.phase) {
       case 'planning': case 'assessment': case 'approval': case 'land':
         if (--p.phaseLeft <= 0) {

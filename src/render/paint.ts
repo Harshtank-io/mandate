@@ -3,14 +3,15 @@
 
 import type { Sim } from '../sim/core';
 import { hash01 } from '../sim/rng';
-import { BUILDINGS, CROPS, ROAD_CAPACITY } from '../sim/tables';
-import { MAP_SIZE, Terrain, Zone } from '../sim/types';
+import { supplyMap } from '../sim/systems/utilities';
+import { BUILDINGS, CROPS, PLANTS, ROAD_CAPACITY } from '../sim/tables';
+import { MAP_SIZE, Terrain, Zone, type Building } from '../sim/types';
 
 export const N = MAP_SIZE;
 export const PX = 4; // texels per tile
 export const TEX = N * PX;
 
-export type Overlay = 'none' | 'zoning' | 'landValue' | 'pollution' | 'traffic' | 'roads' | 'health' | 'schools' | 'police';
+export type Overlay = 'none' | 'zoning' | 'landValue' | 'pollution' | 'traffic' | 'roads' | 'health' | 'schools' | 'police' | 'fire' | 'power' | 'water' | 'happiness';
 
 type RGB = [number, number, number];
 const mix = (a: RGB, b: RGB, t: number): RGB => {
@@ -72,7 +73,7 @@ function tileLook(sim: Sim, t: number): { c: RGB; rows: boolean } {
     if (b) {
       if (b.kind === 'park') return { c: PARK, rows: false };
       // the runway, taxiway and apron are drawn on top of mown grass; monuments stand in kept grounds
-      if (b.kind === 'airport') return { c: AIRFIELD, rows: false };
+      if (b.kind === 'airport' || b.kind === 'solarfarm' || b.kind === 'windfarm') return { c: AIRFIELD, rows: false };
       if (b.kind === 'heritage') return { c: GROUNDS, rows: false };
       switch (BUILDINGS[b.kind].category) {
         case 'residential': return { c: GARDEN, rows: false };
@@ -146,6 +147,31 @@ export function paintOverlay(sim: Sim, kind: Overlay, data: Uint8Array): void {
     const i = ((N - 1 - y) * N + x) * 4;
     data[i] = c[0]; data[i + 1] = c[1]; data[i + 2] = c[2]; data[i + 3] = a;
   };
+  const footprint = (b: Building, c: RGB, a: number) => { for (let y = b.y; y < b.y + b.h; y++) for (let x = b.x; x < b.x + b.w; x++) put(y * N + x, c, a); };
+  if (kind === 'power' || kind === 'water') {
+    // buildings by how much of their demand was met yesterday; plants and waterworks stand out; roads are coloured by the view
+    for (const b of s.buildings) {
+      if (b.kind === 'park') continue;
+      const source = kind === 'power' ? !!PLANTS[b.kind] || b.kind === 'substation' : b.kind === 'waterworks';
+      if (source) { footprint(b, kind === 'power' ? [255, 214, 70] : [80, 170, 240], 230); continue; }
+      if (!b.occupants.length && b.biz < 0) continue;
+      footprint(b, goodBad(kind === 'power' ? b.pw ?? 1 : b.wt ?? 1), 190);
+    }
+    return;
+  }
+  if (kind === 'happiness') {
+    const sum = new Map<number, [number, number]>();
+    for (const c of s.citizens) {
+      if (sim.age(c) < 16) continue;
+      const h = sim.hh(c.hh);
+      if (!h || h.home < 0) continue;
+      const e = sum.get(h.home) ?? [0, 0];
+      e[0] += c.sat; e[1]++;
+      sum.set(h.home, e);
+    }
+    for (const [id, [a, n]] of sum) { const b = sim.bld(id); if (b) footprint(b, goodBad((a / n - 0.4) / 0.45), 200); }
+    return;
+  }
   for (let t = 0; t < N * N; t++) {
     const water = m.terrain[t] === Terrain.Water;
     const x = t % N, y = (t / N) | 0;
@@ -153,8 +179,8 @@ export function paintOverlay(sim: Sim, kind: Overlay, data: Uint8Array): void {
       case 'zoning': { const c = ZONE_RGB[m.zone[t]]; if (c && !m.road[t]) put(t, c, m.zone[t] === Zone.Agricultural ? 70 : 150); break; }
       case 'landValue': if (!water) put(t, heat(m.landValue[t] / 1.2), 140); break;
       case 'pollution': { const v = s.env.pollution[Math.min(31, y >> 2) * 32 + Math.min(31, x >> 2)]; if (v > 0.02) put(t, heat(0.35 + v * 0.8), Math.min(200, 40 + v * 300)); break; }
-      case 'health': case 'schools': case 'police': {
-        const cov = kind === 'health' ? s.services.healthCov : kind === 'schools' ? s.services.schoolCov : s.services.policeCov;
+      case 'health': case 'schools': case 'police': case 'fire': {
+        const cov = kind === 'health' ? s.services.healthCov : kind === 'schools' ? s.services.schoolCov : kind === 'fire' ? s.services.fireCov : s.services.policeCov;
         const v = cov[Math.min(15, y >> 3) * 16 + Math.min(15, x >> 3)];
         if (!water) put(t, goodBad(v), m.owner[t] >= 0 || urban(sim, t) ? 150 : 70);
         break;
@@ -171,6 +197,12 @@ export function roadColor(sim: Sim, t: number, overlay: Overlay): number {
   const toHex = (c: RGB) => (Math.round(c[0]) << 16) | (Math.round(c[1]) << 8) | Math.round(c[2]);
   if (overlay === 'traffic') return toHex(ramp([[0, [26, 152, 80]], [0.6, [254, 224, 139]], [1, [215, 48, 39]]], s01(sim.s.traffic.volume[t] / ROAD_CAPACITY[cls])));
   if (overlay === 'roads') return toHex(goodBad((m.roadCond[t] - 0.2) / 0.7));
+  if (overlay === 'power' || overlay === 'water') {
+    // power lines and water mains run along the roads: lit where they carry supply, dark where they do not
+    const sup = supplyMap(sim), net = sup.comp[t];
+    if (overlay === 'power') { const p = net >= 0 ? sup.power[net] : 0; return p === 1 ? 0xf2c94c : p === 2 ? 0xf29a4c : 0x34373c; }
+    return net >= 0 && sup.water[net] ? 0x4aa3df : 0x34373c;
+  }
   return m.terrain[t] === Terrain.Water ? 0x7b7f86 : ROAD_RGB[cls];
 }
 
