@@ -4,16 +4,22 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import type { AwayReport, Game, Progress } from '../game/game';
 import type { Sim } from '../sim/core';
 import type { Overlay, Selection, Tool, WorldView } from '../render/view';
-import type { CameraPreset } from '../render/camera';
 import { inspect, inspectCitizen, type Card, type Ref } from '../sim/inspect';
-import { GOV_BUILDINGS, previewBuilding, previewRoad, proposeBuilding, proposeRoad, rezone, ZONE_LABELS, type Preview, type RoadTool } from '../sim/commands';
-import { BUILDINGS, GOOD_SPECS, ROADWORKS } from '../sim/tables';
+import {
+  instantProblem, previewBuilding, previewDemolish, previewRoad, proposeBuilding, proposeDemolish, proposeRoad, rezone, setBuildMode, ZONE_LABELS, type Preview, type RoadTool,
+} from '../sim/commands';
+import { BUILDINGS, GOOD_SPECS } from '../sim/tables';
+import { isInstant } from '../sim/systems/construction';
+import { Dock, INFO_VIEWS, type DockMenu } from './dock';
 import { getPreset, SPEEDS } from '../sim/presets';
-import { alerts } from '../sim/summary';
+import { alerts, foundingSteps } from '../sim/summary';
+import { activeSync } from '../net/sync';
+import { cloudConfigured } from '../net/client';
+import { CloudBadge } from './account';
 import { formatDate } from '../sim/calendar';
 import { Terrain, Zone, type BuildingKind } from '../sim/types';
-import { Budget, Milestones, News, Overview, PoliciesPanel, Projects, Saves, Taxes, type Ctx, type Tab } from './panels';
-import { CardView, dateTime, Modal, money, num, pct, realSpan, Rows, useTick } from './util';
+import { Budget, Milestones, News, Overview, PoliciesPanel, Projects, Saves, Taxes, TourismPanel, TradePanel, type Ctx, type Tab } from './panels';
+import { CardView, dateTime, mayorTitle, Modal, money, num, pct, realSpan, Rows, useTick } from './util';
 
 /** Event hub the 3D view calls into; the HUD installs the handlers. */
 export interface Bus {
@@ -21,12 +27,14 @@ export interface Bus {
   place?(x: number, y: number): void;
   route?(tiles: number[]): void;
   zone?(tiles: number[]): void;
+  demolish?(tiles: number[]): void;
 }
 
 type Proposal =
-  | { k: 'build'; kind: BuildingKind; x: number; y: number }
+  | { k: 'build'; kind: BuildingKind; x: number; y: number; rot: boolean }
   | { k: 'road'; tool: RoadTool; tiles: number[] }
-  | { k: 'zone'; zone: number; tiles: number[] };
+  | { k: 'zone'; zone: number; tiles: number[] }
+  | { k: 'demolish'; tiles: number[] };
 
 interface HudProps {
   game: Game;
@@ -41,33 +49,37 @@ interface HudProps {
   onLoad(key: string): void;
   onExport(): void;
   onImport(): void;
+  /** Set while visiting another player's town: everything is read-only and nothing is saved. */
+  visit?: VisitInfo | null;
+  onLeaveVisit?(): void;
+  /** Leaves the player's own town for the world map (only when the game has a server). */
+  onWorld?(): void;
 }
+
+/** Who runs the town being visited and how fresh the copy is. */
+export interface VisitInfo { mayor: string; savedAt: string | null; playing: boolean }
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'overview', label: 'Overview' }, { id: 'budget', label: 'Budget' }, { id: 'taxes', label: 'Taxes' }, { id: 'policies', label: 'Laws' },
-  { id: 'projects', label: 'Projects' }, { id: 'news', label: 'News' }, { id: 'milestones', label: 'Milestones' }, { id: 'saves', label: 'World' },
+  { id: 'trade', label: 'Trade' }, { id: 'tourism', label: 'Tourism' }, { id: 'projects', label: 'Projects' }, { id: 'news', label: 'News' },
+  { id: 'milestones', label: 'Milestones' }, { id: 'saves', label: 'World' },
 ];
 
-const OVERLAYS: { id: Overlay; label: string; legend?: string }[] = [
-  { id: 'none', label: 'Normal view' },
-  { id: 'zoning', label: 'Zoning', legend: 'Green residential · blue commercial · yellow industrial · olive agricultural' },
-  { id: 'landValue', label: 'Land value', legend: 'Blue low → red high' },
-  { id: 'pollution', label: 'Air pollution', legend: 'Shaded where the air is polluted; red is worst' },
-  { id: 'traffic', label: 'Traffic', legend: 'Rush-hour load: green free-flowing → red over capacity' },
-  { id: 'roads', label: 'Road condition', legend: 'Green good surface → red potholed' },
-  { id: 'health', label: 'Healthcare reach', legend: 'Share of residents a clinic or hospital can serve: red none → green all' },
-  { id: 'schools', label: 'School places', legend: 'School places for local children: red none → green enough' },
-  { id: 'police', label: 'Police coverage', legend: 'Red none → green full coverage' },
-];
-
-const ROAD_TOOLS: RoadTool[] = ['road', 'avenue', 'upgrade', 'canal'];
 const ROAD_HINT: Record<RoadTool, string> = {
   road: 'Drag from an existing road to draw a street.',
   avenue: 'Drag from an existing road to draw an avenue; avenues can bridge the river.',
   upgrade: 'Drag along existing streets to widen them to avenues.',
   canal: 'Drag across open land or fields to dig an irrigation canal.',
 };
-const ZONES = [Zone.Residential, Zone.Commercial, Zone.Industrial, Zone.Agricultural];
+const visitAgo = (iso: string | null) => {
+  if (!iso) return 'at an unknown time';
+  const ms = Date.now() - Date.parse(iso);
+  return ms < 60_000 ? 'just now' : `${realSpan(ms)} ago`;
+};
+
+/** Facilities that are not square can be placed either way round. */
+const turnable = (k: BuildingKind) => BUILDINGS[k].w !== BUILDINGS[k].h;
+const footprint = (k: BuildingKind, rot?: boolean) => (rot ? `${BUILDINGS[k].h}×${BUILDINGS[k].w}` : `${BUILDINGS[k].w}×${BUILDINGS[k].h}`);
 
 function vehicleCard(sim: Sim, sel: Selection, following: boolean): Card | null {
   if (!('vehicle' in sel)) return null;
@@ -106,10 +118,14 @@ export function Hud(p: HudProps) {
   const [sel, setSel] = useState<Selection | null>(null);
   const [tool, setToolState] = useState<Tool>({ mode: 'inspect' });
   const [overlay, setOverlayState] = useState<Overlay>('none');
-  const [menu, setMenu] = useState<'build' | 'roads' | 'zone' | 'layers' | 'camera' | null>(null);
+  const [menu, setMenu] = useState<DockMenu | null>(null);
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [floors, setFloors] = useState<number | undefined>(undefined);
   const [toasts, setToasts] = useState<{ id: number; text: string; tone?: string }[]>([]);
+  const ro = !!p.visit;
+  const [visitNote, setVisitNote] = useState(true);
+  const speeds = ro ? SPEEDS.slice(0, 2) : SPEEDS;
+  const tabs = ro ? TABS.filter((t) => t.id !== 'saves') : TABS;
   const toolRef = useRef(tool);
   toolRef.current = tool;
   const lastSpeed = useRef(1);
@@ -126,7 +142,18 @@ export function Hud(p: HudProps) {
     setMenu(null);
     if (t.mode === 'build') setFloors(BUILDINGS[t.kind].floors[0]);
   };
-  const setOverlay = (o: Overlay) => { setOverlayState(o); view?.setOverlay(o); setMenu(null); };
+  /** A quarter turn for facilities that are not square (the airport above all), before or after picking a spot. */
+  const turn = () => {
+    const t = toolRef.current;
+    if (t.mode !== 'build' || !turnable(t.kind)) return;
+    const next: Tool = { ...t, rot: !t.rot };
+    toolRef.current = next;
+    setToolState(next);
+    view?.turn(!!next.rot);
+    setProposal((pr) => (pr && pr.k === 'build' ? { ...pr, rot: !!next.rot } : pr));
+  };
+  // the info views tray stays open so views can be compared; picking one from elsewhere closes any menu
+  const setOverlay = (o: Overlay) => { setOverlayState(o); view?.setOverlay(o); setMenu((m) => (m === 'info' ? m : null)); };
   const openRef = (ref: Ref) => {
     const card = inspect(sim, ref);
     const next: Selection = { ref };
@@ -138,9 +165,10 @@ export function Hud(p: HudProps) {
 
   useEffect(() => {
     p.bus.select = (x) => setSel(x);
-    p.bus.place = (x, y) => { const t = toolRef.current; if (t.mode === 'build') setProposal({ k: 'build', kind: t.kind, x, y }); };
+    p.bus.place = (x, y) => { const t = toolRef.current; if (t.mode === 'build') setProposal({ k: 'build', kind: t.kind, x, y, rot: !!t.rot }); };
     p.bus.route = (tiles) => { const t = toolRef.current; if (t.mode === 'road') setProposal({ k: 'road', tool: t.kind, tiles }); };
     p.bus.zone = (tiles) => { const t = toolRef.current; if (t.mode === 'zone') setProposal({ k: 'zone', zone: t.zone, tiles }); };
+    p.bus.demolish = (tiles) => { if (toolRef.current.mode === 'bulldoze') setProposal({ k: 'demolish', tiles }); };
   }, [p.bus]);
 
   useEffect(() => {
@@ -148,7 +176,9 @@ export function Hud(p: HudProps) {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
       if (e.key === ' ') { e.preventDefault(); setSpeed(game.speed > 0 ? 0 : lastSpeed.current); }
-      else if (/^[1-5]$/.test(e.key)) setSpeed(SPEEDS[Number(e.key)]);
+      else if (/^[1-5]$/.test(e.key)) { if (!ro || e.key === '1') setSpeed(SPEEDS[Number(e.key)]); }
+      else if ((e.key === 't' || e.key === 'T') && toolRef.current.mode === 'build') turn();
+      else if ((e.key === 'b' || e.key === 'B') && !ro && !e.ctrlKey && !e.metaKey) setTool(toolRef.current.mode === 'bulldoze' ? { mode: 'inspect' } : { mode: 'bulldoze' });
       else if (e.key === 'Escape') {
         if (p.report || p.briefing) return;
         if (proposal) { setProposal(null); view?.clearPending(); }
@@ -162,7 +192,8 @@ export function Hud(p: HudProps) {
   });
 
   const ctx: Ctx = {
-    game, sim, select: setSel, openRef, toast, setTab: (t) => setTab(t), menu: p.onMenu, loadSave: p.onLoad, exportWorld: p.onExport, importWorld: p.onImport,
+    game, sim, readOnly: ro, select: setSel, openRef, toast, setTab: (t) => setTab(t), build: (kind) => { if (!ro) setTool({ mode: 'build', kind }); },
+    menu: p.onMenu, loadSave: p.onLoad, exportWorld: p.onExport, importWorld: p.onImport,
   };
   const preset = getPreset(s.meta.preset);
   const w = s.weather;
@@ -170,10 +201,11 @@ export function Hud(p: HudProps) {
   const st = s.stats.months[s.stats.months.length - 1];
   const urgent = alerts(sim).filter((a) => a.sev >= 2).length;
   const latest = s.news[s.news.length - 1];
-  const hint = tool.mode === 'build' ? `Click a spot next to a road to place a ${BUILDINGS[tool.kind].label.toLowerCase()} (${BUILDINGS[tool.kind].w}×${BUILDINGS[tool.kind].h} tiles). Esc to stop.`
+  const hint = tool.mode === 'build' ? `Click a spot next to a road to place a ${BUILDINGS[tool.kind].label.toLowerCase()} (${footprint(tool.kind, tool.rot)} tiles).${turnable(tool.kind) ? ' T turns it.' : ''} Esc to stop.`
     : tool.mode === 'road' ? `${ROAD_HINT[tool.kind]} Esc to stop.`
-      : tool.mode === 'zone' ? `Drag to rezone land as ${ZONE_LABELS[tool.zone].toLowerCase()}. Esc to stop.` : '';
-  const legend = OVERLAYS.find((o) => o.id === overlay)?.legend;
+      : tool.mode === 'zone' ? `Drag to rezone land as ${ZONE_LABELS[tool.zone].toLowerCase()}. Esc to stop.`
+        : tool.mode === 'bulldoze' ? 'Click a building, or drag along a road, to demolish it. Grey means it cannot go: heritage sites, the highway, a building’s only road. Esc to stop.' : '';
+  const legend = INFO_VIEWS.find((o) => o.id === overlay)?.legend;
 
   const panel = () => {
     switch (tab) {
@@ -181,10 +213,12 @@ export function Hud(p: HudProps) {
       case 'budget': return <Budget ctx={ctx} />;
       case 'taxes': return <Taxes ctx={ctx} />;
       case 'policies': return <PoliciesPanel ctx={ctx} />;
+      case 'trade': return <TradePanel ctx={ctx} />;
+      case 'tourism': return <TourismPanel ctx={ctx} />;
       case 'projects': return <Projects ctx={ctx} />;
       case 'news': return <News ctx={ctx} />;
       case 'milestones': return <Milestones ctx={ctx} />;
-      case 'saves': return <Saves ctx={ctx} />;
+      case 'saves': return ro ? null : <Saves ctx={ctx} />;
       default: return null;
     }
   };
@@ -200,44 +234,60 @@ export function Hud(p: HudProps) {
 
   return (
     <div class="hud">
-      <header class="topbar panel">
-        <div class="city">
-          <strong>{s.meta.name}</strong>
-          <span class="muted small">{preset.label}, {preset.country}</span>
+      <header class="topbar">
+        <div class="tb-group place">
+          <div class="city">
+            <strong>{s.meta.name}{ro && <span class="chip on visiting">Visiting</span>}</strong>
+            <span class="muted small">{p.visit ? `${mayorTitle(p.visit.mayor)} · ` : ''}{preset.label}, {preset.country}</span>
+          </div>
+          <div class="clock" aria-live="off">
+            <time>{dateTime(sim)}</time>
+            <span class="muted small">{weather}</span>
+          </div>
         </div>
-        <div class="clock" aria-live="off">
-          <time>{dateTime(sim)}</time>
-          <span class="muted small">{weather}</span>
-        </div>
-        <div class="speeds" role="group" aria-label="Simulation speed">
-          {SPEEDS.map((v, i) => (
+        <div class="tb-group speeds" role="group" aria-label="Simulation speed">
+          {speeds.map((v, i) => (
             <button key={v} class={game.speed === v ? 'on' : ''} aria-pressed={game.speed === v} title={v === 0 ? 'Pause (Space)' : `${v}× the world's pace (key ${i})`} onClick={() => setSpeed(v)}>
               {v === 0 ? 'Pause' : `${v}×`}
             </button>
           ))}
           {game.busy && <span class="small muted">catching up…</span>}
         </div>
-        <div class="kpis">
+        <div class="tb-group kpis">
           <button class="kpi" onClick={() => setTab('overview')}><span>Population</span><b>{num(s.citizens.length)}</b></button>
           <button class="kpi" onClick={() => setTab('budget')}><span>Treasury</span><b class={s.gov.cash < 0 ? 'bad' : ''}>{money(sim, s.gov.cash)}</b></button>
-          <button class="kpi" onClick={() => setTab('overview')}><span>Approval</span><b class={s.gov.approval < 0.45 ? 'bad' : ''}>{pct(s.gov.approval)}</b></button>
-          {st && <button class="kpi" onClick={() => setTab('overview')}><span>Unemployment</span><b class={st.unemployment > 0.1 ? 'bad' : ''}>{pct(st.unemployment, 1)}</b></button>}
+          <button class="kpi" onClick={() => setTab('overview')}><span>Approval</span><b class={s.citizens.length && s.gov.approval < 0.45 ? 'bad' : ''}>{s.citizens.length ? pct(s.gov.approval) : '–'}</b></button>
+          {st && <button class="kpi" onClick={() => setTab('overview')}><span>Unemployment</span><b class={st.unemployment > 0.1 ? 'bad' : ''}>{st.laborForce ? pct(st.unemployment, 1) : '–'}</b></button>}
         </div>
-        <div class="actions">
-          <button class="ghost" onClick={() => { void game.save('Autosave').then((m) => toast(m ? 'Saved.' : 'Save skipped (already saving).')); }}>Save</button>
-          <button class="ghost" onClick={p.onMenu}>Menu</button>
+        <div class="tb-group actions">
+          {ro ? (
+            <button class="primary" onClick={() => p.onLeaveVisit?.()}>Back to the world map</button>
+          ) : (
+            <>
+              <CloudBadge />
+              <button class="ghost" onClick={() => {
+                void game.save('Autosave').then((m) => {
+                  toast(m ? 'Saved.' : game.locked ? 'This town is open on another device.' : 'Save skipped (already saving).');
+                  if (m) void activeSync()?.upload();
+                });
+              }}>Save</button>
+              {cloudConfigured && p.onWorld && <button class="ghost" onClick={p.onWorld}>World map</button>}
+              <button class="ghost" onClick={p.onMenu}>Menu</button>
+            </>
+          )}
         </div>
       </header>
 
       <aside class={`sidebar panel ${tab ? '' : 'collapsed'}`} aria-label="Government">
         <nav class="tabs" role="tablist" aria-label="Government departments">
-          {TABS.map((t) => (
+          {tabs.map((t) => (
             <button key={t.id} role="tab" aria-selected={tab === t.id} class={tab === t.id ? 'on' : ''} onClick={() => setTab(tab === t.id ? null : t.id)}>
               {t.label}{t.id === 'overview' && urgent > 0 && <span class="badge" aria-label={`${urgent} urgent`}>{urgent}</span>}
             </button>
           ))}
         </nav>
-        {tab && <div class="tab-panel" role="tabpanel" aria-label={TABS.find((t) => t.id === tab)?.label}>{panel()}</div>}
+        {/* keyed by tab so each tab opens scrolled to its top */}
+        {tab && <div class="tab-panel" key={tab} role="tabpanel" aria-label={TABS.find((t) => t.id === tab)?.label}>{panel()}</div>}
       </aside>
 
       {sel && (
@@ -254,11 +304,12 @@ export function Hud(p: HudProps) {
       )}
 
       {proposal && (
-        <ProposalPanel sim={sim} proposal={proposal} floors={floors} setFloors={setFloors}
-          onApprove={() => {
+        <ProposalPanel sim={sim} proposal={proposal} floors={floors} setFloors={setFloors} onTurn={turn}
+          onApprove={(now) => {
             let r;
-            if (proposal.k === 'build') r = proposeBuilding(sim, proposal.kind, proposal.x, proposal.y, floors);
-            else if (proposal.k === 'road') r = proposeRoad(sim, proposal.tool, proposal.tiles);
+            if (proposal.k === 'build') r = proposeBuilding(sim, proposal.kind, proposal.x, proposal.y, floors, proposal.rot, now);
+            else if (proposal.k === 'road') r = proposeRoad(sim, proposal.tool, proposal.tiles, now);
+            else if (proposal.k === 'demolish') r = proposeDemolish(sim, proposal.tiles, now);
             else r = rezone(sim, proposal.tiles, proposal.zone);
             toast(r.ok ? r.message : r.error, r.ok ? 'good' : 'bad');
             view?.clearPending();
@@ -269,45 +320,17 @@ export function Hud(p: HudProps) {
       )}
 
       <div class="bottom-left">
-        {(hint || legend) && (
+        {/* the proposal panel takes over while it is open; the hint would cover its buttons */}
+        {(hint || legend) && !proposal && (
           <div class="hint panel small" role="status">
             {hint && <p>{hint}</p>}
+            {tool.mode === 'build' && turnable(tool.kind) && <button class="small" onClick={turn}>Turn a quarter (T)</button>}
             {legend && <p>{legend}</p>}
             {overlay === 'none' && tool.mode === 'inspect' && view && view.carScale > 1.5 && <p class="muted">Each moving car stands for about {Math.round(view.carScale)} commuters.</p>}
           </div>
         )}
-        <nav class="toolbar panel" aria-label="Tools">
-          <button class={tool.mode === 'inspect' ? 'on' : ''} aria-pressed={tool.mode === 'inspect'} onClick={() => setTool({ mode: 'inspect' })}>Inspect</button>
-          <div class="tool-group">
-            <button class={tool.mode === 'build' ? 'on' : ''} aria-expanded={menu === 'build'} onClick={() => setMenu(menu === 'build' ? null : 'build')}>Build</button>
-            {menu === 'build' && (
-              <div class="flyout panel">
-                {GOV_BUILDINGS.map((k) => <button key={k} onClick={() => setTool({ mode: 'build', kind: k })}>{BUILDINGS[k].label}<small>{BUILDINGS[k].w}×{BUILDINGS[k].h}</small></button>)}
-              </div>
-            )}
-          </div>
-          <div class="tool-group">
-            <button class={tool.mode === 'road' ? 'on' : ''} aria-expanded={menu === 'roads'} onClick={() => setMenu(menu === 'roads' ? null : 'roads')}>Roads</button>
-            {menu === 'roads' && <div class="flyout panel">{ROAD_TOOLS.map((k) => <button key={k} onClick={() => setTool({ mode: 'road', kind: k })}>{ROADWORKS[k].label}</button>)}</div>}
-          </div>
-          <div class="tool-group">
-            <button class={tool.mode === 'zone' ? 'on' : ''} aria-expanded={menu === 'zone'} onClick={() => setMenu(menu === 'zone' ? null : 'zone')}>Zone</button>
-            {menu === 'zone' && <div class="flyout panel">{ZONES.map((z) => <button key={z} onClick={() => { setTool({ mode: 'zone', zone: z }); setOverlay('zoning'); }}>{ZONE_LABELS[z]}</button>)}</div>}
-          </div>
-          <div class="tool-group">
-            <button class={overlay !== 'none' ? 'on' : ''} aria-expanded={menu === 'layers'} onClick={() => setMenu(menu === 'layers' ? null : 'layers')}>Layers</button>
-            {menu === 'layers' && <div class="flyout panel">{OVERLAYS.map((o) => <button key={o.id} class={overlay === o.id ? 'on' : ''} onClick={() => setOverlay(o.id)}>{o.label}</button>)}</div>}
-          </div>
-          <div class="tool-group">
-            <button aria-expanded={menu === 'camera'} onClick={() => setMenu(menu === 'camera' ? null : 'camera')}>Camera</button>
-            {menu === 'camera' && (
-              <div class="flyout panel">
-                {(['strategic', 'city', 'street'] as CameraPreset[]).map((c) => <button key={c} onClick={() => { view?.preset(c); setMenu(null); }}>{c === 'strategic' ? 'Strategic map' : c === 'city' ? 'City view' : 'Street level'}</button>)}
-                <p class="muted small">Drag to pan · right-drag to rotate · scroll to zoom · WASD/arrows move · Q/E rotate · R/F tilt</p>
-              </div>
-            )}
-          </div>
-        </nav>
+        <Dock sim={sim} tool={tool} overlay={overlay} menu={menu} readOnly={ro} setMenu={setMenu} setTool={setTool} setOverlay={setOverlay} camera={(c) => view?.preset(c)}
+          setInstant={(on) => { const r = setBuildMode(sim, on ? 'public' : 'realistic'); toast(r.ok ? r.message : r.error, r.ok ? 'good' : 'bad'); }} />
       </div>
 
       {latest && (
@@ -326,14 +349,25 @@ export function Hud(p: HudProps) {
         </div>
       )}
 
+      {p.visit && visitNote && !p.catching && (
+        <section class="visit-note panel" aria-label="About this visit">
+          <p>
+            You are visiting {s.meta.name}, run by {mayorTitle(p.visit.mayor)}. You see it as its mayor last saved it ({visitAgo(p.visit.savedAt)}){p.visit.playing ? ', and they are playing it right now' : ''}.
+            {' '}Time runs here for you alone, and nothing you do changes their town.
+          </p>
+          <div class="buttons"><button class="small" onClick={() => setVisitNote(false)}>Got it</button></div>
+        </section>
+      )}
+
       {p.report && <WelcomeBack sim={sim} report={p.report} onClose={p.clearReport} openRef={(r) => { p.clearReport(); openRef(r); }} />}
       {p.briefing && !p.report && <Briefing sim={sim} onClose={p.clearBriefing} />}
     </div>
   );
 }
 
-function ProposalPanel({ sim, proposal, floors, setFloors, onApprove, onCancel }: {
-  sim: Sim; proposal: Proposal; floors?: number; setFloors(f: number): void; onApprove(): void; onCancel(): void;
+function ProposalPanel({ sim, proposal, floors, setFloors, onTurn, onApprove, onCancel }: {
+  /** `now`: build it at once, whatever the world's construction setting. */
+  sim: Sim; proposal: Proposal; floors?: number; setFloors(f: number): void; onTurn(): void; onApprove(now: boolean): void; onCancel(): void;
 }) {
   if (proposal.k === 'zone') {
     const m = sim.s.map;
@@ -348,17 +382,26 @@ function ProposalPanel({ sim, proposal, floors, setFloors, onApprove, onCancel }
           {farmed > 0 && <li>{farmed} tiles are farmed today: farmers keep working them until a developer buys the land</li>}
           {forest > 0 && <li class="bad">{forest} tiles are woodland that would be cleared for building</li>}
         </ul>
-        <div class="buttons"><button class="primary" onClick={onApprove}>Rezone</button><button class="ghost" onClick={onCancel}>Cancel</button></div>
+        <div class="buttons"><button class="primary" onClick={() => onApprove(false)}>Rezone</button><button class="ghost" onClick={onCancel}>Cancel</button></div>
       </section>
     );
   }
-  const pv: Preview = proposal.k === 'build' ? previewBuilding(sim, proposal.kind, proposal.x, proposal.y, floors) : previewRoad(sim, proposal.tool, proposal.tiles);
+  const demolish = proposal.k === 'demolish';
+  const instant = isInstant(sim, { gov: true });
+  const pv: Preview = proposal.k === 'build' ? previewBuilding(sim, proposal.kind, proposal.x, proposal.y, floors, proposal.rot)
+    : proposal.k === 'road' ? previewRoad(sim, proposal.tool, proposal.tiles) : previewDemolish(sim, proposal.tiles);
   const spec = proposal.k === 'build' ? BUILDINGS[proposal.kind] : null;
   const months = pv.est ? Math.max(1, Math.round(pv.est.days / 30.4)) : 0;
+  const time = instant ? (demolish ? 'cleared at once (instant construction)' : spec?.biz ? 'built and open at once; it hires its staff as people apply' : 'built at once (instant construction)')
+    : demolish ? `about ${months} month${months > 1 ? 's' : ''} until the site is clear, or at once with “Demolish instantly”`
+      : `about ${months} month${months > 1 ? 's' : ''} from proposal to opening, or at once with “Build instantly”`;
+  const rush = pv.est ? instantProblem(sim, pv.est.cost) : null;
   return (
-    <section class="proposal panel" aria-label="Project proposal">
+    <section class="proposal panel" aria-label={demolish ? 'Demolition order' : 'Project proposal'}>
       <h3>{proposal.k === 'build' && proposal.kind === 'affordable' ? `Public housing` : pv.label}{proposal.k === 'road' ? ` · ${(pv.tiles.length * 40).toLocaleString()} m` : ''}</h3>
-      {pv.est && <Rows rows={[['Cost', money(sim, pv.est.cost)], ['Time', `about ${months} month${months > 1 ? 's' : ''} from proposal to opening`], ['Running cost', `${money(sim, pv.monthly)} a month`]]} />}
+      {pv.est && <Rows rows={demolish
+        ? [['Cost', money(sim, pv.est.cost)], ['Time', time]]
+        : [['Cost', money(sim, pv.est.cost)], ['Time', time], ['Running cost', `${money(sim, pv.monthly)} a month`]]} />}
       {spec && spec.floors[1] > spec.floors[0] && (
         <div class="inline">
           <label for="floors">Floors</label>
@@ -373,9 +416,23 @@ function ProposalPanel({ sim, proposal, floors, setFloors, onApprove, onCancel }
       </div>
       {pv.warnings.length > 0 && <ul class="lines muted">{pv.warnings.map((x) => <li key={x}>{x}</li>)}</ul>}
       <div class="buttons sticky-actions">
-        <button class="primary" disabled={!pv.ok} onClick={onApprove}>Approve project</button>
+        <button class={demolish ? 'primary danger' : 'primary'} disabled={!pv.ok} onClick={() => onApprove(instant)}>
+          {demolish ? (instant ? 'Demolish now' : 'Order demolition') : instant ? 'Build now' : 'Approve project'}
+        </button>
+        {/* at the realistic pace the city can still pay to have this one done at once */}
+        {!instant && pv.ok && pv.est && (
+          <button class={demolish ? 'danger' : ''} disabled={!!rush} title={rush ?? `Pays the whole ${money(sim, pv.est.cost)} today; skips planning, approvals and the building months`}
+            onClick={() => onApprove(true)}>
+            {demolish ? 'Demolish instantly' : 'Build instantly'}
+          </button>
+        )}
+        {proposal.k === 'build' && turnable(proposal.kind) && <button onClick={onTurn}>Turn ({pv.w}×{pv.h})</button>}
         <button class="ghost" onClick={onCancel}>Cancel</button>
         {!pv.ok && <span class="small bad">{pv.errors[0]}</span>}
+        {!instant && pv.ok && rush && <span class="small muted">Not instantly: {rush.charAt(0).toLowerCase() + rush.slice(1)}</span>}
+        {pv.ok && !rush && pv.est && pv.est.cost > sim.s.gov.cash && (instant || !demolish) && (
+          <span class="small muted">Building at once costs more than the {money(sim, Math.max(0, sim.s.gov.cash))} in the treasury: the rest is borrowed next month, or take a loan in the Budget tab</span>
+        )}
       </div>
     </section>
   );
@@ -407,8 +464,35 @@ function WelcomeBack({ sim, report, onClose, openRef }: { sim: Sim; report: Away
   );
 }
 
+function FoundingBriefing({ sim, onClose }: { sim: Sim; onClose(): void }) {
+  const s = sim.s;
+  const p = getPreset(s.meta.preset);
+  return (
+    <Modal title={`Welcome to ${s.meta.name}`} wide>
+      <p>{p.blurb}</p>
+      <p>There is no town here yet: open land by the river, the regional highway and a development grant of {money(sim, s.gov.cash)}. Nobody lives here.</p>
+      <h3>How to found a town</h3>
+      <ol class="lines steps-list">
+        {foundingSteps(sim).map((x) => <li key={x.text}><b>{x.text}.</b> <span class="muted small">{x.hint}</span></li>)}
+      </ol>
+      <h3>Good to know</h3>
+      <ul class="lines">
+        {isInstant(sim, { gov: true })
+          ? <li>Construction is instant: your streets and facilities are ready the moment you approve them. You can change this in the World tab.</li>
+          : <li>Zone land straight along the highway to get going at once; a new street takes months to build. Instant construction can be switched on in the World tab.</li>}
+        <li>Public housing (Build menu) lets you house the first settlers yourself.</li>
+        <li>Settlers stay only if they find work: public facilities, building sites, shops and farms all hire.</li>
+        <li>Until local firms exist, building materials and food come in by truck at import prices.</li>
+      </ul>
+      <p class="lead">The land is yours to shape.</p>
+      <div class="buttons"><button class="primary" onClick={onClose} autoFocus>Take office</button></div>
+    </Modal>
+  );
+}
+
 function Briefing({ sim, onClose }: { sim: Sim; onClose(): void }) {
   const s = sim.s;
+  if (s.meta.condition === 'empty') return <FoundingBriefing sim={sim} onClose={onClose} />;
   const st = s.stats.months[s.stats.months.length - 1];
   const p = getPreset(s.meta.preset);
   const count = (k: string) => s.businesses.filter((b) => b.kind === k && b.status === 'operating').length;

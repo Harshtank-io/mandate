@@ -81,7 +81,7 @@ const indiaTaxes: TaxSettings = {
   income: 0.1, incomeTop: 0.25, allowance: 25000, topThreshold: 100000,
   corporate: 0.25, smallBusiness: 0.15, sales: 0.12, foodSales: 0.05, property: 0.006,
   fuel: 0.55, import: 0.1, importFood: 0.1, export: 0, agriculture: 0, luxury: 0.1, licenseFee: 25000,
-  tourism: 0.12, entertainment: 0.18, passengerFee: 350,
+  tourism: 0.12, entertainment: 0.18, passengerFee: 350, power: 1, water: 1,
 };
 const indiaPolicies: Policies = {
   minWage: 10000, unemploymentBenefit: 2500, pension: 2500, retirementAge: 60, fertilizerSubsidy: 0.4,
@@ -176,7 +176,7 @@ export const PRESETS: Preset[] = [
     towns: ['Kiptoro', 'Soko Mpya', 'Mlima Mweupe', 'Nyandarua Vale', 'Ziwa Nakuru', 'Baraka Town'],
     bizPrefix: ['Rift', 'Baraka', 'Uhuru', 'Jamii', 'Neema', 'Imani', 'Savannah', 'Highland', 'Mlima', 'Tumaini'],
     words: { ...baseWords, grocery: ['Supermarket', 'Duka', 'Provisions'], restaurant: ['Hotel', 'Nyama Choma', 'Café'], hotel: ['Lodge', 'Safari Inn', 'Guest House', 'Hotel'] },
-    taxes: { income: 0.12, incomeTop: 0.3, allowance: 24000, topThreshold: 90000, corporate: 0.3, smallBusiness: 0.15, sales: 0.16, foodSales: 0, property: 0.005, fuel: 0.45, import: 0.1, importFood: 0.25, export: 0, agriculture: 0, luxury: 0.1, licenseFee: 20000, tourism: 0.02, entertainment: 0.1, passengerFee: 400 },
+    taxes: { income: 0.12, incomeTop: 0.3, allowance: 24000, topThreshold: 90000, corporate: 0.3, smallBusiness: 0.15, sales: 0.16, foodSales: 0, property: 0.005, fuel: 0.45, import: 0.1, importFood: 0.25, export: 0, agriculture: 0, luxury: 0.1, licenseFee: 20000, tourism: 0.02, entertainment: 0.1, passengerFee: 400, power: 1, water: 1 },
     policies: { ...indiaPolicies, minWage: 9000, unemploymentBenefit: 0, pension: 2000, retirementAge: 60, fertilizerSubsidy: 0.3, cropInsurance: false, busService: 0 },
     canals: false, wells: 0.1, hhSize: 4.2, elderWithFamily: 0.2,
     tourism: {
@@ -214,7 +214,7 @@ export const PRESETS: Preset[] = [
     towns: ['Tân Phú Đông', 'Vĩnh Hòa', 'Mỹ Thạnh', 'Long Hưng', 'Phước Lộc', 'An Bình'],
     bizPrefix: ['Mekong', 'Cửu Long', 'Phú Quý', 'An Khang', 'Tân Tiến', 'Hòa Bình', 'Sông Hậu', 'Đại Phát'],
     words: { ...baseWords, restaurant: ['Quán', 'Phở', 'Café', 'Kitchen'], hotel: ['Hotel', 'Riverside Inn', 'Homestay', 'Palace'] },
-    taxes: { income: 0.1, incomeTop: 0.25, allowance: 30000, topThreshold: 110000, corporate: 0.2, smallBusiness: 0.15, sales: 0.1, foodSales: 0.05, property: 0.003, fuel: 0.35, import: 0.08, importFood: 0.1, export: 0, agriculture: 0, luxury: 0.1, licenseFee: 15000, tourism: 0.1, entertainment: 0.1, passengerFee: 300 },
+    taxes: { income: 0.1, incomeTop: 0.25, allowance: 30000, topThreshold: 110000, corporate: 0.2, smallBusiness: 0.15, sales: 0.1, foodSales: 0.05, property: 0.003, fuel: 0.35, import: 0.08, importFood: 0.1, export: 0, agriculture: 0, luxury: 0.1, licenseFee: 15000, tourism: 0.1, entertainment: 0.1, passengerFee: 300, power: 1, water: 1 },
     policies: { ...indiaPolicies, minWage: 11000, unemploymentBenefit: 3000, pension: 3000, retirementAge: 62, fertilizerSubsidy: 0.2 },
     canals: true, wells: 0.2, hhSize: 3.7, elderWithFamily: 0.3,
     tourism: {
@@ -252,7 +252,7 @@ export const PRESETS: Preset[] = [
     towns: ['Havenmoor', 'Eastbrook', 'Lindenfeld', 'Marrowgate', 'Ostara', 'Valdor'],
     bizPrefix: ['Valley', 'Riverside', 'Northgate', 'Evergreen', 'Summit', 'Crescent', 'Meridian', 'Oakridge', 'Pioneer', 'Harbor'],
     words: baseWords,
-    taxes: { income: 0.15, incomeTop: 0.3, allowance: 20000, topThreshold: 90000, corporate: 0.22, smallBusiness: 0.15, sales: 0.1, foodSales: 0.03, property: 0.008, fuel: 0.5, import: 0.08, importFood: 0.12, export: 0, agriculture: 0.05, luxury: 0.1, licenseFee: 20000, tourism: 0.06, entertainment: 0.08, passengerFee: 450 },
+    taxes: { income: 0.15, incomeTop: 0.3, allowance: 20000, topThreshold: 90000, corporate: 0.22, smallBusiness: 0.15, sales: 0.1, foodSales: 0.03, property: 0.008, fuel: 0.5, import: 0.08, importFood: 0.12, export: 0, agriculture: 0.05, luxury: 0.1, licenseFee: 20000, tourism: 0.06, entertainment: 0.08, passengerFee: 450, power: 1, water: 1 },
     policies: { ...indiaPolicies, minWage: 11000, unemploymentBenefit: 4000, pension: 4000, retirementAge: 65, fertilizerSubsidy: 0.2 },
     canals: false, wells: 0.1, hhSize: 3.2, elderWithFamily: 0.08,
     tourism: {
@@ -301,8 +301,21 @@ export const CONDITIONS: StartCondition[] = [
   { id: 'agricultural', label: 'Agricultural region', blurb: 'A market town serving a wide belt of farms. Weather decides good years and bad.', population: 4200, farms: 170, treasury: 30e6, debt: 0, schools: 2, clinics: 1, hospital: false, college: false, police: 1, factories: 0, offices: 0, foodplants: 2, materials: 1, logistics: 2, construction: 1, apartmentShare: 0.1, unemployment: 0.08, wealth: 0.8, vacancy: 0.05, heritage: 1, stadium: false, museum: false },
 ];
 
+/**
+ * Empty land: no town yet. Open country by the river, the regional highway and a development grant. Roads, zoning
+ * and the first public facilities are up to the player; settlers, farmers and businesses respond to what is built.
+ */
+export const EMPTY_LAND: StartCondition = {
+  id: 'empty', label: 'Empty land', blurb: 'No town yet: open land, the regional highway and a development grant. You lay out roads, zone land and commission the first facilities; settlers, farmers and businesses follow.',
+  population: 0, farms: 0, treasury: 450e6, debt: 0, schools: 0, clinics: 0, hospital: false, college: false, police: 0, factories: 0, offices: 0, foodplants: 0, materials: 0, logistics: 0, construction: 0,
+  apartmentShare: 0, unemployment: 0, wealth: 1, vacancy: 0, heritage: 0, stadium: false, museum: false,
+};
+
+/** Every way a world can start: an existing town of some kind, or empty land. */
+export const START_OPTIONS: StartCondition[] = [...CONDITIONS, EMPTY_LAND];
+
 export function getCondition(id: string): StartCondition {
-  return CONDITIONS.find((c) => c.id === id) ?? CONDITIONS[0];
+  return START_OPTIONS.find((c) => c.id === id) ?? CONDITIONS[0];
 }
 
 export const START_YEARS = [1995, 2005, 2015, 2026];
@@ -321,7 +334,7 @@ export const OFFLINE_CAPS = [
   { days: 0, label: 'No limit' },
 ];
 
-export const SPEEDS = [0, 1, 10, 60, 360, 1800];
+export const SPEEDS = [0, 1, 10, 60, 360, 1800, 3600, 7200];
 
 export function moneyScale(presetId: string, startYear: number): number {
   const p = getPreset(presetId);

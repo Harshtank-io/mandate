@@ -10,6 +10,7 @@ const TAGS: [string, NewsItem['tag']][] = [
   ['gov', 'government'], ['tax', 'government'], ['policy', 'government'], ['migration', 'society'], ['housing', 'society'],
   ['farm', 'agriculture'], ['health', 'society'], ['milestone', 'milestone'], ['env', 'environment'],
   ['tourism', 'tourism'], ['air', 'tourism'], ['leisure', 'society'], ['trade', 'trade'], ['food', 'agriculture'],
+  ['utility', 'development'], ['fire', 'society'],
 ];
 const ALWAYS = new Set(['project.completed', 'project.phase', 'business.planned', 'migration.in', 'world.fx', 'air.more', 'air.fewer', 'leisure.event', 'food.procured', 'food.stockSale']);
 

@@ -1,10 +1,12 @@
 // Monthly statistics. Every number here is computed from the simulated entities, never generated.
 
+import { dateOf } from '../calendar';
 import { emptyAcc, sumExp, sumRev, type Sim } from '../core';
 import { foodRetail, goodsRetail, hhIncome, mealPrice, vegRetail } from '../econ';
 import { GOODS, Terrain, type MonthStats } from '../types';
 import { envAt } from './environment';
 import { roadStats } from './transport';
+import { totalDebt } from './loans';
 
 const median = (a: number[]) => { if (!a.length) return 0; const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
 
@@ -31,7 +33,7 @@ export function basketCost(sim: Sim): number {
 }
 
 export function statsMonthly(sim: Sim): void {
-  const s = sim.s, acc = s.stats.acc, g = s.gov;
+  const s = sim.s, acc = s.stats.acc, g = s.gov, u = s.util;
   let children = 0, students = 0, working = 0, unemployed = 0, retired = 0, wageSum = 0, wageN = 0, healthSum = 0, satSum = 0, adults = 0;
   let kids = 0, enrolled = 0, lit = 0, adults15 = 0, tert = 0, adults25 = 0, pollution = 0, homed = 0;
   for (const c of s.citizens) {
@@ -102,7 +104,7 @@ export function statsMonthly(sim: Sim): void {
     children, working, unemployed, retired, students, laborForce, unemployment: laborForce ? unemployed / laborForce : 0,
     avgWage: wageN ? wageSum / wageN : 0, medianIncome: median(incomes),
     gdp: va, cpi, inflation, foodPrice: foodRetail(sim),
-    revenue: sumRev(g.m), spending: sumExp(g.m), balance: sumRev(g.m) - sumExp(g.m), debt: g.debt, treasury: g.cash,
+    revenue: sumRev(g.m), spending: sumExp(g.m), balance: sumRev(g.m) - sumExp(g.m), debt: totalDebt(sim), treasury: g.cash,
     businesses, opened: acc.opened, closed: acc.closed, jobs, vacancies,
     units, vacantUnits: units - occ, homeless: s.households.filter((h) => h.home < 0).length, avgRent: renters ? rentSum / renters : 0,
     rentIndex: s.housing.rentIndex, rentBurden: median(burdens),
@@ -116,10 +118,17 @@ export function statsMonthly(sim: Sim): void {
     basket, roadKm: rs.km, poorRoads: rs.poor,
     leisure: s.leisure.avg,
     tourists: T.domestic + T.foreign, foreignTourists: T.foreign, touristNights: T.nights, tourismSpend: T.spend, turnedAway: T.turned,
-    hotelRooms: rooms, occupancy: rooms > 0 ? roomNights / (rooms * sim.date.daysInMonth) : 0, appeal: s.tourism.appeal,
+    hotelRooms: rooms, occupancy: rooms > 0 ? roomNights / (rooms * dateOf(s.meta.startYear, sim.day - 1).daysInMonth) : 0, appeal: s.tourism.appeal,
     passengers: s.air.m.pax, flights: s.air.m.flights,
     tradeBalance: exportsV - importsV, fx: s.trade.fx,
-    procured: s.pds.procured, grainStock: s.pds.stock, rationed: s.pds.rationed,
+    // the food programmes close their month before the statistics are taken (see MONTHLY), so read last month's figures
+    procured: s.pds.lastProcured, grainStock: s.pds.stock, rationed: s.pds.lastRationed,
+    // utilities close their month after the statistics, so this is the month that just ended
+    powerPeak: u.peak, powerCap: u.cap,
+    powerServed: u.m.kwh + u.m.short > 0 ? u.m.kwh / (u.m.kwh + u.m.short) : 1,
+    waterServed: u.m.water + u.m.waterShort > 0 ? u.m.water / (u.m.water + u.m.waterShort) : 1,
+    waterUse: u.waterUse, waterCap: u.waterCap, blackouts: u.m.blackouts,
+    fires: acc.fires, burned: acc.burned, fireCoverage: cov(s.services.fireCov),
   };
   months.push(st);
   if (months.length > 600) months.splice(1, months.length - 600);

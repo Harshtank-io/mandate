@@ -15,10 +15,17 @@ export const dayLabel = (sim: Sim, d: number) => formatDay(sim.s.meta.startYear,
 
 export function realSpan(ms: number): string {
   const m = ms / 60000;
-  if (m < 90) return `${Math.max(1, Math.round(m))} minutes`;
+  const n = (v: number, unit: string) => `${v} ${unit}${v === 1 ? '' : 's'}`;
+  if (m < 90) return n(Math.max(1, Math.round(m)), 'minute');
   const h = m / 60;
-  if (h < 48) return `${Math.round(h)} hours`;
-  return `${Math.round(h / 24)} days`;
+  if (h < 48) return n(Math.round(h), 'hour');
+  return n(Math.round(h / 24), 'day');
+}
+
+/** "Mayor Asha", but not "Mayor Mayor 9F2C1A" for players who kept their placeholder name. */
+export function mayorTitle(name: string): string {
+  const n = name.trim() || 'Mayor';
+  return /^mayor\b/i.test(n) ? n : `Mayor ${n}`;
 }
 
 /** Re-renders the calling component every `ms` milliseconds. */

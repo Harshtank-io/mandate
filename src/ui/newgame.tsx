@@ -1,7 +1,9 @@
 // New world: choose a place, a starting year, starting conditions, a name and how fast the world lives.
 
 import { useState } from 'preact/hooks';
-import { CONDITIONS, OFFLINE_CAPS, PACES, PRESETS, START_YEARS, getPreset } from '../sim/presets';
+import { BUILD_MODES } from '../sim/commands';
+import { OFFLINE_CAPS, PACES, PRESETS, START_OPTIONS, START_YEARS, getPreset } from '../sim/presets';
+import type { BuildMode } from '../sim/types';
 import type { NewWorldOptions } from '../sim/worldgen';
 
 const STEPS = ['Place', 'Year', 'Starting point', 'Your mandate'];
@@ -15,6 +17,7 @@ export function NewGame({ onCreate, onBack }: { onCreate(o: NewWorldOptions): vo
   const [touched, setTouched] = useState(false);
   const [pace, setPace] = useState(2);
   const [cap, setCap] = useState(365);
+  const [build, setBuild] = useState<BuildMode>('realistic');
   const [seed] = useState(() => Math.floor(Math.random() * 2 ** 31));
   const p = getPreset(preset);
 
@@ -22,7 +25,7 @@ export function NewGame({ onCreate, onBack }: { onCreate(o: NewWorldOptions): vo
     setPreset(id);
     if (!touched) { const t = getPreset(id).towns; setName(t[seed % t.length]); }
   };
-  const create = () => onCreate({ name: name.trim() || p.towns[0], preset, startYear: year, condition: cond, seed, pace, offlineCapDays: cap, now: Date.now() });
+  const create = () => onCreate({ name: name.trim() || p.towns[0], preset, startYear: year, condition: cond, seed, pace, offlineCapDays: cap, now: Date.now(), build });
 
   return (
     <main class="screen">
@@ -53,7 +56,7 @@ export function NewGame({ onCreate, onBack }: { onCreate(o: NewWorldOptions): vo
         {step === 1 && (
           <section>
             <h2>When do you take office?</h2>
-            <p class="muted">Prices, wages, car ownership and education levels are set to match the year. The simulation runs the year before you arrive, so the place has a recent history.</p>
+            <p class="muted">Prices, wages, car ownership and education levels are set to match the year. For an existing town the simulation runs the year before you arrive, so the place has a recent history.</p>
             <div class="choices row" role="radiogroup" aria-label="Year">
               {START_YEARS.map((y) => (
                 <button key={y} role="radio" aria-checked={year === y} class={`choice ${year === y ? 'on' : ''}`} onClick={() => setYear(y)}><b>{y}</b></button>
@@ -65,8 +68,9 @@ export function NewGame({ onCreate, onBack }: { onCreate(o: NewWorldOptions): vo
         {step === 2 && (
           <section>
             <h2>What kind of place?</h2>
+            <p class="muted">Take over an existing town, or start from empty land and build one yourself.</p>
             <div class="choices" role="radiogroup" aria-label="Starting conditions">
-              {CONDITIONS.map((c) => (
+              {START_OPTIONS.map((c) => (
                 <button key={c.id} role="radio" aria-checked={cond === c.id} class={`choice ${cond === c.id ? 'on' : ''}`} onClick={() => setCond(c.id)}>
                   <b>{c.label}</b>
                   <span class="small">{c.blurb}</span>
@@ -93,6 +97,16 @@ export function NewGame({ onCreate, onBack }: { onCreate(o: NewWorldOptions): vo
               ))}
             </fieldset>
             <fieldset class="field">
+              <legend>How are things built?</legend>
+              {BUILD_MODES.map((x) => (
+                <label key={x.id} class="radio">
+                  <input type="radio" name="build" checked={build === x.id} onChange={() => setBuild(x.id)} />
+                  <span><b>{x.label}</b> <span class="muted small">{x.note}</span></span>
+                </label>
+              ))}
+              <p class="muted small">Costs are the same either way. You can change this later in the World tab.</p>
+            </fieldset>
+            <fieldset class="field">
               <legend>While the game is closed, keep the world running for up to</legend>
               <div class="choices row">
                 {OFFLINE_CAPS.map((c) => (
@@ -102,7 +116,7 @@ export function NewGame({ onCreate, onBack }: { onCreate(o: NewWorldOptions): vo
                 ))}
               </div>
             </fieldset>
-            <p class="muted">{p.label}, {p.country} · taking office in {year} · {CONDITIONS.find((c) => c.id === cond)?.label.toLowerCase()}</p>
+            <p class="muted">{p.label}, {p.country} · taking office in {year} · {START_OPTIONS.find((c) => c.id === cond)?.label.toLowerCase()}{build !== 'realistic' ? ` · ${BUILD_MODES.find((b) => b.id === build)?.label.toLowerCase()} construction` : ''}</p>
           </section>
         )}
 

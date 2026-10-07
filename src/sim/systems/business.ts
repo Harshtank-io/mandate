@@ -20,11 +20,13 @@ function adminDelay(sim: Sim): number {
 export function businessDaily(sim: Sim): void {
   const s = sim.s;
   const reg = s.gov.policies.businessRegulation;
+  // with everything built instantly, the paperwork is quick too: a new business registers and is licensed in a day each
+  const fast = s.meta.build === 'all';
   for (const b of s.businesses) {
     const days = sim.day - b.statusDay;
     switch (b.status) {
       case 'registering':
-        if (days >= REG_DAYS[reg] * adminDelay(sim)) {
+        if (fast || days >= REG_DAYS[reg] * adminDelay(sim)) {
           sim.tax('licenseFees', b, s.gov.taxes.licenseFee);
           b.m.other += s.gov.taxes.licenseFee;
           b.status = 'licensing'; b.statusDay = sim.day;
@@ -32,7 +34,7 @@ export function businessDaily(sim: Sim): void {
         break;
       case 'licensing': {
         const industrial = ['factory', 'foodplant', 'materials'].includes(b.kind);
-        if (days >= LIC_DAYS[reg] * adminDelay(sim) * (industrial ? 1 + 0.5 * s.gov.policies.environmentalRegulation : 1)) {
+        if (fast || days >= LIC_DAYS[reg] * adminDelay(sim) * (industrial ? 1 + 0.5 * s.gov.policies.environmentalRegulation : 1)) {
           b.status = 'hiring'; b.statusDay = sim.day;
           sim.ix.storesDirty = true;
         }
@@ -133,7 +135,8 @@ function adjustJobs(sim: Sim, b: Business, after: number): void {
     case 'construction': {
       // crews follow the order book: project crews plus maintenance contracts
       let demand = 0;
-      for (const p of sim.s.projects) if (p.phase === 'construction' && (p.contractor === b.id || p.contractor < 0)) demand += BUILDINGS[p.kind as keyof typeof BUILDINGS]?.crew ?? 15;
+      // sites already contracted to an outside firm (contractor -2) are not work this firm will get
+      for (const p of sim.s.projects) if (p.phase === 'construction' && (p.contractor === b.id || p.contractor === -1)) demand += BUILDINGS[p.kind as keyof typeof BUILDINGS]?.crew ?? 15;
       const crew = b.jobs.filter((j) => j.role === 'laborer').length;
       if ((demand > crew * 1.1 || margin > 0.12) && after > 0 && vacant <= 2 && b.jobs.length < b.capacity * 2) sim.addJobs(b, 'laborer', Math.min(8, Math.max(1, Math.ceil((demand - crew) / 3))));
       else if (b.lossMonths >= 2 && crew > 6) cutJobs(sim, b, Math.max(1, Math.round(crew * 0.15)), 'Not enough construction contracts.');

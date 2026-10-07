@@ -6,6 +6,7 @@ import { maintenanceWork, payWage } from '../econ';
 import { BUSINESSES, ROAD_MAINT, ROAD_WEAR_COST } from '../tables';
 import { DEPTS, Terrain, type Dept, type Policies, type TaxSettings } from '../types';
 import { roadMaintenance } from './transport';
+import { annualRevenue, DEBT_LIMIT, marketDebt, ratingFor, serviceLoans } from './loans';
 
 export const TAX_LABELS: Record<keyof TaxSettings, string> = {
   income: 'Income tax (basic rate)', incomeTop: 'Income tax (top rate)', allowance: 'Tax-free allowance', topThreshold: 'Top-rate threshold',
@@ -13,6 +14,7 @@ export const TAX_LABELS: Record<keyof TaxSettings, string> = {
   property: 'Property tax', fuel: 'Fuel tax', import: 'Import tariff (manufactures)', importFood: 'Import tariff (food & farm goods)',
   export: 'Export tax', agriculture: 'Agricultural income tax', luxury: 'Luxury tax', licenseFee: 'Business licence fee',
   tourism: 'Hotel room tax', entertainment: 'Entertainment tax', passengerFee: 'Airport passenger fee',
+  power: 'Electricity tariff', water: 'Water tariff',
 };
 
 export const POLICY_LABELS: Record<keyof Policies, string> = {
@@ -34,8 +36,8 @@ export const POLICY_DELAY: Record<keyof Policies, number> = {
 export const GRANT_PER_CAPITA = 550;
 
 export const DEPT_LABELS: Record<Dept, string> = {
-  admin: 'Administration', health: 'Health', education: 'Education', safety: 'Police & safety', transport: 'Transport & roads',
-  agriculture: 'Agriculture', environment: 'Environment', culture: 'Culture, sport & heritage',
+  admin: 'Administration', health: 'Health', education: 'Education', safety: 'Police, fire & safety', transport: 'Transport & roads',
+  agriculture: 'Agriculture', environment: 'Environment', culture: 'Culture, sport & heritage', utilities: 'Water & power',
 };
 
 export function governmentDaily(sim: Sim): void {
@@ -74,6 +76,18 @@ export function deptExtras(sim: Sim): Record<Dept, number> {
   const venues = s.businesses.filter((b) => (b.kind === 'museum' || b.kind === 'stadium') && b.status !== 'planned').length;
   ex.culture = (15_000 + 60_000 * heritage + 90_000 * venues) * nominal;
   if (s.businesses.some((b) => b.kind === 'airport' && b.status !== 'planned')) ex.transport += 450_000 * nominal;
+  // fire engines, breathing sets and hoses; water treatment chemicals, pumps and mains repairs; plant spares
+  let fire = 0, util = 0;
+  for (const b of s.businesses) {
+    if (b.status === 'planned' || b.status === 'closed') continue;
+    if (b.kind === 'firestation') fire += 60_000;
+    else if (b.kind === 'waterworks') util += 90_000;
+    else if (b.kind === 'gasplant') util += 120_000;
+    else if (b.kind === 'solarfarm' || b.kind === 'windfarm') util += 30_000;
+  }
+  for (const b of s.buildings) if (b.kind === 'substation') util += 50_000;
+  ex.safety += fire * nominal;
+  ex.utilities = util * nominal;
   return ex;
 }
 
@@ -116,7 +130,7 @@ export function governmentMonthly(sim: Sim): void {
     const opsShare = opsNeed > 0 ? ops / opsNeed : 1;
     // road, park and heritage upkeep is done by local contractors; supplies and programmes are bought in
     if (ops > 0) {
-      if (d === 'transport' || d === 'environment' || d === 'culture') maintenanceWork(sim, g, ops, d);
+      if (d === 'transport' || d === 'environment' || d === 'culture' || d === 'utilities') maintenanceWork(sim, g, ops, d);
       else sim.spend(d, s.ext, ops);
     }
     g.deptSpend[d] = salaries[d] + ops;
@@ -148,15 +162,16 @@ export function governmentMonthly(sim: Sim): void {
     sim.spend(cat, h, amt);
     h.m.benefits += amt;
   }
-  // debt service
+  // debt service: instalments on the city's loans, interest on the overdraft
+  serviceLoans(sim);
   const interest = (g.debt * g.rate) / 12;
   if (interest > 0) sim.spend('interest', s.ext, interest);
-  const annualRev = Math.max(1, sumRev(g.ytd) > 0 && sim.date.month > 2 ? (sumRev(g.ytd) / sim.date.month) * 12 : sumRev(g.last) * 12 || sumRev(g.m) * 12);
-  const limit = annualRev * 4.5;
+  const annualRev = annualRevenue(sim);
+  const limit = annualRev * DEBT_LIMIT;
   const monthlySpend = Math.max(sumExp(g.last), sumExp(g.m) * 0.5);
   if (g.cash < 0) {
     const want = -g.cash + monthlySpend * 0.5;
-    const room = Math.max(0, limit - g.debt);
+    const room = Math.max(0, limit - marketDebt(sim));
     const borrow = Math.min(want, room);
     if (borrow > 0) {
       sim.pay(s.ext, g, borrow);
@@ -165,7 +180,7 @@ export function governmentMonthly(sim: Sim): void {
     if (g.cash < 0) {
       g.arrears++;
       sim.emit('gov.arrears', `The treasury cannot borrow more: bills worth ${Math.round(-g.cash).toLocaleString()} are unpaid.`, 3, undefined, undefined,
-        [`Debt has reached ${(g.debt / annualRev).toFixed(1)}x annual revenue; lenders refuse new loans`, 'Unpaid suppliers delay public services']);
+        [`Debt has reached ${(marketDebt(sim) / annualRev).toFixed(1)}x annual revenue; lenders refuse new loans`, 'Unpaid suppliers delay public services']);
     }
   } else {
     g.arrears = 0;
@@ -175,8 +190,8 @@ export function governmentMonthly(sim: Sim): void {
       g.debt -= repay;
     }
   }
-  const ratio = g.debt / annualRev;
-  const [rating, rate] = ratio < 1 ? ['AA', 0.065] : ratio < 2 ? ['A', 0.075] : ratio < 3 ? ['BBB', 0.09] : ratio < 4 ? ['BB', 0.11] : ['B', 0.14];
+  const ratio = marketDebt(sim) / annualRev;
+  const [rating, rate] = ratingFor(ratio);
   if (rating !== g.rating) {
     const worse = rate > g.rate;
     sim.emit('gov.rating', `Credit rating ${worse ? 'downgraded' : 'upgraded'} to ${rating}; new borrowing costs ${(rate * 100).toFixed(1)}%.`, worse ? 2 : 1, undefined, undefined,

@@ -2,10 +2,10 @@
 // businesses, households and citizens. The result is a coherent economy close to a steady state so the
 // simulation can take over immediately.
 
-import { dateOf, dayIndex } from './calendar';
+import { dateOf, dayIndex, MIN_PER_DAY } from './calendar';
 import { emptyAcc, emptyGovLedger, emptyHhLedger, idx, inMap, Sim, W } from './core';
 import { businessName, firstName, lastName } from './names';
-import { emptyVenue, initAir, initFood, initLeisure, initTourism, initTrade } from './init';
+import { emptyVenue, initAir, initFood, initLeisure, initTourism, initTrade, initUtilities } from './init';
 import { STATE_VERSION } from './migrate';
 import { getCondition, getPreset, moneyScale, type Preset, type StartCondition } from './presets';
 import { type Rng, seedState } from './rng';
@@ -16,7 +16,7 @@ import {
 import { computeAppeal } from './systems/tourism';
 import {
   DEPTS, GOODS, RoadClass, Terrain, Zone,
-  type Building, type BuildingKind, type Business, type BusinessKind, type Citizen, type CropId, type Dept, type FarmState, type Field,
+  type Building, type BuildingKind, type BuildMode, type Business, type BusinessKind, type Citizen, type CropId, type Dept, type FarmState, type Field,
   type Good, type Household, type MarketGood, type RoleId, type WorldState,
 } from './types';
 
@@ -30,9 +30,13 @@ export interface NewWorldOptions {
   pace: number;
   offlineCapDays: number;
   now: number;
+  /** How construction works (see BuildMode); realistic when left out. */
+  build?: BuildMode;
 }
 
 const N = W * W;
+/** Towns of at least this many people start with a fire station of their own. */
+export const FIRE_STATION_TOWN = 4000;
 const mod = (a: number, n: number) => ((a % n) + n) % n;
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
@@ -54,12 +58,16 @@ export function skeleton(o: NewWorldOptions): WorldState {
   const preset = getPreset(o.preset);
   const cond = getCondition(o.condition);
   const epoch = o.startYear - 1;
+  const officeDay = dayIndex(epoch, o.startYear, 0, 1);
   const scale = moneyScale(o.preset, epoch);
+  // empty land has no history to simulate: the clock starts the day the player takes office, at that year's prices
+  const empty = cond.id === 'empty';
+  const trend = empty ? 1 + preset.inflation : 1;
   const prices = {} as Record<Good, number>;
   const dev = {} as Record<Good, number>;
   const market = {} as Record<Good, MarketGood>;
   for (const g of GOODS) {
-    prices[g] = GOOD_SPECS[g].world * scale;
+    prices[g] = GOOD_SPECS[g].world * scale * trend;
     dev[g] = 0;
     market[g] = { price: prices[g], supply: 0, demand: 0, local: 0, imported: 0, exported: 0, lastLocal: 0, lastImported: 0, lastExported: 0, importValue: 0, exportValue: 0, hist: [], lastWhy: '' };
   }
@@ -72,9 +80,10 @@ export function skeleton(o: NewWorldOptions): WorldState {
     v: STATE_VERSION,
     meta: {
       id: `w${o.now.toString(36)}${Math.floor(o.seed % 1e6).toString(36)}`, name: o.name, preset: o.preset, startYear: epoch,
-      officeYear: o.startYear, officeDay: dayIndex(epoch, o.startYear, 0, 1), condition: o.condition, seed: o.seed, pace: o.pace, offlineCapDays: o.offlineCapDays, createdAt: o.now, lastReal: o.now, playedMs: 0,
+      officeYear: o.startYear, officeDay, condition: o.condition, seed: o.seed, pace: o.pace, offlineCapDays: o.offlineCapDays, createdAt: o.now, lastReal: o.now, playedMs: 0,
+      build: o.build ?? 'realistic',
     },
-    minute: 8 * 60,
+    minute: (empty ? officeDay * MIN_PER_DAY : 0) + 8 * 60,
     rng: seedState(o.seed),
     nextId: 1,
     map: {
@@ -84,10 +93,10 @@ export function skeleton(o: NewWorldOptions): WorldState {
     },
     buildings: [], businesses: [], citizens: [], households: [], projects: [], shipments: [],
     market,
-    ext: { cash: 0, demand: 1, phase: 'normal', phaseLeft: 0, fuel: 60 * scale, fuelDev: 0, prices, dev, trend: 1 },
+    ext: { cash: 0, demand: 1, phase: 'normal', phaseLeft: 0, fuel: 60 * scale * trend, fuelDev: 0, prices, dev, trend },
     weather: { temp: preset.climate.temp[0], tempDev: 0, rain: 0, rainLog: [], normalLog: [], anomaly: 1, anomalyQuarter: -1, drought: false, flood: 999, heatDays: 0, pandemic: 0 },
     gov: {
-      cash: cond.treasury * scale, debt: cond.debt * scale, rate: 0.07, rating: 'A',
+      cash: cond.treasury * scale, debt: cond.debt * scale, loans: [], rate: 0.07, rating: 'A',
       taxes: { ...t, allowance: t.allowance * scale, topThreshold: t.topThreshold * scale, licenseFee: t.licenseFee * scale, passengerFee: t.passengerFee * scale },
       level: { ...oneDept }, deptSpend: { ...zeroDept },
       policies: { ...p, minWage: p.minWage * scale, unemploymentBenefit: p.unemploymentBenefit * scale, pension: p.pension * scale, povertyTransfer: p.povertyTransfer * scale },
@@ -98,10 +107,12 @@ export function skeleton(o: NewWorldOptions): WorldState {
     housing: { rentIndex: 1, vacancy: cond.vacancy, demandGap: 0 },
     traffic: { volume: new Array(N).fill(0), avgCommute: 0, congestion: 0, lastRun: -999, truckLoad: new Array(N).fill(0), tileTime: new Array(N).fill(0) },
     env: { pollution: new Array(32 * 32).fill(0), co2: 0, water: 0.8 },
-    services: { health: 0.6, education: 0.6, safety: 0.6, crime: 0.03, healthCov: new Array(256).fill(0), schoolCov: new Array(256).fill(0), policeCov: new Array(256).fill(0) },
+    services: { health: 0.6, education: 0.6, safety: 0.6, crime: 0.03, healthCov: new Array(256).fill(0), schoolCov: new Array(256).fill(0), policeCov: new Array(256).fill(0), fireCov: new Array(256).fill(0) },
     stats: { months: [], acc: emptyAcc(), cumHarvest: {} },
     events: [], news: [], milestones: {},
     leisure: initLeisure(), tourism: initTourism(preset), air: initAir(), trade: initTrade(preset), pds: initFood(),
+    // the regional grid line is sized to the town's demand on the first simulated day
+    util: initUtilities(0),
   };
 }
 
@@ -148,6 +159,11 @@ class Generator {
 
   run(): void {
     this.terrain();
+    if (this.c.id === 'empty') {
+      this.emptyLand();
+      this.finance();
+      return;
+    }
     this.roads();
     this.zones();
     this.placeCivic();
@@ -244,6 +260,22 @@ class Generator {
     }
     for (let i = 0; i < N; i++) if (m.road[i] > 0 && !seen[i]) m.road[i] = 0;
     for (let i = 0; i < N; i++) m.roadCond[i] = m.road[i] ? 0.7 + 0.3 * this.r.next() : 0;
+  }
+
+  /** Empty land: only the regional highway crosses the region. Nothing is zoned, built or farmed. */
+  emptyLand(): void {
+    const m = this.s.map;
+    for (let x = 0; x < W; x++) {
+      const i = idx(x, this.yH);
+      m.road[i] = RoadClass.Highway;
+      if (m.terrain[i] === Terrain.Forest) m.terrain[i] = Terrain.Grass;
+    }
+    for (let i = 0; i < N; i++) m.roadCond[i] = m.road[i] ? 0.8 + 0.2 * this.r.next() : 0;
+    // land value: the riverbank and the highway are the most sought-after places to settle
+    for (let y = 0; y < W; y++) for (let x = 0; x < W; x++) {
+      const dr = Math.abs(x - this.riverX[y]), dh = Math.abs(y - this.yH);
+      m.landValue[idx(x, y)] = clamp(0.2 + 0.3 * Math.exp(-dr / 10) + 0.25 * Math.exp(-dh / 8), 0, 1);
+    }
   }
 
   roadNeighbor(i: number): number {
@@ -392,6 +424,13 @@ class Generator {
       const a = (2 * Math.PI * k) / this.c.police + 3.4;
       this.place('police', 'police', cx + Math.cos(a) * R * 0.3, cy + Math.sin(a) * R * 0.3, okUrban, 18);
     }
+    // one central station covers a town of this size (about 15,000 people within 1-2 km); small developing towns
+    // have none yet and rely on the district's engines from further away
+    if (this.c.population >= FIRE_STATION_TOWN) this.place('firestation', 'firestation', cx + Math.cos(5.1) * R * 0.25, cy + Math.sin(5.1) * R * 0.25, okUrban, 18);
+    // the waterworks draws from the river upstream of the town; mains follow the streets
+    const wy = clamp(Math.round(cy - R * 0.3), 4, W - 6);
+    const riverside = (i: number) => Math.abs((i % W) - this.riverX[(i / W) | 0]) <= 5 && m.zone[i] !== Zone.Industrial;
+    this.place('waterworks', 'waterworks', this.riverX[wy] + 3, wy, riverside, 30);
   }
 
   placeIndustry(): void {
@@ -477,14 +516,26 @@ class Generator {
       bl.built = -36500;
     }
     if (c.museum) this.place('museum', 'museum', this.cx - 5, this.cy - 5, okUrban, 18);
-    if (c.stadium) this.place('stadium', 'stadium', this.cx + this.R * 0.55, this.cy - this.R * 0.45, okUrban, 25);
+    if (c.stadium) {
+      // a stadium needs a bigger plot than the town's street blocks offer: try the town either way round, then open
+      // land at its edge
+      const tx = this.cx + this.R * 0.55, ty = this.cy - this.R * 0.45;
+      const edge = (i: number) => m.zone[i] !== Zone.Industrial;
+      const tries: [number, number, (i: number) => boolean, number][] = [[4, 3, okUrban, 25], [3, 4, okUrban, 25], [4, 3, edge, 35], [3, 4, edge, 35]];
+      for (const [w, h, ok, maxR] of tries) {
+        const spot = this.findRect(w, h, tx, ty, ok, maxR);
+        if (!spot) continue;
+        this.mkBusiness('stadium', this.mkBuilding('stadium', spot.x, spot.y, w, h, spot.access, 1));
+        break;
+      }
+    }
     const nCin = Math.max(1, Math.round(c.population / 5000));
     for (let k = 0; k < nCin; k++) {
       const [x, y] = this.randomUrbanPoint(0.35);
       this.place('cinema', 'cinema', x, y, okCom, 20) ?? this.place('cinema', 'cinema', x, y, okComRes, 25);
     }
-    // hotels sized to the visitors the attractions already draw
-    computeAppeal(this.sim);
+    // hotels sized to the visitors the attractions already draw (residents are placed later, so use the target)
+    computeAppeal(this.sim, c.population);
     const T = this.s.tourism, rep = 0.5 + T.reputation;
     const dom = VISITOR_BASE.domestic * T.appeal * T.awareness * rep * 0.85;
     const forn = VISITOR_BASE.foreign * T.appeal * T.awarenessIntl * rep * 0.36;
@@ -1165,6 +1216,8 @@ class Generator {
     need.agriculture += (600 * this.farms.length + 800 * canals) * sim.scale;
     need.environment += (25_000 + 10_000 * s.buildings.filter((b) => b.kind === 'park').length + 15_000 * s.businesses.filter((b) => ['factory', 'materials', 'foodplant'].includes(b.kind)).length) * sim.scale;
     need.culture += (15_000 + 60_000 * s.buildings.filter((b) => b.kind === 'heritage').length + 90_000 * s.businesses.filter((b) => b.kind === 'museum' || b.kind === 'stadium').length) * sim.scale;
+    need.safety += 60_000 * s.businesses.filter((b) => b.kind === 'firestation').length * sim.scale;
+    need.utilities += 90_000 * s.businesses.filter((b) => b.kind === 'waterworks').length * sim.scale;
     // departments start at full service; the player adjusts levels from there
     for (const d of DEPTS) {
       s.gov.level[d] = 1;

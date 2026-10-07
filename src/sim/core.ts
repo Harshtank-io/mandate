@@ -18,14 +18,14 @@ export const tx = (i: number) => i % W;
 export const ty = (i: number) => (i / W) | 0;
 export const inMap = (x: number, y: number) => x >= 0 && y >= 0 && x < W && y < W;
 
-export const REV_CATS: RevCat[] = ['incomeTax', 'corporateTax', 'smallBizTax', 'salesTax', 'foodTax', 'propertyTax', 'fuelTax', 'importTariff', 'exportTax', 'agriTax', 'luxuryTax', 'licenseFees', 'rents', 'fares', 'premiums', 'grants', 'tourismTax', 'entertainmentTax', 'airportFees', 'tickets', 'grainSales', 'other'];
-export const EXP_CATS: ExpCat[] = ['admin', 'health', 'education', 'safety', 'transport', 'agriculture', 'environment', 'culture', 'unemployment', 'pensions', 'fertilizer', 'insurance', 'capital', 'interest', 'land', 'procurement', 'rations', 'transfers', 'exportSupport', 'promotion'];
+export const REV_CATS: RevCat[] = ['incomeTax', 'corporateTax', 'smallBizTax', 'salesTax', 'foodTax', 'propertyTax', 'fuelTax', 'importTariff', 'exportTax', 'agriTax', 'luxuryTax', 'licenseFees', 'rents', 'fares', 'premiums', 'grants', 'tourismTax', 'entertainmentTax', 'airportFees', 'tickets', 'grainSales', 'utilityBills', 'powerSales', 'other'];
+export const EXP_CATS: ExpCat[] = ['admin', 'health', 'education', 'safety', 'transport', 'agriculture', 'environment', 'culture', 'utilities', 'unemployment', 'pensions', 'fertilizer', 'insurance', 'capital', 'interest', 'land', 'procurement', 'rations', 'transfers', 'exportSupport', 'promotion', 'energy'];
 
 export function emptyLedger(): Ledger {
   return { revenue: 0, cogs: 0, wages: 0, taxes: 0, other: 0, sales: 0, production: 0, unmet: 0 };
 }
 export function emptyHhLedger(): HhLedger {
-  return { wages: 0, benefits: 0, dividends: 0, rent: 0, food: 0, goods: 0, services: 0, leisure: 0, transport: 0, taxes: 0, other: 0 };
+  return { wages: 0, benefits: 0, dividends: 0, rent: 0, food: 0, goods: 0, services: 0, leisure: 0, transport: 0, taxes: 0, other: 0, utilities: 0 };
 }
 export function emptyGovLedger(): GovLedger {
   const rev = {} as Record<RevCat, number>;
@@ -37,7 +37,7 @@ export function emptyGovLedger(): GovLedger {
 export function emptyAcc(): StatsAcc {
   return {
     births: 0, deaths: 0, immigrants: 0, emigrants: 0, opened: 0, closed: 0, harvest: {}, harvestNormal: {}, harvestLoss: {},
-    fuelLitres: 0, industryCO2: 0, foodUnmet: 0, foodWanted: 0,
+    fuelLitres: 0, industryCO2: 0, foodUnmet: 0, foodWanted: 0, fires: 0, burned: 0,
   };
 }
 export const sumRev = (l: GovLedger) => REV_CATS.reduce((a, c) => a + l.rev[c], 0);
@@ -183,6 +183,14 @@ export class Sim {
   fuelPrice(): number { return this.s.ext.fuel * (1 + this.s.gov.taxes.fuel); }
 
   isWorkDay(): boolean { return this.date.dow !== 0; }
+
+  /**
+   * How much a town founded on empty land is still a frontier settlement: 1 at the start, falling to 0 as it passes
+   * 3,000 residents. Towns that existed when the world was created are never frontiers.
+   */
+  frontier(): number {
+    return this.s.meta.condition === 'empty' ? Math.max(0, 1 - this.s.citizens.length / 3000) : 0;
+  }
 
   // ---------------------------------------------------------------- lookups
   cit(id: number) { return this.ix.cit.get(id); }

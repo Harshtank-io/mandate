@@ -21,17 +21,23 @@ function staffShare(b: Business, roles?: string[]): number {
   return template > 0 ? fil / template : tot ? fil / tot : 0;
 }
 
-export function facilityQuality(sim: Sim, b: Business): number {
+const KEY: Partial<Record<string, string[]>> = {
+  school: ['teacher'], college: ['lecturer'], police: ['officer'], clinic: ['doctor', 'nurse'], hospital: ['doctor', 'nurse'],
+  museum: ['curator', 'host'], stadium: ['host', 'security'], airport: ['controller', 'security'], firestation: ['firefighter'],
+  gasplant: ['plantop', 'technician'], waterworks: ['plantop', 'technician'], solarfarm: ['technician'], windfarm: ['technician'],
+};
+
+/**
+ * Service a public facility delivers, 0..1: its key staff, the department's funding and whether suppliers get paid.
+ * Blackouts take a little off (`power` false for plants and waterworks, whose own supply is worked out separately).
+ */
+export function facilityQuality(sim: Sim, b: Business, power = true): number {
   const dept = BUSINESSES[b.kind].dept;
   const funding = dept ? Math.min(1, sim.s.gov.deptFunding[dept]) : 1;
-  const KEY: Partial<Record<string, string[]>> = {
-    school: ['teacher'], college: ['lecturer'], police: ['officer'], clinic: ['doctor', 'nurse'], hospital: ['doctor', 'nurse'],
-    museum: ['curator', 'host'], stadium: ['host', 'security'], airport: ['controller', 'security'],
-  };
-  const key = KEY[b.kind];
-  const staff = Math.min(1, staffShare(b, key));
+  const staff = Math.min(1, staffShare(b, KEY[b.kind]));
   const arrears = sim.s.gov.arrears > 0 ? 0.8 : 1;
-  return Math.max(0, staff * (0.7 + 0.3 * funding) * arrears);
+  const pw = power ? 0.8 + 0.2 * (sim.bld(b.building)?.pw ?? 1) : 1;
+  return Math.max(0, staff * (0.7 + 0.3 * funding) * arrears * pw);
 }
 
 /** Two-step floating catchment: facility capacity shared among nearby residents with distance decay. */
@@ -73,6 +79,8 @@ export function servicesMonthly(sim: Sim): void {
   sv.healthCov = catchment(sim, ['clinic', 'hospital'], (b) => (b.kind === 'hospital' ? 55 : 22), (b) => (BUSINESSES[b.kind].serves ?? 0) * facilityQuality(sim, b), pop);
   sv.policeCov = catchment(sim, ['police'], () => 30, (b) => (BUSINESSES.police.serves ?? 0) * facilityQuality(sim, b), pop);
   sv.schoolCov = catchment(sim, ['school'], () => 30, (b) => (BUSINESSES.school.serves ?? 0) * facilityQuality(sim, b), kidsCell);
+  // fire engines reach about 1.2 km in the first minutes; crews without mains water fight fires with what they carry
+  sv.fireCov = catchment(sim, ['firestation'], () => 26, (b) => (BUSINESSES.firestation.serves ?? 0) * facilityQuality(sim, b) * (0.6 + 0.4 * (sim.bld(b.building)?.wt ?? 1)), pop);
   education(sim);
   // crime: unemployment and poverty raise it, police coverage lowers it
   const lf = s.citizens.filter((c) => c.status === 'working' || c.status === 'unemployed' || c.status === 'owner').length;
@@ -190,8 +198,14 @@ function chooseField(sim: Sim): Field {
   return sim.rng.weighted(fields, fields.map((f) => vac[f] * (f === 'eng' ? 1.3 : 1)));
 }
 
-export interface SatParts { employment: number; income: number; housing: number; commute: number; health: number; safety: number; environment: number; food: number; taxes: number; services: number; leisure: number }
-export const SAT_WEIGHTS: SatParts = { employment: 0.15, income: 0.15, housing: 0.12, commute: 0.08, health: 0.1, safety: 0.08, environment: 0.07, food: 0.1, taxes: 0.05, services: 0.05, leisure: 0.05 };
+export interface SatParts {
+  employment: number; income: number; housing: number; commute: number; health: number; safety: number; environment: number; food: number; taxes: number;
+  services: number; leisure: number; utilities: number;
+}
+export const SAT_WEIGHTS: SatParts = {
+  employment: 0.141, income: 0.141, housing: 0.1128, commute: 0.0752, health: 0.094, safety: 0.0752, environment: 0.0658, food: 0.094, taxes: 0.047,
+  services: 0.047, leisure: 0.047, utilities: 0.06,
+};
 
 export function satisfactionParts(sim: Sim, c: Citizen, h: Household | undefined, crime: number): SatParts {
   const s = sim.s, sv = s.services;
@@ -224,7 +238,11 @@ export function satisfactionParts(sim: Sim, c: Citizen, h: Household | undefined
   const services = hasKids ? 0.5 * sv.schoolCov[k] + 0.5 * sv.healthCov[k] : sv.healthCov[k] * 0.7 + 0.3 * (1 - (c.lean > 0.3 ? 0 : 0.3));
   // places to go nearby (parks are free) and whether the family can afford to go out
   const leisure = Math.min(1, 0.25 + 0.4 * (s.leisure.cov[k] ?? 0) + 0.35 * (h?.leisure ?? 0.3));
-  return { employment, income: incomeS, housing, commute, health, safety, environment, food, taxes, services, leisure };
+  // reliable electricity and mains water at home, and bills the family can afford
+  const pw = home ? home.pw ?? 1 : 0.5, wt = home ? home.wt ?? 1 : 0.3;
+  const billShare = h && income > 0 ? h.last.utilities / income : 0;
+  const utilities = (0.55 * pw + 0.45 * wt) * (1 - Math.max(0, Math.min(0.4, (billShare - 0.03) * 5)));
+  return { employment, income: incomeS, housing, commute, health, safety, environment, food, taxes, services, leisure, utilities };
 }
 
 export function satisfactionOf(p: SatParts): number {
@@ -243,8 +261,10 @@ function wellbeing(sim: Sim, crimeCell: number[]): void {
     const k = home ? cellOf(home.x, home.y) : 0;
     const age = sim.age(c);
     const pollution = envAt(sim, home ? home.x : 64, home ? home.y : 64);
+    // well and tanker water is often unsafe; blackouts mean no fans in the heat and spoiled food
+    const unsafe = home ? 1 - (home.wt ?? 1) : 0.7, dark = home ? 1 - (home.pw ?? 1) : 0.5;
     const target = 0.92 - Math.max(0, age - 45) * 0.006 - pollution * 0.25 - (1 - (h?.foodSec ?? 0.7)) * 0.3
-      - (1 - sv.healthCov[k]) * 0.15 - (pandemic ? 0.12 : 0) - (!h || h.home < 0 ? 0.08 : 0);
+      - (1 - sv.healthCov[k]) * 0.15 - (pandemic ? 0.12 : 0) - (!h || h.home < 0 ? 0.08 : 0) - unsafe * 0.05 - dark * 0.02;
     c.health = Math.max(0.05, Math.min(1, c.health + (target - c.health) * 0.15));
     if (age < 16) continue;
     const parts = satisfactionParts(sim, c, h, crimeCell[k]);
