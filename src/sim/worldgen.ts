@@ -32,6 +32,8 @@ export interface NewWorldOptions {
   now: number;
   /** How construction works (see BuildMode); realistic when left out. */
   build?: BuildMode;
+  /** Plot on the world map chosen when the town was founded. */
+  plot?: number;
 }
 
 const N = W * W;
@@ -82,6 +84,7 @@ export function skeleton(o: NewWorldOptions): WorldState {
       id: `w${o.now.toString(36)}${Math.floor(o.seed % 1e6).toString(36)}`, name: o.name, preset: o.preset, startYear: epoch,
       officeYear: o.startYear, officeDay, condition: o.condition, seed: o.seed, pace: o.pace, offlineCapDays: o.offlineCapDays, createdAt: o.now, lastReal: o.now, playedMs: 0,
       build: o.build ?? 'realistic',
+      ...(o.plot !== undefined && Number.isInteger(o.plot) && o.plot >= 0 ? { plot: o.plot } : {}),
     },
     minute: (empty ? officeDay * MIN_PER_DAY : 0) + 8 * 60,
     rng: seedState(o.seed),

@@ -1,4 +1,4 @@
-// Accounts and cloud saves in the interface: the account panel on the main menu, the list of towns kept in the
+// Accounts and cloud saves in the interface: the account panel on the world map, the list of towns kept in the
 // account, the cloud status while playing, and the dialogs for a town open on another device or changed in two places.
 
 import { useState } from 'preact/hooks';
@@ -194,11 +194,11 @@ export function CloudSection({ worldId, onSaveNow }: { worldId: string; onSaveNo
         </dl>
       ) : (
         <p class="muted small">{c.phase === 'connecting' ? 'Connecting to your account…'
-          : c.phase === 'signedOut' ? 'Signed out: this town is saved on this device only. Sign in from the main menu.'
+          : c.phase === 'signedOut' ? 'Signed out: this town is saved on this device only. Sign in from the world map (Account).'
             : c.notice || 'Offline: saves go to the cloud once the connection is back.'}</p>
       )}
       {c.phase === 'online' && <div class="buttons"><button disabled={status === 'uploading' || status === 'lost' || status === 'conflict'} onClick={onSaveNow}>Save to cloud now</button></div>}
-      {acc?.guest && <p class="muted small">Guest towns can only be reached from this browser. Add an email on the main menu to keep them safe.</p>}
+      {acc?.guest && <p class="muted small">Guest towns can only be reached from this browser. Add an email under Account on the world map to keep them safe.</p>}
       {c.phase === 'online' && acc && <MapSwitch worldId={worldId} />}
     </section>
   );
@@ -225,7 +225,7 @@ export function CloudDialog({ ask }: { ask: Ask }) {
     return (
       <Modal title="Now open on another device">
         <p>{ask.name} was opened on another device, so play has stopped here to keep a single version of the town. Nothing after that moment was saved on this device.</p>
-        <div class="buttons"><button class="primary" onClick={ask.onTakeOver} autoFocus>Take over here</button><button class="ghost" onClick={ask.onMenu}>Main menu</button></div>
+        <div class="buttons"><button class="primary" onClick={ask.onTakeOver} autoFocus>Take over here</button><button class="ghost" onClick={ask.onMenu}>World map</button></div>
       </Modal>
     );
   }

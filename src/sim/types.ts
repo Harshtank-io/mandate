@@ -598,6 +598,8 @@ export interface WorldMeta {
   lastReal: number; // real ms timestamp the state corresponds to
   playedMs: number;
   build?: BuildMode; // missing in older saves = 'realistic'
+  /** Plot on the world map the founder chose in the region (missing: the next free plot). */
+  plot?: number;
 }
 
 export interface MapState {

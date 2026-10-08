@@ -80,6 +80,8 @@ export function describe(state: WorldState): Record<string, string | number> {
   };
   // a town with nobody in it yet has no approval rating or labour market to speak of
   if (state.citizens.length) d.approval = state.gov.approval;
+  // the plot the founder picked on the world map; the server uses it for the town's first placement if it is free
+  if (state.meta.plot !== undefined) d.plot = state.meta.plot;
   if (last?.laborForce) d.unemployment = last.unemployment;
   return d;
 }

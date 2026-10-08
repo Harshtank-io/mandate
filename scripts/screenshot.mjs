@@ -27,15 +27,27 @@ const canvasCenter = async (dx = 0, dy = 0) => {
 
 try {
   await page.goto(url);
-  await page.getByRole('button', { name: 'New world' }).click();
-  await shot('01-wizard-region');
-  await page.getByRole('button', { name: 'Next' }).click();
-  await page.getByRole('button', { name: 'Next' }).click();
+  await page.getByRole('heading', { name: 'Mandate', level: 1 }).waitFor();
+  await shot('00-landing');
+  await page.getByRole('button', { name: /^Enter / }).first().click();
+  await page.getByRole('button', { name: /Found a new town/ }).waitFor();
+  await page.waitForTimeout(800);
+  await shot('01-world-map');
+  await page.getByRole('button', { name: /Found a new town/ }).click();
+  await page.waitForTimeout(400);
+  await shot('01b-founding');
+  // a free plot clicked on the map itself, then the region list as a shortcut
+  const plot = page.locator('path.free-hex').nth(40);
+  await plot.click({ force: true });
+  await page.waitForTimeout(500);
+  await shot('02-found-card-map');
+  await page.getByRole('button', { name: 'Choose another region' }).click();
+  await page.locator('.region-list button', { hasText: 'Deccan Plateau' }).click();
   await page.getByRole('radio', { name: /Growing town/ }).click();
-  await page.getByRole('button', { name: 'Next' }).click();
-  await shot('02-wizard-mandate');
+  await page.waitForTimeout(300);
+  await shot('02-found-card');
   const t0 = Date.now();
-  await page.getByRole('button', { name: 'Take office' }).click();
+  await page.getByRole('button', { name: /^Found / }).click();
   await page.getByRole('dialog', { name: /Welcome to/ }).waitFor({ timeout: 180_000 });
   console.log(`world generated and its history year simulated in ${Date.now() - t0} ms`);
   await page.waitForTimeout(1200);
@@ -185,8 +197,9 @@ try {
 
   // persistence: leave to the menu (saves), make the stored save look six hours old, reload and continue
   const before = await game(() => ({ minute: window.__mandate.game.state.minute, name: window.__mandate.game.state.meta.name }));
-  await page.getByRole('button', { name: 'Menu', exact: true }).click();
-  await page.getByRole('button', { name: new RegExp(`Continue ${before.name}`) }).waitFor({ timeout: 30_000 });
+  await page.getByRole('button', { name: 'World map', exact: true }).click();
+  await page.getByRole('button', { name: new RegExp(`^Play ${before.name}`) }).waitFor({ timeout: 30_000 });
+  await shot('14b-back-on-map');
   await page.evaluate(async (hours) => {
     const db = await new Promise((res, rej) => { const r = indexedDB.open('mandate'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
     const key = localStorage.getItem('mandate.last');
@@ -198,7 +211,9 @@ try {
     db.close();
   }, 6);
   await page.reload();
-  await page.getByRole('button', { name: new RegExp(`Continue ${before.name}`) }).click();
+  await page.getByRole('button', { name: /^Enter / }).first().click();
+  await page.locator('.world-list button', { hasText: before.name }).first().click();
+  await page.getByRole('button', { name: new RegExp(`^Play ${before.name}`) }).click();
   await page.waitForTimeout(500);
   const report = page.getByRole('dialog', { name: 'While you were away' });
   const hasReport = await report.waitFor({ timeout: 60_000 }).then(() => true, () => false);

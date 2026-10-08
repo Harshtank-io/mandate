@@ -52,8 +52,6 @@ interface HudProps {
   /** Set while visiting another player's town: everything is read-only and nothing is saved. */
   visit?: VisitInfo | null;
   onLeaveVisit?(): void;
-  /** Leaves the player's own town for the world map (only when the game has a server). */
-  onWorld?(): void;
 }
 
 /** Who runs the town being visited and how fresh the copy is. */
@@ -271,8 +269,7 @@ export function Hud(p: HudProps) {
                   if (m) void activeSync()?.upload();
                 });
               }}>Save</button>
-              {cloudConfigured && p.onWorld && <button class="ghost" onClick={p.onWorld}>World map</button>}
-              <button class="ghost" onClick={p.onMenu}>Menu</button>
+              <button class="ghost" onClick={p.onMenu}>World map</button>
             </>
           )}
         </div>

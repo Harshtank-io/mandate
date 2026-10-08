@@ -895,7 +895,7 @@ export function Saves({ ctx }: { ctx: Ctx }) {
           <button disabled={busy} onClick={() => run(() => game.save('Autosave'), 'Saved.')}>Save now</button>
           <button disabled={busy} onClick={() => ctx.exportWorld()}>Export file</button>
           <button disabled={busy} onClick={() => ctx.importWorld()}>Import file</button>
-          <button class="ghost" onClick={() => ctx.menu()}>Main menu</button>
+          <button class="ghost" onClick={() => ctx.menu()}>World map</button>
         </div>
       </section>
       <CloudSection worldId={meta.id} onSaveNow={() => void game.save('Autosave').then((m) => { if (m) void activeSync()?.upload(); })} />

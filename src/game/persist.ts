@@ -20,6 +20,8 @@ export interface SaveMeta {
   population: number;
   size: number; // bytes stored
   enc: 'gzip' | 'json';
+  condition?: string; // how the town started (missing in older saves)
+  plot?: number; // plot chosen on the world map
 }
 
 const DB_NAME = 'mandate';
@@ -124,6 +126,7 @@ export async function putSave(state: WorldState, kind: SaveKind, label: string, 
   const meta: SaveMeta = {
     key: k, worldId: state.meta.id, kind, label, name: state.meta.name, preset: state.meta.preset, savedAt: Date.now(),
     minute: state.minute, date: formatDate(state.meta.startYear, state.minute, false), population: state.citizens.length, size: blob.size, enc,
+    condition: state.meta.condition, ...(state.meta.plot !== undefined ? { plot: state.meta.plot } : {}),
   };
   await tx(['meta', 'data'], 'readwrite', (t) => {
     t.objectStore('data').put({ key: k, blob });

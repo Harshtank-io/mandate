@@ -1,15 +1,28 @@
-// The shared world map. Every town in the cloud has a plot in its region, and each region is a continent of hexagonal
-// plots that grows outwards as towns are founded. Players browse and search the map here and visit other mayors' towns.
+// Meridia, the world map: the hub of the game. Every region is a continent of hexagonal plots; every town is a plot.
+// Players see their own towns (on this device and in their account) and everybody else's, visit other mayors' towns,
+// and found new towns by picking a free plot on a continent. The map works offline too: then it shows the towns on
+// this device only.
 
 import type { ComponentChildren } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { deleteWorld, listSaves, storageAvailable, type SaveMeta } from '../game/persist';
 import { playAsGuest, startCloud } from '../net/auth';
-import { cloudConfigured, within } from '../net/client';
+import { cloudConfigured, errText, within } from '../net/client';
+import { deleteCloudTown } from '../net/saves';
 import { useCloud } from '../net/store';
+import { forgetLocal } from '../net/sync';
 import { cachedWorld, fetchWorld, worldError, type WorldTown } from '../net/world';
+import { BUILD_MODES } from '../sim/commands';
 import { hash01 } from '../sim/rng';
-import { PRESETS, START_OPTIONS } from '../sim/presets';
+import { OFFLINE_CAPS, PACES, PRESETS, START_OPTIONS, START_YEARS, getPreset } from '../sim/presets';
+import { CROPS } from '../sim/tables';
+import type { BuildMode, CropId } from '../sim/types';
+import type { NewWorldOptions } from '../sim/worldgen';
+import { AccountPanel } from './account';
 import { mayorTitle, num, pct, realSpan } from './util';
+
+/** The name of the shared world every town belongs to. */
+export const WORLD_NAME = 'Meridia';
 
 // ------------------------------------------------------------------------------------------------ hex geometry
 
@@ -41,6 +54,7 @@ export function hexAt(n: number): [number, number] {
 }
 
 const toPx = (q: number, r: number): [number, number] => [COL * (q + r / 2), ROW * r];
+/** Plots in rings 0..k. */
 const cells = (rings: number) => 1 + 3 * rings * (rings + 1);
 
 function hexPath(x: number, y: number, s: number): string {
@@ -54,21 +68,34 @@ function hexPath(x: number, y: number, s: number): string {
 
 // ------------------------------------------------------------------------------------------------ layout
 
-interface RegionLook { at: [number, number]; land: string; shore: string }
+interface RegionLook { at: [number, number]; land: string; shore: string; trees: number; hills: number }
 
-/** Where each region's continent lies, roughly as on a real map, and the colour of its land. */
+/** Where each region's continent lies, roughly as on a real map, the colour of its land and its scenery. */
 const LOOKS: Record<string, RegionLook> = {
-  fictional: { at: [-1.55, -0.85], land: '#6f8f5a', shore: '#b3bf92' },
-  'in-punjab': { at: [0.45, -1.05], land: '#9c9655', shore: '#cfc58f' },
-  'in-deccan': { at: [0.65, 0.35], land: '#a7845a', shore: '#d2b48d' },
-  'vn-mekong': { at: [1.9, -0.15], land: '#4f8a5c', shore: '#9cc196' },
-  'ke-rift': { at: [-0.95, 0.95], land: '#9a8957', shore: '#cbbb8c' },
+  fictional: { at: [-1.6, -1.1], land: '#6f8f5a', shore: '#b3bf92', trees: 0.3, hills: 0.12 },
+  'ng-savanna': { at: [-1.9, 0.3], land: '#a99a5a', shore: '#d4c58f', trees: 0.12, hills: 0.03 },
+  'et-highlands': { at: [-0.6, 0.35], land: '#7f8c56', shore: '#bcc08c', trees: 0.08, hills: 0.25 },
+  'ke-rift': { at: [-0.9, 1.3], land: '#9a8957', shore: '#cbbb8c', trees: 0.1, hills: 0.16 },
+  'pk-indus': { at: [0, -0.6], land: '#b49a6a', shore: '#dcc79a', trees: 0.04, hills: 0.05 },
+  'in-punjab': { at: [0.75, -1.25], land: '#9c9655', shore: '#cfc58f', trees: 0.08, hills: 0.02 },
+  'in-deccan': { at: [0.7, 0.35], land: '#a7845a', shore: '#d2b48d', trees: 0.12, hills: 0.14 },
+  'bd-delta': { at: [1.6, -0.5], land: '#5f9663', shore: '#a8c9a0', trees: 0.26, hills: 0 },
+  'vn-mekong': { at: [2.4, 0.35], land: '#4f8a5c', shore: '#9cc196', trees: 0.24, hills: 0.02 },
+  'id-java': { at: [1.9, 1.35], land: '#4c8a55', shore: '#97c08e', trees: 0.3, hills: 0.16 },
 };
-const OTHER_LAND = { land: '#7b8a7c', shore: '#adb8a9' };
+const OTHER_LAND = { land: '#7b8a7c', shore: '#adb8a9', trees: 0.1, hills: 0.05 };
+/** Every continent has at least this many rings of land, so there is always room to found a town. */
+const MIN_RINGS = 6;
 
-interface Continent { region: string; label: string; country: string; land: string; shore: string; x: number; y: number; top: number; landPath: string; shorePath: string; count: number }
-interface Placed { town: WorldTown; x: number; y: number }
-interface Layout { continents: Continent[]; placed: Placed[]; x0: number; y0: number; x1: number; y1: number }
+/** A town on the map: from the world server, or one kept only on this device. */
+export interface MapTown extends WorldTown { local: boolean }
+
+/** A free plot a new town can be founded on. */
+export interface Spot { region: string; plot: number; x: number; y: number }
+
+interface Continent { region: string; label: string; country: string; land: string; shore: string; x: number; y: number; top: number; landPath: string; shorePath: string; treePath: string; hillPath: string; count: number }
+interface Placed { town: MapTown; x: number; y: number }
+interface Layout { continents: Continent[]; placed: Placed[]; free: Spot[]; x0: number; y0: number; x1: number; y1: number }
 
 function regionInfo(id: string): { label: string; country: string } {
   const p = PRESETS.find((x) => x.id === id);
@@ -76,9 +103,10 @@ function regionInfo(id: string): { label: string; country: string } {
 }
 
 const strHash = (s: string) => { let h = 7; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return h; };
+const regionOf = (preset: string) => (PRESETS.some((p) => p.id === preset) ? preset : 'other');
 
-function layoutWorld(towns: WorldTown[]): Layout {
-  const byRegion = new Map<string, WorldTown[]>();
+function layoutWorld(towns: MapTown[]): Layout {
+  const byRegion = new Map<string, MapTown[]>();
   for (const id of Object.keys(LOOKS)) byRegion.set(id, []);
   for (const t of towns) {
     const list = byRegion.get(t.region);
@@ -86,35 +114,51 @@ function layoutWorld(towns: WorldTown[]): Layout {
   }
   const regions = [...byRegion.keys()];
   let extra = 0;
-  const looks = regions.map((r) => LOOKS[r] ?? { at: [-1.6 + 1.3 * extra++, 2.15] as [number, number], ...OTHER_LAND });
+  const looks = regions.map((r) => LOOKS[r] ?? { at: [-1.6 + 1.3 * extra++, 2.3] as [number, number], ...OTHER_LAND });
   // land reaches two rings past the outermost town, so every continent has a shore and room to grow
-  const rings = regions.map((r) => Math.max(2, ringOf(Math.max(0, ...byRegion.get(r)!.map((t) => t.plot))) + 2));
+  const rings = regions.map((r) => Math.max(MIN_RINGS, ringOf(Math.max(0, ...byRegion.get(r)!.map((t) => t.plot))) + 2));
   const radius = (k: number) => (k + 1.6) * COL;
   // spread the continents far enough apart that none can touch another, however big they grow
   let s = 9.5 * COL;
   for (let i = 0; i < regions.length; i++) {
     for (let j = i + 1; j < regions.length; j++) {
       const d = Math.hypot(looks[i].at[0] - looks[j].at[0], looks[i].at[1] - looks[j].at[1]);
-      s = Math.max(s, (radius(rings[i]) + radius(rings[j]) + COL * 1.5) / Math.max(0.3, d));
+      // with room between them for the region names
+      s = Math.max(s, (radius(rings[i]) + radius(rings[j]) + COL * 3.5) / Math.max(0.3, d));
     }
   }
-  const continents: Continent[] = [], placed: Placed[] = [];
+  const continents: Continent[] = [], placed: Placed[] = [], free: Spot[] = [];
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   regions.forEach((region, i) => {
     const k = rings[i], L = looks[i];
     const cx = L.at[0] * s, cy = L.at[1] * s;
     const salt = strHash(region);
-    let landPath = '', shorePath = '';
+    const list = byRegion.get(region)!;
+    const taken = new Set(list.map((t) => t.plot));
+    let landPath = '', shorePath = '', treePath = '', hillPath = '';
     for (let n = 0; n < cells(k + 1); n++) {
       const ring = ringOf(n);
       // the outermost ring is a ragged coastline: only some of its hexes are land
       if (ring > k && hash01(n, salt) > 0.32) continue;
       const [q, r] = hexAt(n);
       const [px, py] = toPx(q, r);
-      const d = hexPath(cx + px, cy + py, HS * 1.02);
+      const x = cx + px, y = cy + py;
+      const d = hexPath(x, y, HS * 1.02);
       if (ring < k) landPath += d; else shorePath += d;
+      if (ring >= k || taken.has(n)) continue;
+      // towns may be founded anywhere inland; scenery decorates the plots nobody has taken
+      free.push({ region, plot: n, x, y });
+      const h = hash01(n, salt + 5);
+      if (h < L.hills) {
+        const w = HS * 0.55, ht = HS * 0.62;
+        hillPath += `M${(x - w).toFixed(1)} ${(y + ht * 0.45).toFixed(1)}L${x.toFixed(1)} ${(y - ht * 0.55).toFixed(1)}L${(x + w).toFixed(1)} ${(y + ht * 0.45).toFixed(1)}Z`;
+      } else if (h < L.hills + L.trees) {
+        for (const [dx, dy, rr] of [[-3, 1.5, 2.4], [2.6, 2.2, 2.1], [0, -2.4, 2.6]]) {
+          const tx = x + dx, ty = y + dy;
+          treePath += `M${(tx - rr).toFixed(1)} ${ty.toFixed(1)}a${rr} ${rr} 0 1 0 ${(rr * 2).toFixed(1)} 0a${rr} ${rr} 0 1 0 ${(-rr * 2).toFixed(1)} 0`;
+        }
+      }
     }
-    const list = byRegion.get(region)!;
     for (const t of list) {
       const [q, r] = hexAt(t.plot);
       const [px, py] = toPx(q, r);
@@ -122,11 +166,54 @@ function layoutWorld(towns: WorldTown[]): Layout {
     }
     const R = radius(k + 1);
     const info = regionInfo(region);
-    continents.push({ region, ...info, land: L.land, shore: L.shore, x: cx, y: cy, top: cy - R - 8, landPath, shorePath, count: list.length });
+    continents.push({ region, ...info, land: L.land, shore: L.shore, x: cx, y: cy, top: cy - R - 8, landPath, shorePath, treePath, hillPath, count: list.length });
     x0 = Math.min(x0, cx - R); x1 = Math.max(x1, cx + R);
     y0 = Math.min(y0, cy - R - 34); y1 = Math.max(y1, cy + R);
   });
-  return { continents, placed, x0, y0, x1, y1 };
+  return { continents, placed, free, x0, y0, x1, y1 };
+}
+
+/**
+ * The player's towns that the world server does not list (kept on this device only, or the server is out of reach),
+ * placed on the plot their founder chose, or on the next free plot of their region.
+ */
+function mergeTowns(server: WorldTown[], locals: SaveMeta[], mayor: string): MapTown[] {
+  const out: MapTown[] = server.map((t) => ({ ...t, local: false }));
+  const known = new Set(server.map((t) => t.worldId).filter(Boolean));
+  const taken = new Map<string, Set<number>>();
+  const used = (r: string) => { let s = taken.get(r); if (!s) { s = new Set(); taken.set(r, s); } return s; };
+  for (const t of out) used(t.region).add(t.plot);
+  const later: [SaveMeta, string][] = [];
+  const add = (s: SaveMeta, region: string, plot: number) => {
+    used(region).add(plot);
+    out.push({
+      id: `local:${s.worldId}`, name: s.name || 'Unnamed town', mayor, region, plot, preset: s.preset, condition: s.condition ?? '',
+      population: s.population, date: s.date, approval: null, unemployment: null, year: null, officeYear: null,
+      savedAt: new Date(s.savedAt).toISOString(), playing: false, mine: true, onMap: false, worldId: s.worldId, local: true,
+    });
+  };
+  for (const s of [...locals].sort((a, b) => a.savedAt - b.savedAt)) {
+    if (known.has(s.worldId)) continue;
+    const region = regionOf(s.preset);
+    if (s.plot !== undefined && !used(region).has(s.plot)) add(s, region, s.plot);
+    else later.push([s, region]);
+  }
+  for (const [s, region] of later) {
+    let p = 0;
+    while (used(region).has(p)) p++;
+    add(s, region, p);
+  }
+  return out;
+}
+
+/** One entry per town on this device: its autosave, or else its latest save. */
+function localTowns(saves: SaveMeta[]): SaveMeta[] {
+  const worlds = new Map<string, SaveMeta>();
+  for (const s of saves) {
+    const cur = worlds.get(s.worldId);
+    if (!cur || (s.kind === 'auto' && cur.kind !== 'auto') || (s.kind === cur.kind && s.savedAt > cur.savedAt)) worlds.set(s.worldId, s);
+  }
+  return [...worlds.values()];
 }
 
 // ------------------------------------------------------------------------------------------------ looks of a town
@@ -149,7 +236,7 @@ function popColor(pop: number): string {
 
 /** A little skyline that grows with the town: [offset, width, height] of each building. */
 function skyline(pop: number): [number, number, number][] {
-  if (pop <= 0) return [];
+  if (pop <= 0) return [[0, 1.2, 4.5]]; // a surveyor's flag on empty land
   if (pop < 800) return [[0, 3, 3]];
   if (pop < 3000) return [[-2, 2.8, 3.2], [1.8, 2.8, 4.6]];
   if (pop < 8000) return [[-3.4, 2.6, 3.4], [0, 2.8, 5.8], [3.4, 2.6, 4.2]];
@@ -162,12 +249,12 @@ const since = (iso: string | null) => {
   return ms < 60_000 ? 'just now' : `${realSpan(ms)} ago`;
 };
 
-const townLabel = (t: WorldTown) => `${t.name}, ${mayorTitle(t.mayor)}, ${num(t.population)} residents${t.playing ? ', being played now' : ''}${t.mine ? ', your town' : ''}`;
+const townLabel = (t: MapTown) => `${t.name}, ${mayorTitle(t.mayor)}, ${num(t.population)} residents${t.playing ? ', being played now' : ''}${t.mine ? ', your town' : ''}`;
 
 function TownHex({ p, selected, onSelect }: { p: Placed; selected: boolean; onSelect(id: string): void }) {
   const t = p.town;
   return (
-    <g class={`town-hex${t.mine ? ' mine' : ''}${t.onMap ? '' : ' off'}${selected ? ' sel' : ''}`} role="button" tabIndex={0} aria-label={townLabel(t)} aria-pressed={selected}
+    <g class={`town-hex${t.mine ? ' mine' : ''}${t.onMap || t.local ? '' : ' off'}${selected ? ' sel' : ''}`} role="button" tabIndex={0} aria-label={townLabel(t)} aria-pressed={selected}
       onClick={() => onSelect(t.id)} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(t.id); } }}>
       <title>{`${t.name} · ${mayorTitle(t.mayor)} · ${num(t.population)} residents`}</title>
       <path d={hexPath(p.x, p.y, HS * 0.9)} fill={popColor(t.population)} />
@@ -184,13 +271,19 @@ const shortName = (s: string) => (s.length > 14 ? `${s.slice(0, 13).trimEnd()}�
 
 // Labels keep the same size on screen at every zoom (see --u in the CSS), so all town names are shown only once
 // neighbouring plots are far enough apart on screen for a name to fit between them.
-const K_MIN = 0.25, K_MAX = 8, NAMES_AT = 3.6;
+const K_MIN = 0.2, K_MAX = 8, NAMES_AT = 3.6;
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
 /** A request to centre the map on a point, optionally zoomed in to at least `k`. `seq` makes repeat requests count. */
 export interface FocusRequest { x: number; y: number; k?: number; seq: number }
 
-function WorldMap({ layout, selected, focus, onSelect }: { layout: Layout; selected: string | null; focus: FocusRequest | null; onSelect(id: string): void }) {
+interface MapProps {
+  layout: Layout; selected: string | null; focus: FocusRequest | null; onSelect(id: string): void;
+  /** Founding a town: free plots can be picked. */
+  founding: boolean; spot: Spot | null; onPick(s: Spot): void;
+}
+
+function WorldMap({ layout, selected, focus, onSelect, founding, spot, onPick }: MapProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const view = useRef({ cx: 0, cy: 0, k: 1 });
   const size = useRef({ w: 800, h: 600 });
@@ -257,7 +350,7 @@ function WorldMap({ layout, selected, focus, onSelect }: { layout: Layout; selec
     apply();
   }, [focus?.seq]);
 
-  // a drag only takes over the pointer once it has moved, so a plain click still reaches the town under it
+  // a drag only takes over the pointer once it has moved, so a plain click still reaches the plot under it
   const onDown = (e: PointerEvent) => { if (e.button === 0) drag.current = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: false }; };
   const onMove = (e: PointerEvent) => {
     const d = drag.current;
@@ -292,21 +385,47 @@ function WorldMap({ layout, selected, focus, onSelect }: { layout: Layout; selec
 
   return (
     <div class="world-map">
-      <svg ref={svgRef} class="world-svg" tabIndex={0} role="group" aria-label="World map. Drag or use the arrow keys to move, scroll or press plus and minus to zoom."
+      <svg ref={svgRef} class={`world-svg${founding ? ' founding' : ''}`} tabIndex={0} role="group"
+        aria-label={`Map of ${WORLD_NAME}. Drag or use the arrow keys to move, scroll or press plus and minus to zoom.`}
         onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp} onKeyDown={onKey}>
+        <defs>
+          <pattern id="sea-waves" width="46" height="26" patternUnits="userSpaceOnUse">
+            <path d="M2 14 q5.5 -5 11 0 t11 0" class="wave" />
+            <path d="M25 3 q5.5 -5 11 0" class="wave" />
+          </pattern>
+        </defs>
+        <rect class="sea" x={layout.x0 - 4000} y={layout.y0 - 4000} width={layout.x1 - layout.x0 + 8000} height={layout.y1 - layout.y0 + 8000} fill="url(#sea-waves)" />
         {layout.continents.map((c) => (
           <g key={c.region} class="continent">
             <path d={c.shorePath} fill={c.shore} />
             <path d={c.landPath} fill={c.land} />
+            <path class="hills" d={c.hillPath} />
+            <path class="trees" d={c.treePath} />
           </g>
         ))}
+        {founding && (
+          <g class="free-plots">
+            {layout.free.map((f) => (
+              <path key={`${f.region}:${f.plot}`} class={`free-hex${spot && spot.region === f.region && spot.plot === f.plot ? ' on' : ''}`} d={hexPath(f.x, f.y, HS * 0.86)}
+                role="button" tabIndex={-1} aria-label={`Free plot in ${regionInfo(f.region).label}`} onClick={() => onPick(f)} />
+            ))}
+          </g>
+        )}
         {layout.placed.map((p) => <TownHex key={p.town.id} p={p} selected={p.town.id === selected} onSelect={onSelect} />)}
+        {spot && (
+          <g class="spot" aria-hidden="true">
+            <circle class="spot-ring" cx={spot.x} cy={spot.y} r={HS * 0.9} />
+            <path class="spot-hex" d={hexPath(spot.x, spot.y, HS * 0.9)} />
+            <line x1={spot.x - 1} y1={spot.y + 4} x2={spot.x - 1} y2={spot.y - 7} class="spot-pole" />
+            <path d={`M${spot.x - 1} ${spot.y - 7}L${spot.x + 6} ${spot.y - 4.8}L${spot.x - 1} ${spot.y - 2.6}Z`} class="spot-flag" />
+          </g>
+        )}
         {/* labels go on top of every plot so neighbouring hexes never cover them */}
         <g aria-hidden="true">
           {layout.continents.map((c) => (
             <g key={c.region}>
               <text class="continent-name" x={c.x} y={c.top} dy="-1.25em">{c.label}</text>
-              <text class="continent-sub" x={c.x} y={c.top}>{[c.country, c.count ? `${c.count} town${c.count > 1 ? 's' : ''}` : 'no towns yet'].filter(Boolean).join(' · ')}</text>
+              <text class="continent-sub" x={c.x} y={c.top}>{[c.country, c.count ? `${c.count} town${c.count > 1 ? 's' : ''}` : 'unsettled'].filter(Boolean).join(' · ')}</text>
             </g>
           ))}
           {layout.placed.map((p) => (
@@ -333,16 +452,20 @@ function WorldMap({ layout, selected, focus, onSelect }: { layout: Layout; selec
 export interface WorldScreenProps {
   /** Town to select when the map opens (e.g. the one just visited). */
   focus?: string;
-  onBack(): void;
+  /** Back to the landing page. */
+  onHome(): void;
   onVisit(t: WorldTown): void;
   onOpenMine(worldId: string): void;
+  onFound(o: NewWorldOptions): void;
+  onImport(): void;
 }
 
 type Sort = 'people' | 'playing' | 'recent';
 
-export function WorldScreen({ focus, onBack, onVisit, onOpenMine }: WorldScreenProps) {
+export function WorldScreen({ focus, onHome, onVisit, onOpenMine, onFound, onImport }: WorldScreenProps) {
   const c = useCloud();
-  const [towns, setTowns] = useState<WorldTown[] | null>(() => cachedWorld()?.towns ?? null);
+  const [server, setServer] = useState<WorldTown[] | null>(() => cachedWorld()?.towns ?? null);
+  const [saves, setSaves] = useState<SaveMeta[]>([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [sel, setSel] = useState<string | null>(focus ?? null);
@@ -350,13 +473,18 @@ export function WorldScreen({ focus, onBack, onVisit, onOpenMine }: WorldScreenP
   const [region, setRegion] = useState('all');
   const [sort, setSort] = useState<Sort>('people');
   const [focusReq, setFocusReq] = useState<FocusRequest | null>(null);
+  const [founding, setFounding] = useState(false);
+  const [spot, setSpot] = useState<Spot | null>(null);
+  const [account, setAccount] = useState(false);
   const online = c.phase === 'online' && !!c.account;
 
+  const loadLocal = () => (storageAvailable() ? listSaves().then((s) => setSaves(localTowns(s))).catch(() => setSaves([])) : Promise.resolve());
   const load = async () => {
     if (!online) return;
     setLoading(true);
-    try { setTowns(await within(fetchWorld(), 15_000, 'The world map')); setError(''); } catch (e) { setError(worldError(e)); } finally { setLoading(false); }
+    try { setServer(await within(fetchWorld(), 15_000, 'The world map')); setError(''); } catch (e) { setError(worldError(e)); } finally { setLoading(false); }
   };
+  useEffect(() => { void loadLocal(); }, []);
   useEffect(() => { void load(); }, [online]);
   useEffect(() => {
     if (!online) return;
@@ -364,21 +492,25 @@ export function WorldScreen({ focus, onBack, onVisit, onOpenMine }: WorldScreenP
     return () => clearInterval(id);
   }, [online]);
 
-  const layout = useMemo(() => layoutWorld(towns ?? []), [towns]);
+  const mayor = c.account?.name || 'You';
+  const towns = useMemo(() => mergeTowns(online ? server ?? [] : [], saves, mayor), [server, saves, online, mayor]);
+  const layout = useMemo(() => layoutWorld(towns), [towns]);
   const placedById = useMemo(() => new Map(layout.placed.map((p) => [p.town.id, p])), [layout]);
   const selected = sel ? placedById.get(sel)?.town ?? null : null;
 
-  // coming back from a visit: show the town just visited
+  // coming back from a town or a visit: show it
   const focused = useRef(false);
   useEffect(() => {
     if (focused.current || !focus) return;
-    const p = placedById.get(focus);
+    const p = placedById.get(focus) ?? layout.placed.find((x) => x.town.worldId === focus);
     if (!p) return;
     focused.current = true;
+    setSel(p.town.id);
     setFocusReq({ x: p.x, y: p.y, k: 2.2, seq: Date.now() });
   }, [placedById]);
 
   const select = (id: string, centre = false) => {
+    if (founding) return;
     setSel(id);
     const p = placedById.get(id);
     if (centre && p) setFocusReq({ x: p.x, y: p.y, k: 2.2, seq: Date.now() });
@@ -388,82 +520,119 @@ export function WorldScreen({ focus, onBack, onVisit, onOpenMine }: WorldScreenP
     const ct = layout.continents.find((x) => x.region === id);
     if (ct) setFocusReq({ x: ct.x, y: ct.y, k: 1.2, seq: Date.now() });
   };
+  const startFounding = () => { setSel(null); setSpot(null); setFounding(true); };
+  const stopFounding = () => { setFounding(false); setSpot(null); };
+  const pick = (s: Spot) => { setSpot(s); setFocusReq({ x: s.x, y: s.y, k: 1.6, seq: Date.now() }); };
 
+  const remove = async (t: MapTown) => {
+    const id = t.worldId;
+    if (!id) return;
+    setSel(null);
+    try {
+      await deleteWorld(id);
+      forgetLocal(id);
+      if (online && c.towns.some((x) => x.worldId === id && x.path)) await deleteCloudTown(id);
+    } catch (e) { setError(`Could not delete ${t.name} everywhere: ${errText(e)}`); }
+    await loadLocal();
+    await load();
+  };
+
+  const mine = towns.filter((t) => t.mine).sort((a, b) => Date.parse(b.savedAt ?? '0') - Date.parse(a.savedAt ?? '0'));
+  const others = towns.filter((t) => !t.mine);
   const q = query.trim().toLowerCase();
-  const list = (towns ?? [])
+  const list = others
     .filter((t) => (region === 'all' || t.region === region) && (!q || t.name.toLowerCase().includes(q) || t.mayor.toLowerCase().includes(q)))
-    .sort((a, b) => Number(b.mine) - Number(a.mine)
-      || (sort === 'playing' ? Number(b.playing) - Number(a.playing) : 0)
+    .sort((a, b) => (sort === 'playing' ? Number(b.playing) - Number(a.playing) : 0)
       || (sort === 'recent' ? Date.parse(b.savedAt ?? '0') - Date.parse(a.savedAt ?? '0') : 0)
       || b.population - a.population);
   const shown = list.slice(0, 200);
-  const playing = (towns ?? []).filter((t) => t.playing).length;
-  const mayors = new Set((towns ?? []).map((t) => t.mayor)).size;
+  const playing = towns.filter((t) => t.playing).length;
+  const mayors = new Set(others.map((t) => t.mayor)).size + (mine.length ? 1 : 0);
   const unplaced = c.towns.filter((t) => t.path && t.plot === null).length;
 
   let status: ComponentChildren = null;
-  if (!cloudConfigured) status = <p class="muted">This copy of the game is not connected to a server, so there is no shared world to show.</p>;
-  else if (c.phase === 'connecting' || c.phase === 'off') status = <p class="muted" role="status">Connecting to your account…</p>;
-  else if (c.phase === 'offline') status = <><p class="muted small" role="status">{c.notice || 'Your account could not be reached.'}</p><div class="buttons"><button class="small" onClick={() => void startCloud()}>Try again</button></div></>;
-  else if (c.phase === 'signedOut') status = <><p class="muted">The world map needs an account. A guest account is enough.</p><div class="buttons"><button class="small primary" disabled={c.busy} onClick={() => void playAsGuest()}>Play as a guest</button></div></>;
+  if (!cloudConfigured) status = <p class="muted small">This copy of the game has no server, so the map shows the towns on this device only.</p>;
+  else if (c.phase === 'connecting' || c.phase === 'off') status = <p class="muted small" role="status">Connecting to {WORLD_NAME}…</p>;
+  else if (c.phase === 'offline') status = <><p class="muted small" role="status">{c.notice || 'The world server could not be reached.'} Your own towns still work.</p><div class="buttons"><button class="small" onClick={() => void startCloud()}>Try again</button></div></>;
+  else if (c.phase === 'signedOut') status = <><p class="muted small">Signed out: you see only the towns on this device. Join as a guest to see every mayor’s town.</p><div class="buttons"><button class="small primary" disabled={c.busy} onClick={() => void playAsGuest()}>Join as a guest</button></div></>;
   else if (error) status = <><p class="bad small" role="alert">{error}</p><div class="buttons"><button class="small" onClick={() => void load()}>Try again</button></div></>;
-  else if (!towns) status = <p class="muted" role="status">Loading the world…</p>;
+  else if (!server) status = <p class="muted small" role="status">Loading the world…</p>;
 
   return (
-    <main class="world" aria-label="The world">
-      <WorldMap layout={layout} selected={sel} focus={focusReq} onSelect={(id) => select(id)} />
-      <div class="world-top"><button onClick={onBack}>Back to the menu</button></div>
-      <aside class="world-side panel" aria-label="Towns of the world">
+    <main class="world" aria-label={WORLD_NAME}>
+      <WorldMap layout={layout} selected={sel} focus={focusReq} onSelect={(id) => select(id)} founding={founding} spot={spot} onPick={pick} />
+      <div class="world-top">
+        <button class="brand" onClick={onHome} aria-label="Mandate home page"><span class="brand-mark" aria-hidden="true">⬢</span> Mandate</button>
+      </div>
+      {founding && (
+        <div class="found-banner panel" role="status">
+          <b>{spot ? `${regionInfo(spot.region).label}, ${regionInfo(spot.region).country}` : 'Choose where your town will stand'}</b>
+          <span class="muted small">{spot ? 'Pick another plot to move, or found your town in the panel.' : 'Click any free plot on a continent. Each region has its own climate, crops, currency and people.'}</span>
+          <button class="small ghost" onClick={stopFounding}>Cancel</button>
+        </div>
+      )}
+      <aside class="world-side panel" aria-label={founding ? 'Found a town' : `Towns of ${WORLD_NAME}`}>
         <div class="world-side-body">
-          <header class="world-head">
-            <div>
-              <h1>The world</h1>
-              <p class="muted small">{towns ? `${num(towns.length)} town${towns.length === 1 ? '' : 's'} · ${num(mayors)} mayor${mayors === 1 ? '' : 's'} · ${num(playing)} being played now` : 'Every public town, region by region'}</p>
-            </div>
-            {online && <button class="ghost small" disabled={loading} onClick={() => void load()}>{loading ? 'Refreshing…' : 'Refresh'}</button>}
-          </header>
-          {status}
-          {selected ? (
-            <TownCard t={selected} onVisit={() => onVisit(selected)} onOpenMine={() => selected.worldId && onOpenMine(selected.worldId)} onClose={() => setSel(null)} />
-          ) : towns && !status && (
-            <p class="muted small">{towns.length
-              ? 'Each plot is a town run by a player. Pick one to see who runs it, then visit: you can look around, inspect anything and watch time pass there.'
-              : 'No towns on the map yet. Towns saved to an account appear here, so yours could be the first.'}</p>
-          )}
-          {unplaced > 0 && online && <p class="muted small">{unplaced} of your town{unplaced > 1 ? 's' : ''} will appear on the map after {unplaced > 1 ? 'their' : 'its'} next cloud save.</p>}
-          {towns && towns.length > 0 && (
+          {founding ? (
+            spot ? <FoundCard spot={spot} towns={towns} onFound={onFound} onBack={() => setSpot(null)} />
+              : <RegionPicker free={layout.free} onPick={pick} onCancel={stopFounding} />
+          ) : (
             <>
-              <div class="inline">
-                <label class="sr-only" for="world-search">Find a town or mayor</label>
-                <input id="world-search" type="search" placeholder="Find a town or mayor" value={query} onInput={(e) => setQuery((e.currentTarget as HTMLInputElement).value)} />
-                <label class="sr-only" for="world-sort">Sort towns</label>
-                <select id="world-sort" value={sort} onChange={(e) => setSort((e.currentTarget as HTMLSelectElement).value as Sort)}>
-                  <option value="people">Most people</option>
-                  <option value="playing">Being played</option>
-                  <option value="recent">Recently saved</option>
-                </select>
-              </div>
-              <div class="chips" role="group" aria-label="Regions">
-                <button class={`chip ${region === 'all' ? 'on' : ''}`} aria-pressed={region === 'all'} onClick={() => setRegion('all')}>All</button>
-                {layout.continents.filter((ct) => ct.count > 0).map((ct) => (
-                  <button key={ct.region} class={`chip ${region === ct.region ? 'on' : ''}`} aria-pressed={region === ct.region} onClick={() => pickRegion(ct.region)}>{ct.label} ({ct.count})</button>
-                ))}
-              </div>
-              <ul class="world-list">
-                {shown.map((t) => (
-                  <li key={t.id}>
-                    <button class={t.id === sel ? 'on' : ''} aria-pressed={t.id === sel} onClick={() => select(t.id, true)}>
-                      <span class="world-list-name">
-                        {t.playing && <><b class="dot" aria-hidden="true" /><span class="sr-only">Being played now:</span></>}
-                        {t.name}{t.mine && <span class="chip">yours</span>}
-                      </span>
-                      <span class="muted small">{t.mayor} · {num(t.population)} residents · {regionInfo(t.region).label}</span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-              {list.length > shown.length && <p class="muted small">Showing {shown.length} of {num(list.length)}. Search to narrow it down.</p>}
-              {list.length === 0 && <p class="muted small">No town matches.</p>}
+              <header class="world-head">
+                <div>
+                  <h1>{WORLD_NAME}</h1>
+                  <p class="muted small">{num(towns.length)} town{towns.length === 1 ? '' : 's'} · {num(mayors)} mayor{mayors === 1 ? '' : 's'}{online ? ` · ${num(playing)} being played now` : ''}</p>
+                </div>
+                {online && <button class="ghost small" disabled={loading} onClick={() => void load()}>{loading ? 'Refreshing…' : 'Refresh'}</button>}
+              </header>
+              <button class="primary found-btn" onClick={startFounding}><span aria-hidden="true">＋</span> Found a new town</button>
+              {status}
+              {selected && <TownCard t={selected} cloud={cloudConfigured} onVisit={() => onVisit(selected)} onPlay={() => selected.worldId && onOpenMine(selected.worldId)}
+                onDelete={() => void remove(selected)} onClose={() => setSel(null)} />}
+              <section class="world-section">
+                <h2>Your towns</h2>
+                {mine.length ? (
+                  <ul class="world-list">
+                    {mine.map((t) => <TownRow key={t.id} t={t} on={t.id === sel} onClick={() => select(t.id, true)} />)}
+                  </ul>
+                ) : <p class="muted small">You have no town yet. Found one: pick a plot on any continent and name it.</p>}
+                {unplaced > 0 && online && <p class="muted small">{unplaced} of your town{unplaced > 1 ? 's' : ''} move{unplaced > 1 ? '' : 's'} onto the shared map after the next cloud save.</p>}
+              </section>
+              {others.length > 0 && (
+                <section class="world-section">
+                  <h2>Other mayors</h2>
+                  <div class="inline">
+                    <label class="sr-only" for="world-search">Find a town or mayor</label>
+                    <input id="world-search" type="search" placeholder="Find a town or mayor" value={query} onInput={(e) => setQuery((e.currentTarget as HTMLInputElement).value)} />
+                    <label class="sr-only" for="world-sort">Sort towns</label>
+                    <select id="world-sort" value={sort} onChange={(e) => setSort((e.currentTarget as HTMLSelectElement).value as Sort)}>
+                      <option value="people">Most people</option>
+                      <option value="playing">Being played</option>
+                      <option value="recent">Recently saved</option>
+                    </select>
+                  </div>
+                  <div class="chips" role="group" aria-label="Regions">
+                    <button class={`chip ${region === 'all' ? 'on' : ''}`} aria-pressed={region === 'all'} onClick={() => setRegion('all')}>All</button>
+                    {layout.continents.filter((ct) => others.some((t) => t.region === ct.region)).map((ct) => (
+                      <button key={ct.region} class={`chip ${region === ct.region ? 'on' : ''}`} aria-pressed={region === ct.region} onClick={() => pickRegion(ct.region)}>{ct.label}</button>
+                    ))}
+                  </div>
+                  <ul class="world-list">
+                    {shown.map((t) => <TownRow key={t.id} t={t} on={t.id === sel} onClick={() => select(t.id, true)} />)}
+                  </ul>
+                  {list.length > shown.length && <p class="muted small">Showing {shown.length} of {num(list.length)}. Search to narrow it down.</p>}
+                  {list.length === 0 && <p class="muted small">No town matches.</p>}
+                </section>
+              )}
+              <footer class="world-foot">
+                {cloudConfigured && (
+                  <button class="ghost small" aria-expanded={account} onClick={() => setAccount(!account)}>
+                    {c.account ? `${c.account.name || 'Mayor'}${c.account.guest ? ' (guest)' : ''}` : 'Account'} ▾
+                  </button>
+                )}
+                <button class="ghost small" onClick={onImport}>Import a town file</button>
+              </footer>
+              {account && <AccountPanel />}
             </>
           )}
         </div>
@@ -472,8 +641,24 @@ export function WorldScreen({ focus, onBack, onVisit, onOpenMine }: WorldScreenP
   );
 }
 
-function TownCard({ t, onVisit, onOpenMine, onClose }: { t: WorldTown; onVisit(): void; onOpenMine(): void; onClose(): void }) {
+function TownRow({ t, on, onClick }: { t: MapTown; on: boolean; onClick(): void }) {
+  return (
+    <li>
+      <button class={on ? 'on' : ''} aria-pressed={on} onClick={onClick}>
+        <span class="world-list-name">
+          {t.playing && <><b class="dot" aria-hidden="true" /><span class="sr-only">Being played now:</span></>}
+          {t.name}{t.local && <span class="chip">this device</span>}
+        </span>
+        <span class="muted small">{t.mine ? `${regionInfo(t.region).label} · ${num(t.population)} residents${t.date ? ` · ${t.date}` : ''}` : `${t.mayor} · ${num(t.population)} residents · ${regionInfo(t.region).label}`}</span>
+      </button>
+    </li>
+  );
+}
+
+function TownCard({ t, cloud, onVisit, onPlay, onDelete, onClose }: { t: MapTown; cloud: boolean; onVisit(): void; onPlay(): void; onDelete(): void; onClose(): void }) {
   const r = regionInfo(t.region);
+  const [confirm, setConfirm] = useState(false);
+  useEffect(() => setConfirm(false), [t.id]);
   return (
     <section class="town-card" aria-label={t.name}>
       <header>
@@ -484,7 +669,8 @@ function TownCard({ t, onVisit, onOpenMine, onClose }: { t: WorldTown; onVisit()
       <div class="chips">
         {t.playing && <span class="chip on">Being played now</span>}
         {t.mine && <span class="chip">Your town</span>}
-        {!t.onMap && <span class="chip">Off the map: only you see it</span>}
+        {t.local && <span class="chip">{cloud ? 'On this device; joins the shared map after a cloud save' : 'Saved on this device'}</span>}
+        {!t.local && !t.onMap && <span class="chip">Off the map: only you see it</span>}
       </div>
       <dl class="rows">
         <div><dt>Residents</dt><dd>{num(t.population)}</dd></div>
@@ -495,12 +681,142 @@ function TownCard({ t, onVisit, onOpenMine, onClose }: { t: WorldTown; onVisit()
         {t.condition && <div><dt>Started as</dt><dd>{START_OPTIONS.find((o) => o.id === t.condition)?.label ?? t.condition}</dd></div>}
         <div><dt>Last saved</dt><dd>{since(t.savedAt)}</dd></div>
       </dl>
-      <div class="buttons">
+      <div class="buttons wrap">
         {t.mine && t.worldId
-          ? <button class="primary" onClick={onOpenMine}>Play your town</button>
+          ? <button class="primary" onClick={onPlay}>Play {t.name}</button>
           : <button class="primary" onClick={onVisit}>Visit {t.name}</button>}
+        {t.mine && t.worldId && (confirm
+          ? <><button class="danger small" onClick={onDelete}>Delete for good</button><button class="ghost small" onClick={() => setConfirm(false)}>Keep</button></>
+          : <button class="ghost small" onClick={() => setConfirm(true)}>Delete</button>)}
       </div>
+      {confirm && <p class="muted small">This deletes the town and its saves on this device{cloud ? ' and in your account' : ''}. It cannot be undone.</p>}
       {!t.mine && <p class="muted small">A visit is read-only. You see the town as its mayor last saved it, with time running on your device. Nothing you do there changes it.</p>}
+    </section>
+  );
+}
+
+// ------------------------------------------------------------------------------------------------ founding a town
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** The skyline a starting point begins with, as drawn on the map: a surveyor's flag for empty land. */
+function StartArt({ population }: { population: number }) {
+  return (
+    <svg class="start-art" width="34" height="22" viewBox="-8.5 -6 17 11" aria-hidden="true">
+      {skyline(population).map(([dx, w, h], i) => <rect key={i} x={dx - w / 2} y={4.6 - h} width={w} height={h} />)}
+      <rect x={-8.5} y={4.6} width={17} height={0.5} />
+    </svg>
+  );
+}
+
+/** Before a plot is picked: the regions, so a player who would rather not hunt on the map can jump to one. */
+function RegionPicker({ free, onPick, onCancel }: { free: Spot[]; onPick(s: Spot): void; onCancel(): void }) {
+  return (
+    <section>
+      <h1>Found a town</h1>
+      <p class="muted">Click a free plot on the map, or pick a region and you get the plot nearest its heart.</p>
+      <ul class="region-list">
+        {PRESETS.map((p) => {
+          const first = free.find((f) => f.region === p.id);
+          return (
+            <li key={p.id}>
+              <button disabled={!first} onClick={() => first && onPick(first)}>
+                <i style={{ background: (LOOKS[p.id] ?? OTHER_LAND).land }} aria-hidden="true" />
+                <span><b>{p.label}</b><span class="muted small">{p.country} · {p.currency}</span></span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+      <div class="buttons"><button class="ghost" onClick={onCancel}>Cancel</button></div>
+    </section>
+  );
+}
+
+/** A name for a new town that no town of the region has yet. */
+function suggestName(preset: string, taken: Set<string>, skip = ''): string {
+  const names = getPreset(preset).towns;
+  const free = names.filter((n) => !taken.has(n.toLowerCase()) && n !== skip);
+  if (free.length) return free[Math.floor(Math.random() * free.length)];
+  const base = names[Math.floor(Math.random() * names.length)];
+  for (let k = 2; k < 99; k++) { const n = `${base} ${['II', 'III', 'IV', 'V', 'VI'][k - 2] ?? k}`; if (!taken.has(n.toLowerCase())) return n; }
+  return base;
+}
+
+function FoundCard({ spot, towns, onFound, onBack }: { spot: Spot; towns: MapTown[]; onFound(o: NewWorldOptions): void; onBack(): void }) {
+  const p = getPreset(spot.region);
+  const taken = useMemo(() => new Set(towns.filter((t) => t.region === spot.region).map((t) => t.name.toLowerCase())), [towns, spot.region]);
+  const [name, setName] = useState(() => suggestName(spot.region, taken));
+  const [touched, setTouched] = useState(false);
+  const [cond, setCond] = useState('growing');
+  const [year, setYear] = useState(2026);
+  const [pace, setPace] = useState(2);
+  const [build, setBuild] = useState<BuildMode>('realistic');
+  const [cap, setCap] = useState(365);
+  // a new region gets a name from that region, unless the player has typed their own
+  useEffect(() => { if (!touched) setName(suggestName(spot.region, taken)); }, [spot.region]);
+  const crops = (Object.keys(p.crops) as CropId[]).map((c) => CROPS[c].label.toLowerCase());
+  const wet = p.climate.rain.map((r, i) => (r >= 100 ? MONTHS[i] : '')).filter(Boolean);
+  const t = p.climate.temp;
+  const found = () => onFound({
+    name: name.trim() || p.towns[0], preset: p.id, startYear: year, condition: cond, seed: Math.floor(Math.random() * 2 ** 31),
+    pace, offlineCapDays: cap, now: Date.now(), build, plot: spot.plot,
+  });
+  const chosen = START_OPTIONS.find((x) => x.id === cond);
+  return (
+    <section class="found-card" aria-label="Found a town">
+      <p class="found-kicker">New town in</p>
+      <h1>{p.label}</h1>
+      <p class="muted">{p.region}, {p.country}</p>
+      <p class="small">{p.blurb}</p>
+      <dl class="found-facts">
+        <div><dt>Climate</dt><dd>{Math.round(Math.min(...t))}–{Math.round(Math.max(...t))} °C{wet.length ? `, rains ${wet[0]}–${wet[wet.length - 1]}` : Math.min(...p.climate.rain) >= 30 ? ', rain all year round' : ', mostly dry'}</dd></div>
+        <div><dt>Farms grow</dt><dd>{crops.join(', ')}</dd></div>
+        <div><dt>Currency</dt><dd>{p.currency} ({p.currencyCode})</dd></div>
+      </dl>
+
+      <label class="found-label" for="town-name">Name your town</label>
+      <div class="inline">
+        <input id="town-name" type="text" maxLength={40} value={name} onInput={(e) => { setTouched(true); setName((e.currentTarget as HTMLInputElement).value); }} />
+        <button title="Suggest another name" onClick={() => { setTouched(false); setName(suggestName(p.id, taken, name)); }}>Shuffle</button>
+      </div>
+
+      <p class="found-label" id="start-label">What stands there today?</p>
+      <div class="start-tiles" role="radiogroup" aria-labelledby="start-label">
+        {START_OPTIONS.map((x) => (
+          <button key={x.id} role="radio" aria-checked={cond === x.id} class={`start-tile ${cond === x.id ? 'on' : ''}`} onClick={() => setCond(x.id)}>
+            <StartArt population={x.population} />
+            <b>{x.label}</b>
+            <span class="muted small">{x.population ? `${num(x.population)} people` : 'Nobody yet'}</span>
+          </button>
+        ))}
+      </div>
+      {chosen && <p class="muted small">{chosen.blurb}</p>}
+
+      <details class="found-more">
+        <summary>More options</summary>
+        <p class="found-label">Take office in</p>
+        <div class="segmented" role="radiogroup" aria-label="Year">
+          {START_YEARS.map((y) => <button key={y} role="radio" aria-checked={year === y} class={year === y ? 'on' : ''} onClick={() => setYear(y)}>{y}</button>)}
+        </div>
+        <p class="found-label">How fast the world lives</p>
+        <div class="segmented" role="radiogroup" aria-label="Pace">
+          {PACES.map((x) => <button key={x.id} role="radio" aria-checked={pace === x.pace} class={pace === x.pace ? 'on' : ''} title={x.blurb} onClick={() => setPace(x.pace)}>{x.label}</button>)}
+        </div>
+        <p class="muted small">{PACES.find((x) => x.pace === pace)?.blurb}</p>
+        <p class="found-label">Construction</p>
+        <div class="segmented" role="radiogroup" aria-label="Construction">
+          {BUILD_MODES.map((x) => <button key={x.id} role="radio" aria-checked={build === x.id} class={build === x.id ? 'on' : ''} title={x.note} onClick={() => setBuild(x.id)}>{x.label}</button>)}
+        </div>
+        <p class="muted small">{BUILD_MODES.find((x) => x.id === build)?.note}</p>
+        <p class="found-label">While the game is closed, keep the town running for up to</p>
+        <div class="segmented" role="radiogroup" aria-label="Time simulated while away">
+          {OFFLINE_CAPS.map((x) => <button key={x.days} role="radio" aria-checked={cap === x.days} class={cap === x.days ? 'on' : ''} onClick={() => setCap(x.days)}>{x.label}</button>)}
+        </div>
+      </details>
+
+      <button class="primary found-go" onClick={found}>Found {name.trim() || p.towns[0]}</button>
+      <div class="buttons"><button class="ghost small" onClick={onBack}>Choose another region</button></div>
     </section>
   );
 }

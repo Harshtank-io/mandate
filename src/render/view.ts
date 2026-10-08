@@ -60,7 +60,6 @@ function demolishTarget(sim: Sim, from: number, to: number): number[] {
   const t = to < 0 ? from : to;
   return routeTiles(from % N, (from / N) | 0, t % N, (t / N) | 0).filter((i) => m.road[i] > 0);
 }
-const LEFT_HAND = new Set(['in-deccan', 'in-punjab', 'ke-rift']);
 
 /** A resizable instanced mesh with per-instance colour and optional float attributes. */
 class Layer {
@@ -366,11 +365,11 @@ export class WorldView {
 
   constructor(private container: HTMLElement, private opts: ViewOptions, private events: ViewEvents) {
     const sim = opts.getSim();
-    this.leftHand = LEFT_HAND.has(sim.s.meta.preset);
+    this.leftHand = !!sim.preset.driveLeft;
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', preserveDrawingBuffer: false });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.05;
     this.canvas = this.renderer.domElement;
