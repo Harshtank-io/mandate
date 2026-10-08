@@ -488,6 +488,7 @@ button.big { padding: 12px 24px; font-size: 1rem; border-radius: 10px; }
 .world-svg .sea { pointer-events: none; }
 .continent .hills { fill: rgba(70, 54, 36, 0.3); stroke: rgba(255, 245, 225, 0.16); stroke-width: 0.6; pointer-events: none; }
 .continent .trees { fill: rgba(30, 64, 32, 0.42); pointer-events: none; }
+.continent .lake { fill: #2a5a7a; stroke: rgba(255, 255, 255, 0.18); stroke-width: 0.6; pointer-events: none; }
 .free-hex { fill: rgba(255, 255, 255, 0.05); stroke: rgba(255, 255, 255, 0.3); stroke-width: 0.7; stroke-dasharray: 2 1.6; cursor: pointer; }
 .free-hex:hover { fill: rgba(143, 220, 201, 0.35); stroke: #fff; stroke-dasharray: none; }
 .free-hex.on { fill: rgba(143, 220, 201, 0.5); stroke: #fff; stroke-width: 1.4; stroke-dasharray: none; }

@@ -39,7 +39,30 @@ const SITE: RGB = [140, 118, 86];
 const AIRFIELD: RGB = [126, 142, 86];
 const GROUNDS: RGB = [142, 150, 112];
 
+/** The colour of each region's land: golden savanna, a dry plateau, lush delta green, a temperate valley. */
+interface Ground { grass: RGB; forest: RGB; dry: RGB }
+const GROUNDS_BY_REGION: Record<string, Ground> = {
+  'in-deccan': { grass: [146, 140, 86], forest: [82, 98, 54], dry: [166, 140, 96] },
+  'in-punjab': { grass: [128, 152, 80], forest: [70, 100, 52], dry: [160, 140, 94] },
+  'ke-rift': { grass: [158, 152, 92], forest: [92, 106, 58], dry: [172, 150, 102] },
+  'vn-mekong': { grass: [92, 150, 72], forest: [50, 100, 52], dry: [140, 136, 88] },
+  fictional: { grass: [104, 142, 82], forest: [44, 76, 48], dry: [148, 134, 96] },
+  'bd-delta': { grass: [90, 148, 76], forest: [48, 94, 50], dry: [138, 132, 88] },
+  'id-java': { grass: [86, 144, 70], forest: [42, 90, 48], dry: [136, 130, 86] },
+  'ng-savanna': { grass: [176, 160, 96], forest: [102, 110, 60], dry: [184, 158, 104] },
+  'et-highlands': { grass: [122, 142, 84], forest: [72, 94, 66], dry: [158, 140, 96] },
+};
+const DEFAULT_GROUND: Ground = { grass: GRASS, forest: FOREST, dry: DRY };
+const groundOf = (sim: Sim): Ground => GROUNDS_BY_REGION[sim.s.meta.preset] ?? DEFAULT_GROUND;
+
+/** The land beyond the edge of the region, a shade darker than its open ground. */
+export function outerGround(sim: Sim): number {
+  const g = groundOf(sim).grass;
+  return (Math.round(g[0] * 0.86) << 16) | (Math.round(g[1] * 0.86) << 8) | Math.round(g[2] * 0.86);
+}
+
 function farmLook(sim: Sim, fid: number): { c: RGB; rows: boolean } {
+  const { grass: GRASS, dry: DRY } = groundOf(sim);
   const f = sim.biz(fid)?.farm;
   if (!f) return { c: DRY, rows: false };
   const crop = f.crop ? CROPS[f.crop] : null;
@@ -62,6 +85,7 @@ function urban(sim: Sim, t: number): boolean {
 
 function tileLook(sim: Sim, t: number): { c: RGB; rows: boolean } {
   const m = sim.s.map;
+  const { grass: GRASS, forest: FOREST, dry: DRY } = groundOf(sim);
   const tt = m.terrain[t];
   if (tt === Terrain.Water) return { c: WATER, rows: false };
   if (tt === Terrain.Canal) return { c: CANAL, rows: false };

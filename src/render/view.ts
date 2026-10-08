@@ -14,8 +14,8 @@ import { isRoadwork } from '../sim/systems/construction';
 import { projectProgress, refAtTile, type Ref } from '../sim/inspect';
 import { previewBuilding, previewDemolish, previewRoad, rectTiles, routeTiles, zoneable, type RoadTool } from '../sim/commands';
 import { CameraRig, type CameraPreset } from './camera';
-import { buildingLook, CAR_COLORS, GOOD_COLORS, lookFor } from './look';
-import { N, paintOverlay, paintTerrain, roadColor, TEX, ZONE_RGB, type Overlay } from './paint';
+import { buildingLook, CAR_COLORS, GOOD_COLORS, lookFor, setRegionStyle } from './look';
+import { N, outerGround, paintOverlay, paintTerrain, roadColor, TEX, ZONE_RGB, type Overlay } from './paint';
 
 export type Tool =
   | { mode: 'inspect' }
@@ -284,6 +284,23 @@ const PARTS: Partial<Record<BuildingKind, number>> = {
 /** Sites laid out across their whole footprint, outlined by it (height of the outline box). */
 const WHOLE: Partial<Record<BuildingKind, number>> = { airport: 0.45, stadium: 1.08, heritage: 0.9, solarfarm: 0.3, windfarm: 1.75, substation: 0.5, waterworks: 0.9 };
 const URBAN = new Set<number>([Zone.Residential, Zone.Commercial, Zone.Industrial]);
+/**
+ * Each region's trees: their colours in woods and in gardens, and their shape (height and spread): flat-topped
+ * acacias on the savanna, tall dark firs in a temperate valley, dense deep-green woods in the tropics.
+ */
+interface TreeLook { forest: number[]; park: number[]; h: number; r: number }
+const DEFAULT_TREES: TreeLook = { forest: [0x2f5a2a, 0x3b6b30, 0x2c4f28, 0x47753a], park: [0x4f8a3a, 0x5d9a44, 0x3f7a34], h: 1, r: 1 };
+const TREES_BY_REGION: Record<string, TreeLook> = {
+  'in-deccan': { forest: [0x4a5e2c, 0x56682f, 0x3f5528], park: [0x5f7d36, 0x6b8a3c, 0x55722f], h: 0.85, r: 1.15 },
+  'in-punjab': { forest: [0x355f2c, 0x416b32, 0x2f5528], park: [0x538a3c, 0x60973f, 0x497c35], h: 1.05, r: 1 },
+  'ke-rift': { forest: [0x5a6a30, 0x667635, 0x4e5f2b], park: [0x6a7d3a, 0x76893f, 0x5d7033], h: 0.55, r: 1.6 },
+  'vn-mekong': { forest: [0x245a2a, 0x2c6a30, 0x1f4f26], park: [0x3f8a3a, 0x4a9a42, 0x377a34], h: 1.15, r: 1.05 },
+  fictional: { forest: [0x1f3f26, 0x27492c, 0x1b3822], park: [0x3d7036, 0x477c3c, 0x36652f], h: 1.45, r: 0.78 },
+  'bd-delta': { forest: [0x275e2b, 0x306c32, 0x225326], park: [0x428c3c, 0x4c9a44, 0x3a7c35], h: 1.2, r: 1.05 },
+  'id-java': { forest: [0x1f5228, 0x26602e, 0x1a4823], park: [0x3c8838, 0x469640, 0x347832], h: 1.3, r: 1.1 },
+  'ng-savanna': { forest: [0x6a7034, 0x767c3a, 0x5d6430], park: [0x748a3c, 0x7f9542, 0x687d36], h: 0.5, r: 1.7 },
+  'et-highlands': { forest: [0x4b6650, 0x557258, 0x425c48], park: [0x5b7e48, 0x66894f, 0x527240], h: 1.35, r: 0.85 },
+};
 const hashStr = (t: string) => { let h = 7; for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0; return Math.abs(h); };
 
 interface Commuter { id: number; path: number[]; depart: number; ret: number; dur: number; mode: number; color: number }
@@ -366,6 +383,7 @@ export class WorldView {
   constructor(private container: HTMLElement, private opts: ViewOptions, private events: ViewEvents) {
     const sim = opts.getSim();
     this.leftHand = !!sim.preset.driveLeft;
+    setRegionStyle(sim.s.meta.preset);
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', preserveDrawingBuffer: false });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     this.renderer.shadowMap.enabled = true;
@@ -417,7 +435,7 @@ export class WorldView {
     ground.position.set(N / 2, 0, N / 2);
     ground.receiveShadow = true;
     this.scene.add(ground);
-    const outer = new THREE.Mesh(this.keepGeo(new THREE.PlaneGeometry(4000, 4000)), this.keepMat(new THREE.MeshLambertMaterial({ color: 0x6d8752 })));
+    const outer = new THREE.Mesh(this.keepGeo(new THREE.PlaneGeometry(4000, 4000)), this.keepMat(new THREE.MeshLambertMaterial({ color: outerGround(sim) })));
     outer.rotation.x = -Math.PI / 2;
     outer.position.set(N / 2, -0.04, N / 2);
     this.scene.add(outer);
@@ -1155,8 +1173,8 @@ export class WorldView {
   private buildTrees(sim: Sim): void {
     const m = sim.s.map;
     this.trees.begin(9000);
-    const FOREST = [0x2f5a2a, 0x3b6b30, 0x2c4f28, 0x47753a];
-    const PARK = [0x4f8a3a, 0x5d9a44, 0x3f7a34];
+    const look = TREES_BY_REGION[sim.s.meta.preset] ?? DEFAULT_TREES;
+    const FOREST = look.forest, PARK = look.park;
     for (let t = 0; t < N * N; t++) {
       const tx = t % N, ty = (t / N) | 0;
       const o = m.owner[t];
@@ -1168,7 +1186,7 @@ export class WorldView {
       for (let k = 0; k < n; k++) {
         let x = tx + 0.15 + hash01(t, 20 + k) * 0.7, z = ty + 0.15 + hash01(t, 30 + k) * 0.7;
         if (bld && bld.kind !== 'park') { x = tx + (hash01(t, 21) < 0.5 ? 0.12 : 0.88); z = ty + (hash01(t, 31) < 0.5 ? 0.12 : 0.88); }
-        const h = (0.42 + 0.35 * hash01(t, 40 + k)) * big, r = (0.24 + 0.12 * hash01(t, 50 + k)) * big;
+        const h = (0.42 + 0.35 * hash01(t, 40 + k)) * big * look.h, r = (0.24 + 0.12 * hash01(t, 50 + k)) * big * look.r;
         this.trees.add(x, 0, z, r, h, r, 0, palette[Math.floor(hash01(t, 60 + k) * palette.length)]);
       }
     }

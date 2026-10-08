@@ -39,6 +39,8 @@ jobs:
           VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
           VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY }}
           VITE_AUTH_PROVIDERS: ${{ vars.VITE_AUTH_PROVIDERS }}
+      # pages such as /world and /town/<id> have no file of their own: Pages answers them with 404.html, i.e. the game
+      - run: cp dist/index.html dist/404.html
       - uses: actions/upload-pages-artifact@v4
         with:
           path: dist

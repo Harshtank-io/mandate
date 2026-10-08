@@ -7,7 +7,7 @@ import { emptyAcc, emptyGovLedger, emptyHhLedger, idx, inMap, Sim, W } from './c
 import { businessName, firstName, lastName } from './names';
 import { emptyVenue, initAir, initFood, initLeisure, initTourism, initTrade, initUtilities } from './init';
 import { STATE_VERSION } from './migrate';
-import { getCondition, getPreset, moneyScale, type Preset, type StartCondition } from './presets';
+import { DEFAULT_LANDSCAPE, getCondition, getPreset, moneyScale, type LandscapeSpec, type Preset, type StartCondition } from './presets';
 import { type Rng, seedState } from './rng';
 import {
   BASE_RENT, BUILDINGS, BUSINESSES, CROPS, DAY_TRIP_SHARE, FOOD_NEED, GOOD_SPECS, HA_PER_TILE, HOTEL_ROOMS_PER_FLOOR, ROAD_MAINT, ROLES, STAY_NIGHTS,
@@ -147,6 +147,8 @@ class Generator {
   p: Preset;
   c: StartCondition;
   cx = 64; cy = 64; R = 20; yH = 84;
+  /** How the town is stretched east-west and north-south (1, 1: round). */
+  tex = 1; tey = 1;
   urban = new Uint8Array(N);
   riverX = new Int16Array(W);
   ind = { x0: 0, y0: 0, x1: 0, y1: 0 };
@@ -183,25 +185,35 @@ class Generator {
   // ------------------------------------------------------------------ terrain
   terrain(): void {
     const m = this.s.map, r = this.r;
+    const L = this.p.landscape ?? DEFAULT_LANDSCAPE;
     const n1 = makeNoise(r, 7), n2 = makeNoise(r, 22), nr = makeNoise(r, 9), nu = makeNoise(r, 6);
     const phase = r.range(0, Math.PI * 2);
-    for (let y = 0; y < W; y++) this.riverX[y] = Math.round(W * 0.4 + 8 * Math.sin(y / 17 + phase) + 10 * (nr(0.3, y / W) - 0.5));
+    for (let y = 0; y < W; y++) this.riverX[y] = Math.round(W * L.at + L.wind * Math.sin(y / 17 + phase) + 10 * (nr(0.3, y / W) - 0.5));
     this.cy = 58 + r.int(8);
-    this.cx = this.riverX[this.cy] + 13;
+    // the town stands on the east bank, clear of however wide the river is
+    this.cx = this.riverX[this.cy] + 13 + Math.max(0, L.river - 1);
     this.R = Math.round(9 + Math.sqrt(this.c.population) * 0.2);
     this.yH = this.cy + 20;
+    [this.tex, this.tey] = L.town ?? [1, 1];
+    const groves = L.groves ? makeNoise(r, 44) : null;
     for (let y = 0; y < W; y++) {
       for (let x = 0; x < W; x++) {
         const i = idx(x, y);
         const dr = Math.abs(x - this.riverX[y]);
-        if (dr <= 1) m.terrain[i] = Terrain.Water;
+        if (dr <= L.river) m.terrain[i] = Terrain.Water;
         m.fertility[i] = clamp(0.45 + 0.4 * Math.exp(-dr / 14) + 0.3 * (n2(x / W, y / W) - 0.5), 0.2, 1);
-        const d = Math.hypot(x - this.cx, y - this.cy);
+        // distance from the centre in the town's own shape: round, or stretched along the highway or the river
+        const d = this.townDist(x, y);
         const f = 0.6 * n1(x / W, y / W) + 0.4 * n2(x / W, y / W);
-        if (m.terrain[i] !== Terrain.Water && f > 0.63 && d > this.R + 8) m.terrain[i] = Terrain.Forest;
+        // in a valley the woods climb the slopes away from the river
+        const woods = L.valley ? L.forest - 0.2 * clamp((dr - 12) / 40, 0, 1) : L.forest;
+        if (m.terrain[i] !== Terrain.Water && f > woods && d > this.R + 8) m.terrain[i] = Terrain.Forest;
+        // savanna: small groves and lone stands of trees scattered over open country
+        if (groves && m.terrain[i] !== Terrain.Water && d > this.R + 6 && groves(x / W, y / W) > 1 - 0.3 * (L.groves ?? 0)) m.terrain[i] = Terrain.Forest;
         if (m.terrain[i] !== Terrain.Water && d < this.R * (0.82 + 0.36 * nu(x / W, y / W))) this.urban[i] = 1;
       }
     }
+    this.waterFeatures(L);
     // industrial district east of the centre along the highway
     const R = this.R;
     this.ind = { x0: this.cx + Math.round(R * 0.45), x1: Math.min(W - 3, this.cx + R + 10), y0: this.yH - 8, y1: Math.min(W - 3, this.yH + 5) };
@@ -218,6 +230,88 @@ class Generator {
           if (Math.hypot(x - this.cx, yc - this.cy) < R + 3) continue;
           m.terrain[i] = Terrain.Canal;
         }
+      }
+    }
+  }
+
+  /**
+   * What makes one region's land unlike another's beyond its river: a lake the river runs into, ponds or crater lakes,
+   * the channels of a delta fanning out below the town, a wooded volcano with a crater lake. None of them reaches
+   * into the town, its main roads or the regional highway.
+   */
+  /** Distance from the town centre, measured in the town's shape (a stretched town reaches further along its long axis). */
+  townDist(x: number, y: number): number { return Math.hypot((x - this.cx) / this.tex, (y - this.cy) / this.tey); }
+
+  waterFeatures(L: LandscapeSpec): void {
+    const m = this.s.map, r = this.r;
+    const { cx, cy, R, yH } = this;
+    const inTown = (x: number, y: number, pad: number) => this.townDist(x, y) < R * 1.18 + pad;
+    const water = (x: number, y: number) => {
+      if (!inMap(x, y) || inTown(x, y, 2)) return;
+      const i = idx(x, y);
+      m.terrain[i] = Terrain.Water;
+      this.urban[i] = 0;
+    };
+    if (L.lake) {
+      // a lake north of the town, fed by the river, with an uneven shore
+      const rad = L.lake, shore = makeNoise(r, 5);
+      const ly = Math.max(rad * 0.35, cy - R * 1.18 * this.tey - rad / 1.25 - 5);
+      const lx = this.riverX[clamp(Math.round(ly), 0, W - 1)] - rad * 0.35;
+      for (let y = Math.floor(ly - rad); y <= ly + rad; y++) for (let x = Math.floor(lx - rad * 1.3); x <= lx + rad * 1.3; x++) {
+        if (!inMap(x, y)) continue;
+        if (Math.hypot((x - lx) / 1.15, (y - ly) * 1.25) / rad < 0.82 + 0.32 * shore(x / W, y / W)) water(x, y);
+      }
+    }
+    if (L.mountain) {
+      // a volcano in the far corner from the river: a bare summit round a crater lake, wooded slopes below
+      const mr = L.mountain, edge = makeNoise(r, 6);
+      const mx = this.riverX[0] < W / 2 ? W - mr * 0.45 : mr * 0.45, my = mr * 0.45;
+      for (let y = 0; y < W; y++) for (let x = 0; x < W; x++) {
+        const dm = Math.hypot(x - mx, y - my) / mr;
+        if (dm > 1.15 || inTown(x, y, 6)) continue;
+        const i = idx(x, y);
+        if (m.terrain[i] === Terrain.Water) continue;
+        if (dm < 0.13) water(x, y);
+        else if (dm < 0.3) { m.terrain[i] = Terrain.Grass; m.fertility[i] = 0.25; }
+        else if (dm < 0.88 + 0.3 * (edge(x / W, y / W) - 0.5)) { m.terrain[i] = Terrain.Forest; m.fertility[i] = Math.min(1, m.fertility[i] + 0.15); }
+      }
+    }
+    if (L.branches) {
+      // below the highway the river splits into channels that fan out towards the sea: west, away from the town on the
+      // east bank, and (for a third channel) east once the river is past the town
+      const below = Math.round(cy + R * 1.18 * this.tey + 3);
+      for (let k = 0; k < L.branches; k++) {
+        const east = k === 2;
+        const ys = Math.min(W - 22, east ? Math.max(yH + 7, below) : yH + 7 + 5 * k), xs = this.riverX[ys], bw = Math.max(0, L.river - 1);
+        const spread = east ? 0.5 : -(0.42 + 0.45 * k), ph = r.range(0, Math.PI * 2);
+        for (let y = ys; y < W; y++) {
+          const t = y - ys;
+          const bx = Math.round(xs + spread * t + 3 * Math.sin(t / 7 + ph) * Math.min(1, t / 10));
+          for (let x = bx - bw; x <= bx + bw; x++) water(x, y);
+          if (t > 0) water(Math.round(xs + spread * (t - 0.5) + 3 * Math.sin((t - 0.5) / 7 + ph) * Math.min(1, t / 10)), y);
+        }
+      }
+      // silt: the delta's farmland is the most fertile of the region
+      for (let y = yH + 7; y < W; y++) for (let x = 0; x < W; x++) {
+        const i = idx(x, y);
+        if (m.terrain[i] !== Terrain.Water) m.fertility[i] = Math.min(1, m.fertility[i] + 0.12);
+      }
+    }
+    if (L.ponds) {
+      // village tanks, ponds or crater lakes in the open country, clear of the river and the main roads
+      const [n, r0, r1] = L.ponds;
+      let made = 0;
+      for (let tries = 0; made < n && tries < n * 40; tries++) {
+        const px = r.range(5, W - 5), py = r.range(5, W - 5), pr = r.range(r0, r1);
+        if (inTown(px, py, pr + 4) || Math.abs(py - yH) < pr + 2 || Math.abs(px - cx) < pr + 2 || Math.abs(py - cy) < pr + 2) continue;
+        if (Math.abs(px - this.riverX[Math.round(py)]) < pr + L.river + 4) continue;
+        let clear = true;
+        for (let y = Math.floor(py - pr - 1); y <= py + pr + 1 && clear; y++) for (let x = Math.floor(px - pr - 1); x <= px + pr + 1; x++) {
+          if (inMap(x, y) && m.terrain[idx(x, y)] === Terrain.Water) { clear = false; break; }
+        }
+        if (!clear) continue;
+        for (let y = Math.floor(py - pr); y <= py + pr; y++) for (let x = Math.floor(px - pr); x <= px + pr; x++) if (Math.hypot(x - px, y - py) <= pr) water(x, y);
+        made++;
       }
     }
   }

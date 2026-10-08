@@ -68,22 +68,27 @@ function hexPath(x: number, y: number, s: number): string {
 
 // ------------------------------------------------------------------------------------------------ layout
 
-interface RegionLook { at: [number, number]; land: string; shore: string; trees: number; hills: number }
+/**
+ * Where each region's continent lies (roughly as on a real map), its colours and scenery, and its outline: beyond a
+ * hexagonal heartland of plots, the land runs out into peninsulas and capes that are stretched east-west (`ex`) or
+ * north-south (`ey`) by region, so no two continents share a shape. `lakes` are inland lakes on those outer lands.
+ */
+interface RegionLook { at: [number, number]; land: string; shore: string; trees: number; hills: number; ex: number; ey: number; lakes?: number }
 
-/** Where each region's continent lies, roughly as on a real map, the colour of its land and its scenery. */
 const LOOKS: Record<string, RegionLook> = {
-  fictional: { at: [-1.6, -1.1], land: '#6f8f5a', shore: '#b3bf92', trees: 0.3, hills: 0.12 },
-  'ng-savanna': { at: [-1.9, 0.3], land: '#a99a5a', shore: '#d4c58f', trees: 0.12, hills: 0.03 },
-  'et-highlands': { at: [-0.6, 0.35], land: '#7f8c56', shore: '#bcc08c', trees: 0.08, hills: 0.25 },
-  'ke-rift': { at: [-0.9, 1.3], land: '#9a8957', shore: '#cbbb8c', trees: 0.1, hills: 0.16 },
-  'pk-indus': { at: [0, -0.6], land: '#b49a6a', shore: '#dcc79a', trees: 0.04, hills: 0.05 },
-  'in-punjab': { at: [0.75, -1.25], land: '#9c9655', shore: '#cfc58f', trees: 0.08, hills: 0.02 },
-  'in-deccan': { at: [0.7, 0.35], land: '#a7845a', shore: '#d2b48d', trees: 0.12, hills: 0.14 },
-  'bd-delta': { at: [1.6, -0.5], land: '#5f9663', shore: '#a8c9a0', trees: 0.26, hills: 0 },
-  'vn-mekong': { at: [2.4, 0.35], land: '#4f8a5c', shore: '#9cc196', trees: 0.24, hills: 0.02 },
-  'id-java': { at: [1.9, 1.35], land: '#4c8a55', shore: '#97c08e', trees: 0.3, hills: 0.16 },
+  fictional: { at: [-1.55, -1.1], land: '#6f8f5a', shore: '#b3bf92', trees: 0.34, hills: 0.12, ex: 0.7, ey: 1.3, lakes: 1 },
+  'ng-savanna': { at: [-1.9, 0.35], land: '#a99a5a', shore: '#d4c58f', trees: 0.14, hills: 0.02, ex: 1.5, ey: 0.55 },
+  'et-highlands': { at: [-0.5, 0.15], land: '#7f8c56', shore: '#bcc08c', trees: 0.08, hills: 0.32, ex: 1, ey: 1, lakes: 3 },
+  'ke-rift': { at: [-0.85, 1.35], land: '#9a8957', shore: '#cbbb8c', trees: 0.12, hills: 0.18, ex: 0.45, ey: 1.6, lakes: 2 },
+  'in-punjab': { at: [0.55, -1.2], land: '#9c9655', shore: '#cfc58f', trees: 0.06, hills: 0.01, ex: 1.4, ey: 0.6 },
+  'in-deccan': { at: [0.7, 0.45], land: '#a7845a', shore: '#d2b48d', trees: 0.1, hills: 0.16, ex: 0.8, ey: 1.45 },
+  'bd-delta': { at: [1.6, -0.55], land: '#5f9663', shore: '#a8c9a0', trees: 0.24, hills: 0, ex: 1.1, ey: 1.1, lakes: 2 },
+  'vn-mekong': { at: [2.4, 0.35], land: '#4f8a5c', shore: '#9cc196', trees: 0.22, hills: 0.02, ex: 0.6, ey: 1.5 },
+  'id-java': { at: [1.85, 1.4], land: '#4c8a55', shore: '#97c08e', trees: 0.3, hills: 0.2, ex: 1.9, ey: 0.4 },
 };
-const OTHER_LAND = { land: '#7b8a7c', shore: '#adb8a9', trees: 0.1, hills: 0.05 };
+const OTHER_LAND = { land: '#7b8a7c', shore: '#adb8a9', trees: 0.1, hills: 0.05, ex: 1, ey: 1 };
+/** How many rings beyond the heartland the capes and peninsulas reach, at most. */
+const CAPES = 4;
 /** Every continent has at least this many rings of land, so there is always room to found a town. */
 const MIN_RINGS = 6;
 
@@ -93,13 +98,43 @@ export interface MapTown extends WorldTown { local: boolean }
 /** A free plot a new town can be founded on. */
 export interface Spot { region: string; plot: number; x: number; y: number }
 
-interface Continent { region: string; label: string; country: string; land: string; shore: string; x: number; y: number; top: number; landPath: string; shorePath: string; treePath: string; hillPath: string; count: number }
+interface Continent { region: string; label: string; country: string; land: string; shore: string; x: number; y: number; top: number; landPath: string; shorePath: string; treePath: string; hillPath: string; lakePath: string; count: number }
+
+interface Cell { ring: number; q: number; r: number; shore: boolean }
+
+/**
+ * The hexes of a continent: its heartland (rings 0..k, where towns are founded) and capes and peninsulas beyond, reaching
+ * out by a few overlapping waves round the coast that are unique to the region and stretched along its long axis.
+ */
+function continentCells(k: number, L: { ex: number; ey: number }, salt: number): Map<number, Cell> {
+  const max = k + CAPES + 1;
+  const waves = [2, 3, 5].map((f, i) => ({ f, a: 0.4 + hash01(salt, 40 + i), p: hash01(salt, 50 + i) * Math.PI * 2 }));
+  const total = waves.reduce((a, w) => a + w.a, 0);
+  const reach = (theta: number) => {
+    let v = 0;
+    for (const w of waves) v += w.a * Math.sin(theta * w.f + w.p);
+    const axis = Math.abs(Math.cos(theta)) * L.ex + Math.abs(Math.sin(theta)) * L.ey;
+    return k + Math.min(CAPES, Math.max(0, (0.3 + 0.7 * (v / total)) * CAPES * axis));
+  };
+  const key = (q: number, r: number) => (q + 64) * 256 + (r + 64);
+  const land = new Map<number, Cell>(), keys = new Set<number>();
+  for (let n = 0; n < cells(max); n++) {
+    const ring = ringOf(n);
+    const [q, r] = hexAt(n);
+    const [px, py] = toPx(q, r);
+    // the heartland is always land; beyond it the coast is ragged
+    if (ring <= k || ring <= reach(Math.atan2(py, px)) - hash01(n, salt) * 0.9) { land.set(n, { ring, q, r, shore: false }); keys.add(key(q, r)); }
+  }
+  for (const c of land.values()) c.shore = DIRS.some(([dq, dr]) => !keys.has(key(c.q + dq, c.r + dr)));
+  return land;
+}
 interface Placed { town: MapTown; x: number; y: number }
 interface Layout { continents: Continent[]; placed: Placed[]; free: Spot[]; x0: number; y0: number; x1: number; y1: number }
 
 function regionInfo(id: string): { label: string; country: string } {
   const p = PRESETS.find((x) => x.id === id);
-  return p ? { label: p.label, country: p.country } : { label: id === 'other' ? 'Other lands' : id, country: '' };
+  // towns of regions this version does not know (or no longer has) stand on the continent of other lands
+  return p ? { label: p.label, country: p.country } : { label: 'Other lands', country: '' };
 }
 
 const strHash = (s: string) => { let h = 7; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return h; };
@@ -117,7 +152,8 @@ function layoutWorld(towns: MapTown[]): Layout {
   const looks = regions.map((r) => LOOKS[r] ?? { at: [-1.6 + 1.3 * extra++, 2.3] as [number, number], ...OTHER_LAND });
   // land reaches two rings past the outermost town, so every continent has a shore and room to grow
   const rings = regions.map((r) => Math.max(MIN_RINGS, ringOf(Math.max(0, ...byRegion.get(r)!.map((t) => t.plot))) + 2));
-  const radius = (k: number) => (k + 1.6) * COL;
+  // capes reach CAPES rings past the heartland at most, further along the region's long axis
+  const radius = (k: number) => (k + 1.6 + CAPES) * COL;
   // spread the continents far enough apart that none can touch another, however big they grow
   let s = 9.5 * COL;
   for (let i = 0; i < regions.length; i++) {
@@ -135,20 +171,24 @@ function layoutWorld(towns: MapTown[]): Layout {
     const salt = strHash(region);
     const list = byRegion.get(region)!;
     const taken = new Set(list.map((t) => t.plot));
-    let landPath = '', shorePath = '', treePath = '', hillPath = '';
-    for (let n = 0; n < cells(k + 1); n++) {
-      const ring = ringOf(n);
-      // the outermost ring is a ragged coastline: only some of its hexes are land
-      if (ring > k && hash01(n, salt) > 0.32) continue;
-      const [q, r] = hexAt(n);
+    let landPath = '', shorePath = '', treePath = '', hillPath = '', lakePath = '';
+    const land = continentCells(k, L, salt);
+    let lakes = L.lakes ?? 0;
+    let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+    for (const [n, cell] of land) {
+      const { ring, q, r } = cell;
       const [px, py] = toPx(q, r);
       const x = cx + px, y = cy + py;
+      bx0 = Math.min(bx0, x); bx1 = Math.max(bx1, x); by0 = Math.min(by0, y); by1 = Math.max(by1, y);
       const d = hexPath(x, y, HS * 1.02);
-      if (ring < k) landPath += d; else shorePath += d;
-      if (ring >= k || taken.has(n)) continue;
-      // towns may be founded anywhere inland; scenery decorates the plots nobody has taken
-      free.push({ region, plot: n, x, y });
-      const h = hash01(n, salt + 5);
+      if (cell.shore) shorePath += d; else landPath += d;
+      if (ring < k && taken.has(n)) continue;
+      // inland lakes lie on the outer lands, never on a plot a town could have
+      if (ring >= k && !cell.shore && lakes > 0 && hash01(n, salt + 9) < 0.07) { lakePath += hexPath(x, y, HS * 0.98); lakes--; continue; }
+      // towns may be founded anywhere in the heartland; scenery decorates every plot nobody has taken
+      if (ring < k) free.push({ region, plot: n, x, y });
+      if (cell.shore) continue;
+      const h = hash01(n, salt + 5) / (ring >= k ? 1.6 : 1);
       if (h < L.hills) {
         const w = HS * 0.55, ht = HS * 0.62;
         hillPath += `M${(x - w).toFixed(1)} ${(y + ht * 0.45).toFixed(1)}L${x.toFixed(1)} ${(y - ht * 0.55).toFixed(1)}L${(x + w).toFixed(1)} ${(y + ht * 0.45).toFixed(1)}Z`;
@@ -164,11 +204,10 @@ function layoutWorld(towns: MapTown[]): Layout {
       const [px, py] = toPx(q, r);
       placed.push({ town: t, x: cx + px, y: cy + py });
     }
-    const R = radius(k + 1);
     const info = regionInfo(region);
-    continents.push({ region, ...info, land: L.land, shore: L.shore, x: cx, y: cy, top: cy - R - 8, landPath, shorePath, treePath, hillPath, count: list.length });
-    x0 = Math.min(x0, cx - R); x1 = Math.max(x1, cx + R);
-    y0 = Math.min(y0, cy - R - 34); y1 = Math.max(y1, cy + R);
+    continents.push({ region, ...info, land: L.land, shore: L.shore, x: cx, y: cy, top: by0 - HS - 6, landPath, shorePath, treePath, hillPath, lakePath, count: list.length });
+    x0 = Math.min(x0, bx0 - HS * 2); x1 = Math.max(x1, bx1 + HS * 2);
+    y0 = Math.min(y0, by0 - HS - 40); y1 = Math.max(y1, by1 + HS * 2);
   });
   return { continents, placed, free, x0, y0, x1, y1 };
 }
@@ -399,6 +438,7 @@ function WorldMap({ layout, selected, focus, onSelect, founding, spot, onPick }:
           <g key={c.region} class="continent">
             <path d={c.shorePath} fill={c.shore} />
             <path d={c.landPath} fill={c.land} />
+            <path class="lake" d={c.lakePath} />
             <path class="hills" d={c.hillPath} />
             <path class="trees" d={c.treePath} />
           </g>

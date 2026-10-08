@@ -27,8 +27,16 @@ export function supabase(): Promise<SupabaseClient> {
   return client;
 }
 
-/** Where sign-in links and OAuth logins return to. It must be listed in the project's redirect URLs. */
-export function returnUrl(): string { return `${location.origin}${location.pathname}`; }
+/**
+ * Where sign-in links and OAuth logins return to: the game's home address, whatever page they were asked for on (the
+ * world map then opens, see ui/route.ts). It must be listed in the project's redirect URLs.
+ */
+export function returnUrl(): string { return `${location.origin}${import.meta.env.BASE_URL}`; }
+
+/** Whether the address holds the result of a sign-in link or an OAuth login. */
+export function authReturn(): boolean {
+  return /access_token|refresh_token|error_description/.test(location.hash) || /[?&](code|error_description)=/.test(location.search);
+}
 
 let memoryDevice = '';
 

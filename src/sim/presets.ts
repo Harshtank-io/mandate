@@ -1,4 +1,4 @@
-﻿// Real-world-inspired starting regions. Climate, crops, culture, currency and fiscal defaults are modelled on
+// Real-world-inspired starting regions. Climate, crops, culture, currency and fiscal defaults are modelled on
 // real places; the town itself and its map are generated. Money values are base (INR 2026) and get multiplied
 // by `money` and the price level of the chosen start year.
 
@@ -61,7 +61,38 @@ export interface Preset {
   fxName: string; // the foreign currency the exchange-rate index is quoted against
   /** Traffic keeps to the left. */
   driveLeft?: boolean;
+  /** The shape of the land a town of this region is generated on (missing: one winding river through farmland). */
+  landscape?: LandscapeSpec;
 }
+
+/** What the land of a region looks like: its river, lakes, woods and hills. */
+export interface LandscapeSpec {
+  /** Half-width of the main river in tiles: 0 is a stream, 1 a river, 2 or 3 a broad river. */
+  river: number;
+  /** How far the river winds from side to side, in tiles. */
+  wind: number;
+  /** Where the river runs, as a share of the map from the west. */
+  at: number;
+  /** Woodland noise threshold: lower means more woods (0.63 is typical farmland country). */
+  forest: number;
+  /** Woods thicken towards the sides of a river valley. */
+  valley?: boolean;
+  /** Scattered groves and lone stands of trees, as on a savanna (0..1). */
+  groves?: number;
+  /** The river splits into this many more channels below the town, as in a delta. */
+  branches?: number;
+  /** Radius in tiles of a lake north of the town. */
+  lake?: number;
+  /** Ponds, village tanks or crater lakes: how many, and their smallest and largest radius in tiles. */
+  ponds?: [number, number, number];
+  /** Radius in tiles of a wooded volcano rising in a corner of the map, with a crater lake. */
+  mountain?: number;
+  /** How the town spreads: stretched east-west along the highway (x above 1) or north-south along the river (y above 1). */
+  town?: [number, number];
+}
+
+/** One winding river through farmland and woods: the landscape of a region that does not describe its own. */
+export const DEFAULT_LANDSCAPE: LandscapeSpec = { river: 1, wind: 8, at: 0.4, forest: 0.63 };
 
 const baseWords: Partial<Record<BusinessKind, string[]>> = {
   grocery: ['Grocers', 'Fresh Mart', 'Provisions', 'Supermart'],
@@ -127,7 +158,7 @@ export const PRESETS: Preset[] = [
       nature: 0.5, heritage: ['Old Hill Fort', 'Peshwa-era Temple', 'Stepwell of the Nine Arches'], heritageStyle: 'fort',
       festival: { name: 'Ganeshotsav', month: 8, days: 10 }, hubs: ['Mumbai', 'Pune', 'Bengaluru', 'Delhi'], ...indiaAir,
     },
-    partners: indiaPartners, fxName: 'US dollar', driveLeft: true,
+    partners: indiaPartners, fxName: 'US dollar', driveLeft: true, landscape: { river: 1, wind: 8, at: 0.4, forest: 0.66, groves: 0.25, ponds: [6, 2, 3] },
   },
   {
     id: 'in-punjab', label: 'Indo-Gangetic Plains', region: 'Punjab', country: 'India',
@@ -155,7 +186,7 @@ export const PRESETS: Preset[] = [
       nature: 0.3, heritage: ['Old Gurdwara Sahib', 'Mughal Sarai', 'Maharaja’s Haveli'], heritageStyle: 'temple',
       festival: { name: 'Baisakhi Mela', month: 3, days: 4 }, hubs: ['Delhi', 'Amritsar', 'Mumbai', 'Chandigarh'], ...indiaAir,
     },
-    partners: indiaPartners, fxName: 'US dollar', driveLeft: true,
+    partners: indiaPartners, fxName: 'US dollar', driveLeft: true, landscape: { river: 2, wind: 3, at: 0.3, forest: 0.8, town: [1.35, 0.74] },
   },
   {
     id: 'ke-rift', label: 'Rift Valley Highlands', region: 'Nakuru County', country: 'Kenya',
@@ -193,7 +224,7 @@ export const PRESETS: Preset[] = [
       { id: 'china', name: 'China', dist: 1.2, tariffGoods: 0.08, tariffAgri: 0.1, buys: ['cotton', 'food'], sells: ['goods', 'materials'] },
       { id: 'us', name: 'United States', dist: 1.5, tariffGoods: 0.04, tariffAgri: 0.06, buys: ['goods', 'cotton'], sells: ['wheat', 'goods'] },
     ],
-    fxName: 'US dollar', driveLeft: true,
+    fxName: 'US dollar', driveLeft: true, landscape: { river: 0, wind: 6, at: 0.42, forest: 0.72, groves: 0.55, lake: 21, town: [1.15, 0.87] },
   },
   {
     id: 'vn-mekong', label: 'Mekong Delta', region: 'Cần Thơ', country: 'Vietnam',
@@ -231,7 +262,7 @@ export const PRESETS: Preset[] = [
       { id: 'us', name: 'United States', dist: 1.5, tariffGoods: 0.06, tariffAgri: 0.05, buys: ['goods', 'food'], sells: ['wheat', 'maize', 'cotton'] },
       { id: 'jpk', name: 'Japan and Korea', dist: 1, tariffGoods: 0.03, tariffAgri: 0.15, buys: ['goods', 'food', 'rice'], sells: ['goods', 'materials'] },
     ],
-    fxName: 'US dollar',
+    fxName: 'US dollar', landscape: { river: 2, wind: 6, at: 0.36, forest: 0.72, branches: 3, ponds: [5, 1, 2], town: [0.72, 1.39] },
   },
   {
     id: 'fictional', label: 'Valdoria River Valley', region: 'Northern Province', country: 'Valdoria (fictional)',
@@ -268,7 +299,7 @@ export const PRESETS: Preset[] = [
       { id: 'south', name: 'Southern Republic', dist: 1.3, tariffGoods: 0.07, tariffAgri: 0.05, buys: ['maize', 'wheat', 'materials'], sells: ['cotton', 'food', 'goods'] },
       { id: 'north', name: 'Northern Federation', dist: 1.5, tariffGoods: 0.05, tariffAgri: 0.1, buys: ['goods', 'food'], sells: ['materials', 'goods'] },
     ],
-    fxName: 'Aurelian mark',
+    fxName: 'Aurelian mark', landscape: { river: 1, wind: 13, at: 0.42, forest: 0.6, valley: true, town: [0.8, 1.25] },
   },
   {
     id: 'bd-delta', label: 'Ganges Delta', region: 'Khulna Division', country: 'Bangladesh',
@@ -306,7 +337,7 @@ export const PRESETS: Preset[] = [
       { id: 'us', name: 'United States', dist: 1.6, tariffGoods: 0.1, tariffAgri: 0.06, buys: ['goods'], sells: ['cotton', 'wheat', 'goods'] },
       { id: 'gulf', name: 'Gulf states', dist: 0.9, tariffGoods: 0.05, tariffAgri: 0.04, buys: ['rice', 'vegetables', 'food'], sells: ['materials', 'goods'] },
     ],
-    fxName: 'US dollar', driveLeft: true,
+    fxName: 'US dollar', driveLeft: true, landscape: { river: 3, wind: 5, at: 0.3, forest: 0.74, branches: 2, ponds: [14, 1, 2], town: [0.75, 1.33] },
   },
   {
     id: 'id-java', label: 'Java Volcano Highlands', region: 'Central Java', country: 'Indonesia',
@@ -344,7 +375,7 @@ export const PRESETS: Preset[] = [
       { id: 'us', name: 'United States', dist: 1.6, tariffGoods: 0.06, tariffAgri: 0.05, buys: ['goods', 'food'], sells: ['wheat', 'cotton', 'maize'] },
       { id: 'eu', name: 'European Union', dist: 1.5, tariffGoods: 0.04, tariffAgri: 0.12, buys: ['food', 'goods'], sells: ['goods', 'wheat'] },
     ],
-    fxName: 'US dollar', driveLeft: true,
+    fxName: 'US dollar', driveLeft: true, landscape: { river: 1, wind: 7, at: 0.38, forest: 0.64, mountain: 34, town: [1.2, 0.83] },
   },
   {
     id: 'ng-savanna', label: 'Guinea Savanna', region: 'Kaduna State', country: 'Nigeria',
@@ -382,45 +413,7 @@ export const PRESETS: Preset[] = [
       { id: 'india', name: 'India', dist: 1.2, tariffGoods: 0.1, tariffAgri: 0.12, buys: ['cotton', 'materials'], sells: ['rice', 'goods'] },
       { id: 'us', name: 'United States', dist: 1.5, tariffGoods: 0.04, tariffAgri: 0.06, buys: ['goods'], sells: ['wheat', 'goods'] },
     ],
-    fxName: 'US dollar',
-  },
-  {
-    id: 'pk-indus', label: 'Lower Indus Plain', region: 'Sindh', country: 'Pakistan',
-    blurb: 'A hot, nearly rainless plain made green by the Indus canals. Cotton in summer, wheat in winter, and every farm depends on irrigation.',
-    currency: 'Rs', currencyCode: 'PKR', money: 3.3, inflation: 0.08,
-    climate: {
-      temp: [17, 20, 26, 31, 34, 34, 32, 31, 30, 28, 23, 18],
-      rain: [2, 3, 4, 3, 4, 10, 55, 55, 15, 2, 1, 2],
-      rainDays: [0.3, 0.5, 0.5, 0.3, 0.3, 1, 4, 3.5, 1, 0.2, 0.1, 0.3], variability: 0.4,
-    },
-    crops: { wheat: [[305, 340]], cotton: [[100, 140]], rice: [[150, 185]], vegetables: [[20, 330]] },
-    cropBias: { wheat: 1.2, cotton: 1.3, rice: 0.8, vegetables: 0.8 },
-    schoolStartMonth: 3, tfr: 3.3, mortality: 1.3, car2026: 0.08, bike2026: 0.4, literacy2026: 0.6, tertiary2026: 0.09, femaleLFP: 0.22,
-    familyFirst: false,
-    names: {
-      male: ['Ali', 'Ahmed', 'Bilal', 'Faisal', 'Hamza', 'Imran', 'Kashif', 'Nadeem', 'Omar', 'Qasim', 'Rashid', 'Salman', 'Tariq', 'Usman', 'Waqar', 'Zubair', 'Ghulam', 'Asif', 'Javed', 'Sajid', 'Murad', 'Saleem'],
-      female: ['Ayesha', 'Fatima', 'Sana', 'Hina', 'Saima', 'Rabia', 'Nida', 'Mehwish', 'Zainab', 'Sadia', 'Amna', 'Bushra', 'Kiran', 'Naila', 'Shazia', 'Sumbul', 'Marvi', 'Sassui', 'Noor', 'Iqra'],
-      last: ['Memon', 'Soomro', 'Shaikh', 'Qureshi', 'Siddiqui', 'Abbasi', 'Jamali', 'Bhutto', 'Chandio', 'Junejo', 'Mahar', 'Laghari', 'Talpur', 'Baloch', 'Khan', 'Ansari', 'Malik', 'Rajput', 'Butt', 'Mirza'],
-    },
-    towns: ['Mehran Nagar', 'Sabzpur', 'Goth Sangar', 'Nawabpur Kalan', 'Daro Khurd', 'Sehwan Pur', 'Kotri Bagh', 'Indus Wala', 'Bhit Nagar', 'Tando Saeen', 'Kinjhar Goth', 'Sukkur Naya'],
-    bizPrefix: ['Al-Noor', 'Mehran', 'Sindh', 'Indus', 'Madina', 'Al-Rehman', 'Shah', 'Sachal', 'Sohni', 'Faisal'],
-    words: { ...baseWords, grocery: ['Kiryana Store', 'General Store', 'Mart'], restaurant: ['Hotel', 'Karahi House', 'Dhaba', 'Café'] },
-    taxes: { income: 0.1, incomeTop: 0.3, allowance: 30000, topThreshold: 120000, corporate: 0.29, smallBusiness: 0.15, sales: 0.17, foodSales: 0, property: 0.004, fuel: 0.5, import: 0.15, importFood: 0.15, export: 0, agriculture: 0, luxury: 0.1, licenseFee: 20000, tourism: 0.08, entertainment: 0.1, passengerFee: 400, power: 1, water: 1 },
-    policies: { ...indiaPolicies, minWage: 9000, unemploymentBenefit: 0, pension: 2000, retirementAge: 60, fertilizerSubsidy: 0.3, cropInsurance: false },
-    canals: true, wells: 0.5, hhSize: 6.0, elderWithFamily: 0.4,
-    tourism: {
-      nature: 0.35, heritage: ['Ancient Indus City Mound', 'Sufi Shrine', 'Mughal-era Fort'], heritageStyle: 'fort',
-      festival: { name: 'Sindhi Culture Day Mela', month: 11, days: 3 }, hubs: ['Karachi', 'Lahore', 'Islamabad'], intlHubs: ['Dubai', 'Doha', 'Jeddah'],
-      airlines: ['Mehran Air', 'Indus Regional', 'Crescent Wings'],
-    },
-    partners: [
-      { id: 'gulf', name: 'Gulf states', dist: 0.7, tariffGoods: 0.05, tariffAgri: 0.04, buys: ['rice', 'vegetables', 'food'], sells: ['materials', 'goods'], agreement: true },
-      { id: 'china', name: 'China', dist: 1, tariffGoods: 0.04, tariffAgri: 0.08, buys: ['cotton', 'rice'], sells: ['goods', 'materials'], agreement: true },
-      { id: 'eu', name: 'European Union', dist: 1.3, tariffGoods: 0, tariffAgri: 0.1, buys: ['goods', 'cotton', 'rice'], sells: ['goods', 'wheat'] },
-      { id: 'us', name: 'United States', dist: 1.6, tariffGoods: 0.06, tariffAgri: 0.06, buys: ['goods', 'cotton'], sells: ['wheat', 'goods'] },
-      { id: 'asean', name: 'Southeast Asia (ASEAN)', dist: 1.1, tariffGoods: 0.05, tariffAgri: 0.1, buys: ['cotton', 'rice'], sells: ['goods', 'food'] },
-    ],
-    fxName: 'US dollar', driveLeft: true,
+    fxName: 'US dollar', landscape: { river: 0, wind: 9, at: 0.42, forest: 0.82, groves: 0.8, town: [1.3, 0.77] },
   },
   {
     id: 'et-highlands', label: 'Ethiopian Highlands', region: 'Oromia', country: 'Ethiopia',
@@ -458,7 +451,7 @@ export const PRESETS: Preset[] = [
       { id: 'eu', name: 'European Union', dist: 1.3, tariffGoods: 0.04, tariffAgri: 0.1, buys: ['food', 'vegetables'], sells: ['goods', 'wheat'], agreement: true },
       { id: 'us', name: 'United States', dist: 1.6, tariffGoods: 0.04, tariffAgri: 0.06, buys: ['goods', 'food'], sells: ['wheat', 'goods'] },
     ],
-    fxName: 'US dollar',
+    fxName: 'US dollar', landscape: { river: 0, wind: 7, at: 0.4, forest: 0.7, groves: 0.45, ponds: [3, 4, 6] },
   },
 ];
 

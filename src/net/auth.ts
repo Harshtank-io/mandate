@@ -2,7 +2,7 @@
 // an email address or a Google/Discord login to keep their towns and reach them from other devices.
 
 import type { Session } from '@supabase/supabase-js';
-import { cloudConfigured, errText, OAUTH_LABELS, returnUrl, supabase, within, type OAuthProvider } from './client';
+import { authReturn, cloudConfigured, errText, OAUTH_LABELS, returnUrl, supabase, within, type OAuthProvider } from './client';
 import { cloud, setCloud, type Account } from './store';
 import { refreshTowns } from './saves';
 
@@ -47,13 +47,14 @@ async function connect(): Promise<void> {
   }
 }
 
-/** Reads and clears the result of a sign-in link from the address bar (the auth client has already used any tokens). */
+/**
+ * Reads and clears the result of a sign-in link from the address bar (the auth client read any tokens as it started).
+ * The page stays: it is the world map by now (see ui/route.ts).
+ */
 function takeLinkError(): string {
   const params = new URLSearchParams(location.hash.replace(/^#/, '') || location.search);
   const err = params.get('error_description') ?? '';
-  if (/access_token|refresh_token|error_description/.test(location.hash) || /[?&](code|error_description)=/.test(location.search)) {
-    history.replaceState(null, '', returnUrl());
-  }
+  if (authReturn()) history.replaceState(null, '', location.pathname);
   return err.replace(/\+/g, ' ');
 }
 

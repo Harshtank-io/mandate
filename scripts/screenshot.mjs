@@ -1,5 +1,6 @@
 // End-to-end check in a real browser (the installed Microsoft Edge, headless): creates a world through the UI,
-// plays it, inspects things, uses the tools, saves, and reopens it after a simulated absence.
+// plays it, inspects things, uses the tools, saves, reopens it after a simulated absence, and checks that every page
+// keeps its address through reloads, Back and Forward.
 // Usage: npm run build; npx vite preview --port 4173 --strictPort   (leave running), then: npm run screenshot
 import { chromium } from 'playwright-core';
 import { mkdirSync } from 'node:fs';
@@ -195,8 +196,11 @@ try {
   await page.waitForTimeout(1500);
   await shot('14-night');
 
-  // persistence: leave to the menu (saves), make the stored save look six hours old, reload and continue
-  const before = await game(() => ({ minute: window.__mandate.game.state.minute, name: window.__mandate.game.state.meta.name }));
+  // persistence: leave for the world map (saves), make the stored save look six hours old, reload and continue
+  const before = await game(() => ({ minute: window.__mandate.game.state.minute, name: window.__mandate.game.state.meta.name, id: window.__mandate.game.state.meta.id }));
+  const path = () => page.evaluate(() => location.pathname);
+  const expectPath = async (want, what) => { const p = await path(); if (p !== want) problems.push(`${what}: the address is ${p}, not ${want}`); };
+  await expectPath(`/town/${before.id}`, 'playing a town');
   await page.getByRole('button', { name: 'World map', exact: true }).click();
   await page.getByRole('button', { name: new RegExp(`^Play ${before.name}`) }).waitFor({ timeout: 30_000 });
   await shot('14b-back-on-map');
@@ -210,8 +214,8 @@ try {
     await new Promise((res, rej) => { const t = db.transaction('data', 'readwrite'); t.objectStore('data').put({ key, blob }); t.oncomplete = res; t.onerror = () => rej(t.error); });
     db.close();
   }, 6);
-  await page.reload();
-  await page.getByRole('button', { name: /^Enter / }).first().click();
+  await expectPath('/world', 'the world map');
+  await page.reload(); // stays on the world map
   await page.locator('.world-list button', { hasText: before.name }).first().click();
   await page.getByRole('button', { name: new RegExp(`^Play ${before.name}`) }).click();
   await page.waitForTimeout(500);
@@ -221,6 +225,37 @@ try {
   await shot('15-reopened');
   const after = await game(() => window.__mandate?.game.state.minute ?? null);
   console.log(`reopened: world minute ${before.minute} -> ${after}; "While you were away" shown: ${hasReport}`);
+
+  // addresses: a reload reopens the same town, Back and Forward move between pages, the landing page stays put
+  const townOpen = (id) => page.waitForFunction((x) => window.__mandate?.game.state.meta.id === x, id, { timeout: 60_000 });
+  await page.reload();
+  await townOpen(before.id);
+  await page.getByRole('button', { name: 'World map', exact: true }).waitFor();
+  await expectPath(`/town/${before.id}`, 'a town after a reload');
+  await shot('16-town-reloaded');
+  await page.goBack();
+  await page.getByRole('button', { name: new RegExp(`^Play ${before.name}`) }).waitFor({ timeout: 30_000 });
+  await expectPath('/world', 'Back from the town');
+  await game(() => { window.__mandate = undefined; });
+  await page.goForward();
+  await townOpen(before.id);
+  await expectPath(`/town/${before.id}`, 'Forward to the town');
+  await page.getByRole('button', { name: 'World map', exact: true }).click();
+  await page.getByRole('button', { name: 'Mandate home page' }).click();
+  await page.getByRole('button', { name: /^Enter / }).first().waitFor();
+  await expectPath('/', 'the landing page');
+  await page.reload();
+  await page.getByRole('button', { name: /^Enter / }).first().waitFor();
+  await expectPath('/', 'the landing page after a reload');
+  // addresses of towns that cannot be opened lead to the world map with a note
+  const origin = new URL(url).origin;
+  for (const [address, note] of [['/town/nowhere', /not saved on this device/], ['/visit/nowhere', /world server/]]) {
+    await page.goto(`${origin}${address}?debug`);
+    await page.getByRole('alert').filter({ hasText: note }).waitFor({ timeout: 30_000 });
+    await expectPath('/world', address);
+  }
+  await shot('17-unknown-town');
+  console.log('addresses: reload, Back, Forward and unknown towns checked');
 } catch (e) {
   problems.push(`script: ${e.message}`);
   await shot('99-failure').catch(() => {});

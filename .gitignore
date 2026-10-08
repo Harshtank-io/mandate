@@ -1,7 +1,10 @@
 node_modules
 dist
 *.log
+temp_auto_push.bat
 screenshots
 .vite
 .env.local
 .env.*.local
+.gitignore
+branch_structure.json
